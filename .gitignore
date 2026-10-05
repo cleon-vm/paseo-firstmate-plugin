@@ -1,0 +1,7 @@
+node_modules/
+*.log
+logs/
+scratch/
+.env
+*.env
+bitbucket-watch.env

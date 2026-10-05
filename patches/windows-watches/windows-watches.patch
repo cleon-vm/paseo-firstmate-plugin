@@ -1,0 +1,534 @@
+diff --git a/original/server/watch-files.ts b/modified/server/watch-files.ts
+index c58ab3d..cb4aa3b 100644
+--- a/original/server/watch-files.ts
++++ b/modified/server/watch-files.ts
+@@ -76,7 +76,7 @@ function describe(error: unknown): string {
+   return error instanceof Error ? error.message : String(error);
+ }
+ 
+-async function readWatch(directory: string, name: string): Promise<WatchFile> {
++async function readWatch(directory: string, name: string, platform: NodeJS.Platform): Promise<WatchFile> {
+   const path = join(directory, name);
+   const invalid = (reason: string, scheduleText: string | null = null): WatchFile => ({
+     name,
+@@ -104,13 +104,14 @@ async function readWatch(directory: string, name: string): Promise<WatchFile> {
+   } catch (error) {
+     return invalid(`its schedule cannot be read: ${describe(error)}`, scheduleText);
+   }
+-  if ((mode & 0o111) === 0) return invalid("it is not executable (chmod +x)", scheduleText);
++  // Windows has no execute bit to look at; the #! line below still says what runs the script.
++  if (platform !== "win32" && (mode & 0o111) === 0) return invalid("it is not executable (chmod +x)", scheduleText);
+   if (!head.startsWith("#!")) return invalid("it has no #! line saying what runs it", scheduleText);
+   return { name, path, scheduleText, schedule, invalid: null };
+ }
+ 
+ /** Every watch in `<home>/watches/`, by name; none when the folder is missing. */
+-export async function listWatches(home: string): Promise<WatchFile[]> {
++export async function listWatches(home: string, platform: NodeJS.Platform = process.platform): Promise<WatchFile[]> {
+   const directory = join(home, WATCHES_DIR);
+   let entries;
+   try {
+@@ -123,7 +124,7 @@ export async function listWatches(home: string): Promise<WatchFile[]> {
+     .filter((entry) => entry.isFile() && !entry.name.startsWith(".") && !entry.name.toLowerCase().endsWith(".md"))
+     .map((entry) => entry.name)
+     .sort();
+-  return Promise.all(names.map((name) => readWatch(directory, name)));
++  return Promise.all(names.map((name) => readWatch(directory, name, platform)));
+ }
+ 
+ // ---------------------------------------------------------------------------
+diff --git a/modified/server/watch-launch.test.ts b/modified/server/watch-launch.test.ts
+new file mode 100644
+index 0000000..d15ef60
+--- /dev/null
++++ b/modified/server/watch-launch.test.ts
+@@ -0,0 +1,212 @@
++import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import { listWatches } from "./watch-files";
++import { findGitBash, parseShebang, windowsLaunch, type LaunchEnv } from "./watch-launch";
++import { runWatchScript } from "./watch-run";
++
++/** A Windows machine that has exactly these files. */
++function machine(files: string[], env: NodeJS.ProcessEnv = {}): LaunchEnv {
++  const have = new Set(files.map((file) => file.toLowerCase()));
++  return { env, isFile: (path) => have.has(path.toLowerCase()) };
++}
++
++const NODE = "C:\\Program Files\\nodejs\\node.exe";
++const GIT_BASH = "C:\\Program Files\\Git\\bin\\bash.exe";
++const SCRIPT = "C:\\Users\\me\\home\\watches\\pr-watch";
++
++describe("parseShebang", () => {
++  it("reads env and direct interpreters", () => {
++    expect(parseShebang("#!/usr/bin/env node\n// x")).toEqual({ name: "node", args: [] });
++    expect(parseShebang("#!/usr/bin/node\n")).toEqual({ name: "node", args: [] });
++    expect(parseShebang("#!/usr/bin/env python3\r\nprint()")).toEqual({ name: "python3", args: [] });
++    expect(parseShebang("#! /bin/bash -e\n")).toEqual({ name: "bash", args: ["-e"] });
++    expect(parseShebang("#!C:\\Tools\\Node.EXE\n")).toEqual({ name: "node", args: [] });
++  });
++
++  it("skips env's options and assignments, and keeps the interpreter's own arguments", () => {
++    expect(parseShebang("#!/usr/bin/env -S node --no-warnings\n")).toEqual({ name: "node", args: ["--no-warnings"] });
++    expect(parseShebang("#!/usr/bin/env FOO=1 BAR=2 node\n")).toEqual({ name: "node", args: [] });
++  });
++
++  it("has none when the file does not start with #! or names nothing", () => {
++    expect(parseShebang("// no shebang\n")).toBeNull();
++    expect(parseShebang(" #!/usr/bin/env node\n")).toBeNull();
++    expect(parseShebang("#!\n")).toBeNull();
++    expect(parseShebang("#!/usr/bin/env\n")).toBeNull();
++  });
++});
++
++describe("windowsLaunch", () => {
++  it("runs node from PATH, never anything else, with the script as its argument", () => {
++    const launch = machine([NODE], { Path: "C:\\Windows;C:\\Program Files\\nodejs" });
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env node\n"), launch)).toEqual({ command: NODE, args: [SCRIPT] });
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env -S node --x\n"), launch)).toEqual({
++      command: NODE,
++      args: ["--x", SCRIPT],
++    });
++  });
++
++  it("falls back to the installer's folder when PATH does not list node", () => {
++    const launch = machine([NODE], { PATH: "C:\\Windows", ProgramFiles: "C:\\Program Files" });
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env node\n"), launch)).toEqual({ command: NODE, args: [SCRIPT] });
++  });
++
++  it("says which interpreter is missing", () => {
++    const result = windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env node\n"), machine([], { PATH: "C:\\Windows" }));
++    expect(result).toEqual({ error: expect.stringContaining("node was not found on PATH") });
++  });
++
++  it("has no launch without a #! line", () => {
++    expect(windowsLaunch(SCRIPT, null, machine([NODE], { PATH: "C:\\Program Files\\nodejs" }))).toEqual({
++      error: "it has no #! line saying what runs it",
++    });
++  });
++
++  it("runs sh and bash with Git for Windows' bash, using forward slashes", () => {
++    const launch = machine([GIT_BASH], { ProgramFiles: "C:\\Program Files" });
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/bin/sh\n"), launch)).toEqual({
++      command: GIT_BASH,
++      args: ["C:/Users/me/home/watches/pr-watch"],
++    });
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env bash\n"), launch)).toMatchObject({ command: GIT_BASH });
++  });
++
++  it("does not take WSL's bash, and says Git for Windows' is needed", () => {
++    const launch = machine(["C:\\Windows\\System32\\bash.exe"], { PATH: "C:\\Windows\\System32" });
++    expect(findGitBash(launch)).toBeNull();
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/bin/bash\n"), launch)).toEqual({
++      error: expect.stringContaining("Git for Windows' bash was not found"),
++    });
++  });
++
++  it("finds Git's bash from git.exe on PATH", () => {
++    const launch = machine(["D:\\Tools\\Git\\cmd\\git.exe", "D:\\Tools\\Git\\bin\\bash.exe"], { PATH: "D:\\Tools\\Git\\cmd" });
++    expect(findGitBash(launch)).toBe("D:\\Tools\\Git\\bin\\bash.exe");
++  });
++
++  it("maps python3 to python, then the py launcher, and skips the Store's stub", () => {
++    const stub = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe";
++    const python = "C:\\Python\\python.exe";
++    const path = "C:\\Users\\me\\AppData\\Local\\Microsoft\\WindowsApps;C:\\Python";
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env python3\n"), machine([stub, python], { PATH: path }))).toEqual({
++      command: python,
++      args: [SCRIPT],
++    });
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env python3\n"), machine(["C:\\Windows\\py.exe"], { PATH: "C:\\Windows" }))).toEqual({
++      command: "C:\\Windows\\py.exe",
++      args: ["-3", SCRIPT],
++    });
++  });
++
++  it("does not know an interpreter that is not on PATH", () => {
++    expect(windowsLaunch(SCRIPT, parseShebang("#!/usr/bin/env ruby\n"), machine([], { PATH: "C:\\Windows" }))).toEqual({
++      error: expect.stringContaining("ruby was not found on PATH"),
++    });
++  });
++});
++
++describe("watch validity by platform", () => {
++  let home: string;
++  beforeEach(async () => {
++    home = await mkdtemp(join(tmpdir(), "fm-watch-"));
++    await mkdir(join(home, "watches"));
++  });
++  afterEach(() => rm(home, { recursive: true, force: true }));
++
++  const write = (name: string, text: string) => writeFile(join(home, "watches", name), text, { mode: 0o644 });
++
++  it("does not ask for an execute bit on Windows, but still for a #! line", async () => {
++    await write("good", "#!/usr/bin/env node\n// schedule: */5 * * * *\n");
++    await write("bare", "// schedule: */5 * * * *\n");
++    const watches = new Map((await listWatches(home, "win32")).map((watch) => [watch.name, watch]));
++    expect(watches.get("good")?.invalid).toBeNull();
++    expect(watches.get("good")?.schedule === null).toBe(false);
++    expect(watches.get("bare")?.invalid).toBe("it has no #! line saying what runs it");
++  });
++
++  it("still asks for it everywhere else", async () => {
++    await write("good", "#!/usr/bin/env node\n// schedule: */5 * * * *\n");
++    for (const platform of ["linux", "darwin"] as const) {
++      const [watch] = await listWatches(home, platform);
++      expect(watch?.invalid).toBe("it is not executable (chmod +x)");
++    }
++  });
++});
++
++describe("runWatchScript on Windows, before anything is started", () => {
++  const options = (launchEnv: LaunchEnv) => ({
++    cwd: tmpdir(),
++    env: launchEnv.env,
++    timeoutMs: 1000,
++    maxOutputBytes: 1000,
++    maxErrorBytes: 1000,
++    platform: "win32" as const,
++    launchEnv,
++  });
++  let dir: string;
++  beforeEach(async () => {
++    dir = await mkdtemp(join(tmpdir(), "fm-run-"));
++  });
++  afterEach(() => rm(dir, { recursive: true, force: true }));
++
++  it("reports an unknown interpreter as a spawn error, not a crash", async () => {
++    const path = join(dir, "watch");
++    await writeFile(path, "#!/usr/bin/env ruby\nputs 1\n");
++    const result = await runWatchScript(path, options(machine([], { PATH: "C:\\Windows" })));
++    expect(result).toMatchObject({ code: null, timedOut: false, stdout: "", spawnError: expect.stringContaining("ruby was not found") });
++  });
++
++  it("reports a missing file as a spawn error", async () => {
++    const result = await runWatchScript(join(dir, "gone"), options(machine([])));
++    expect(result.code).toBeNull();
++    expect(result.spawnError).toContain("ENOENT");
++  });
++
++  it("does not start anything once the plugin has stopped", async () => {
++    const path = join(dir, "watch");
++    await writeFile(path, "#!/usr/bin/env node\n");
++    const result = await runWatchScript(path, { ...options(machine([NODE], { PATH: "C:\\Program Files\\nodejs" })), signal: AbortSignal.abort() });
++    expect(result.spawnError).toBe("the plugin stopped");
++  });
++});
++
++// Real processes: only meaningful (and only run) on a Windows host.
++describe.skipIf(process.platform !== "win32")("runWatchScript on this Windows machine", () => {
++  let dir: string;
++  beforeEach(async () => {
++    dir = await mkdtemp(join(tmpdir(), "fm-real-"));
++  });
++  afterEach(() => rm(dir, { recursive: true, force: true }));
++  const options = { cwd: tmpdir(), env: process.env, timeoutMs: 20_000, maxOutputBytes: 1000, maxErrorBytes: 1000 };
++
++  it("runs a node script by its #! line and keeps stdout and the exit code", async () => {
++    const path = join(dir, "watch");
++    await writeFile(path, '#!/usr/bin/env node\nconsole.log("hello " + process.argv.length);\nconsole.error("warn");\nprocess.exit(3);\n');
++    const result = await runWatchScript(path, options);
++    expect(result).toMatchObject({ code: 3, timedOut: false, stdout: "hello 2\n", spawnError: null });
++    expect(result.stderr).toContain("warn");
++  });
++
++  it("stops a script that runs too long, and its children with it", async () => {
++    const path = join(dir, "watch");
++    const marker = join(dir, "child-pid");
++    await writeFile(
++      path,
++      `#!/usr/bin/env node
++const { spawn } = require("node:child_process");
++const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
++require("node:fs").writeFileSync(${JSON.stringify(marker)}, String(child.pid));
++setInterval(() => {}, 1000);
++`,
++    );
++    const result = await runWatchScript(path, { ...options, timeoutMs: 1500, killGraceMs: 500 });
++    expect(result.timedOut).toBe(true);
++    const { readFile } = await import("node:fs/promises");
++    const pid = Number(await readFile(marker, "utf8"));
++    expect(pid).toBeGreaterThan(0);
++    expect(() => process.kill(pid, 0)).toThrow();
++  }, 30_000);
++});
+diff --git a/modified/server/watch-launch.ts b/modified/server/watch-launch.ts
+new file mode 100644
+index 0000000..d7c3267
+--- /dev/null
++++ b/modified/server/watch-launch.ts
+@@ -0,0 +1,152 @@
++/**
++ * How a watch script is started on Windows, where a `#!` line means nothing to the OS and there is no
++ * execute bit: the line is read here and the interpreter it names is run explicitly, with the script as
++ * its argument. POSIX runs the script as it is and never comes through here.
++ *
++ * `node` is always the one on PATH, never `process.execPath`: the plugin runs inside Paseo's own
++ * Electron process, whose execPath is `Paseo.exe`; when PATH lacks it, the installer's own folder is tried.
++ * `sh` and `bash` mean Git for Windows' bash; the
++ * `bash.exe` in System32 is WSL's, which cannot read Windows paths, and is not used.
++ */
++import { statSync } from "node:fs";
++import { win32 } from "node:path";
++
++export interface Shebang {
++  /** The interpreter's name: lower case, without directory or `.exe` (`node`, `python3`, `bash`). */
++  name: string;
++  /** Whatever followed the interpreter on the line. */
++  args: string[];
++}
++
++/** The `#!` line of a script's text, or null when it has none. */
++export function parseShebang(head: string): Shebang | null {
++  if (!head.startsWith("#!")) return null;
++  const line = head.slice(2).split(/\r\n|\r|\n/, 1)[0] ?? "";
++  const tokens = line.trim().split(/\s+/).filter((token) => token !== "");
++  const program = tokens.shift();
++  if (program === undefined) return null;
++  if (baseName(program) === "env") {
++    // `#!/usr/bin/env [-S] [NAME=value ...] interpreter args`: the interpreter is the first thing that
++    // is neither an option nor an assignment.
++    while (tokens.length > 0 && (tokens[0]!.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0]!))) {
++      tokens.shift();
++    }
++    const named = tokens.shift();
++    return named === undefined ? null : { name: baseName(named), args: tokens };
++  }
++  return { name: baseName(program), args: tokens };
++}
++
++function baseName(program: string): string {
++  const last = program.split(/[\\/]/).pop() ?? program;
++  return last.toLowerCase().replace(/\.exe$/, "");
++}
++
++export interface LaunchEnv {
++  env: NodeJS.ProcessEnv;
++  /** Whether a file exists there. */
++  isFile: (path: string) => boolean;
++}
++
++export const realLaunchEnv = (env: NodeJS.ProcessEnv): LaunchEnv => ({
++  env,
++  isFile: (path) => {
++    try {
++      return statSync(path).isFile();
++    } catch {
++      return false;
++    }
++  },
++});
++
++/** A variable of the environment by name, whatever the case: Windows spells it `Path`, `PATH` or `path`. */
++function variable(env: NodeJS.ProcessEnv, name: string): string | undefined {
++  const key = Object.keys(env).find((candidate) => candidate.toLowerCase() === name.toLowerCase());
++  return key === undefined ? undefined : env[key];
++}
++
++function pathDirectories(env: NodeJS.ProcessEnv): string[] {
++  return (variable(env, "PATH") ?? "")
++    .split(";")
++    .map((entry) => entry.trim().replace(/^"(.*)"$/, "$1"))
++    .filter((entry) => entry !== "");
++}
++
++/** Every `<name>.exe` (or `.com`) on PATH, in order. */
++function onPath(name: string, launch: LaunchEnv): string[] {
++  const found: string[] = [];
++  for (const directory of pathDirectories(launch.env)) {
++    for (const extension of [".exe", ".com"]) {
++      const candidate = win32.join(directory, name + extension);
++      if (launch.isFile(candidate)) found.push(candidate);
++    }
++  }
++  return found;
++}
++
++/** Git for Windows' bash, or null. */
++export function findGitBash(launch: LaunchEnv): string | null {
++  const roots = [
++    variable(launch.env, "ProgramFiles"),
++    variable(launch.env, "ProgramW6432"),
++    variable(launch.env, "ProgramFiles(x86)"),
++    variable(launch.env, "LOCALAPPDATA") === undefined ? undefined : win32.join(variable(launch.env, "LOCALAPPDATA")!, "Programs"),
++  ];
++  for (const root of roots) {
++    if (root === undefined) continue;
++    for (const relative of ["Git\\bin\\bash.exe", "Git\\usr\\bin\\bash.exe"]) {
++      const candidate = win32.join(root, relative);
++      if (launch.isFile(candidate)) return candidate;
++    }
++  }
++  // A git on PATH is at <Git>\cmd\git.exe (or <Git>\bin\git.exe): its bash is at <Git>\bin\bash.exe.
++  for (const git of onPath("git", launch)) {
++    const candidate = win32.join(win32.dirname(win32.dirname(git)), "bin", "bash.exe");
++    if (launch.isFile(candidate)) return candidate;
++  }
++  // Any other bash on PATH, except WSL's launcher in System32 and the Store's alias stubs.
++  return onPath("bash", launch).find((candidate) => !/\\(system32|windowsapps)\\/i.test(candidate)) ?? null;
++}
++
++/** Node.js where its installer puts it, for a PATH that does not list it. */
++function installedNode(launch: LaunchEnv): string | undefined {
++  const local = variable(launch.env, "LOCALAPPDATA");
++  const roots = [
++    variable(launch.env, "ProgramFiles"),
++    variable(launch.env, "ProgramW6432"),
++    local === undefined ? undefined : win32.join(local, "Programs"),
++  ];
++  return roots
++    .filter((root): root is string => root !== undefined)
++    .map((root) => win32.join(root, "nodejs", "node.exe"))
++    .find((candidate) => launch.isFile(candidate));
++}
++
++export type Launch = { command: string; args: string[] } | { error: string };
++
++/** The command that runs `script`, given its `#!` line; or why it cannot be run. */
++export function windowsLaunch(script: string, shebang: Shebang | null, launch: LaunchEnv): Launch {
++  if (shebang === null) return { error: "it has no #! line saying what runs it" };
++  const { name } = shebang;
++  const tail = [...shebang.args, script];
++  if (name === "sh" || name === "bash") {
++    const bash = findGitBash(launch);
++    if (bash === null) return { error: `Git for Windows' bash was not found, and "#!/…/${name}" scripts need it` };
++    return { command: bash, args: [...shebang.args, script.replace(/\\/g, "/")] };
++  }
++  if (/^python[0-9.]*$/.test(name)) {
++    // `python3` does not exist on Windows unless it was made to; `python` and the `py` launcher do.
++    const real = (candidate: string) => !/\\windowsapps\\/i.test(candidate);
++    for (const candidate of [name, "python"]) {
++      const python = onPath(candidate, launch).find(real);
++      if (python !== undefined) return { command: python, args: tail };
++    }
++    const py = onPath("py", launch)[0];
++    if (py !== undefined) return { command: py, args: name === "python2" ? ["-2", ...tail] : ["-3", ...tail] };
++    return { error: `${name} was not found on PATH (needed for "#!/…/${name}")` };
++  }
++  const wanted = name === "nodejs" ? "node" : name;
++  const found = onPath(wanted, launch)[0] ?? (wanted === "node" ? installedNode(launch) : undefined);
++  if (found === undefined) return { error: `${wanted} was not found on PATH (needed for "#!/…/${name}")` };
++  return { command: found, args: tail };
++}
+diff --git a/original/server/watch-run.ts b/modified/server/watch-run.ts
+index dc940d5..d1a0b81 100644
+--- a/original/server/watch-run.ts
++++ b/modified/server/watch-run.ts
+@@ -6,8 +6,16 @@
+  *
+  * What it prints is kept up to a cap and read to the end regardless, so a chatty script never blocks on
+  * a full pipe; stderr is kept as its last lines, which is where an error usually is.
++ *
++ * **Windows** has neither a `#!` line that means anything nor process groups: the interpreter the line
++ * names is run explicitly (`watch-launch.ts`), without a console window, and a stopped run's whole
++ * process tree is taken down at once with `taskkill /T /F`, which has no gentler first step.
+  */
+-import { spawn } from "node:child_process";
++import { execFile, spawn, type ChildProcess } from "node:child_process";
++import { open } from "node:fs/promises";
++import { join } from "node:path";
++
++import { parseShebang, realLaunchEnv, windowsLaunch, type LaunchEnv } from "./watch-launch";
+ 
+ export interface RunOptions {
+   cwd: string;
+@@ -21,6 +29,10 @@ export interface RunOptions {
+   killGraceMs?: number;
+   /** Stops the script as a timeout would, for a plugin that is shutting down. */
+   signal?: AbortSignal;
++  /** Which platform's way of starting and stopping a script to use; the host's by default. For tests. */
++  platform?: NodeJS.Platform;
++  /** How Windows finds an interpreter; the real PATH and file system by default. For tests. */
++  launchEnv?: LaunchEnv;
+ }
+ 
+ export interface RunResult {
+@@ -44,11 +56,54 @@ function killGroup(pid: number | undefined, signal: NodeJS.Signals): void {
+   }
+ }
+ 
+-export function runWatchScript(path: string, options: RunOptions): Promise<RunResult> {
++/**
++ * Takes the process and everything it started down, on Windows. taskkill is run by its full path, since
++ * PATH may not list System32; if it cannot be run, the script alone is killed so the run still ends.
++ */
++function killTree(child: ChildProcess): void {
++  if (child.pid === undefined) return;
++  const taskkill = join(process.env.SystemRoot ?? process.env.windir ?? "C:\\Windows", "System32", "taskkill.exe");
++  execFile(taskkill, ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true }, (error) => {
++    // Exit 128 is "no such process": it was already gone. Anything else means taskkill itself failed.
++    if (error !== null && (error.code as unknown) !== 128) child.kill("SIGKILL");
++  });
++}
++
++/** The first bytes of a script, for its `#!` line. */
++async function readHead(path: string): Promise<string> {
++  const handle = await open(path, "r");
++  try {
++    const buffer = Buffer.alloc(512);
++    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
++    return buffer.subarray(0, bytesRead).toString("utf8");
++  } finally {
++    await handle.close();
++  }
++}
++
++function notStarted(reason: string): RunResult {
++  return { code: null, timedOut: false, stdout: "", truncated: false, stderr: "", spawnError: reason };
++}
++
++export async function runWatchScript(path: string, options: RunOptions): Promise<RunResult> {
++  const windows = (options.platform ?? process.platform) === "win32";
++  if (!windows) return spawnScript(path, [], options, false);
++  if (options.signal?.aborted === true) return notStarted("the plugin stopped");
++  let launch;
++  try {
++    launch = windowsLaunch(path, parseShebang(await readHead(path)), options.launchEnv ?? realLaunchEnv(options.env));
++  } catch (error) {
++    return notStarted(error instanceof Error ? error.message : String(error));
++  }
++  if ("error" in launch) return notStarted(launch.error);
++  return spawnScript(launch.command, launch.args, options, true);
++}
++
++function spawnScript(command: string, args: string[], options: RunOptions, windows: boolean): Promise<RunResult> {
+   return new Promise((resolve) => {
+     // An abort that has already happened is never replayed to a listener added now, so check it here.
+     if (options.signal?.aborted === true) {
+-      resolve({ code: null, timedOut: false, stdout: "", truncated: false, stderr: "", spawnError: "the plugin stopped" });
++      resolve(notStarted("the plugin stopped"));
+       return;
+     }
+     const stdout: Buffer[] = [];
+@@ -59,16 +114,26 @@ export function runWatchScript(path: string, options: RunOptions): Promise<RunRe
+     let spawnError: string | null = null;
+     let settled = false;
+ 
+-    const child = spawn(path, [], {
++    const child = spawn(command, args, {
+       cwd: options.cwd,
+       env: options.env,
+       stdio: ["ignore", "pipe", "pipe"],
+-      detached: true,
++      // A process group on POSIX; on Windows it would only risk a console window.
++      detached: !windows,
++      windowsHide: true,
+     });
+ 
+     let killTimer: NodeJS.Timeout | undefined;
+     function stop(): void {
+       if (killTimer !== undefined) return;
++      if (windows) {
++        killTree(child);
++        // The pid may be reused once the script is gone, so only a script still there is killed again.
++        killTimer = setTimeout(() => {
++          if (child.exitCode === null && child.signalCode === null) killTree(child);
++        }, options.killGraceMs ?? 2000);
++        return;
++      }
+       killGroup(child.pid, "SIGTERM");
+       killTimer = setTimeout(() => killGroup(child.pid, "SIGKILL"), options.killGraceMs ?? 2000);
+     }

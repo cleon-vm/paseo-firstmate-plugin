@@ -1,0 +1,899 @@
+diff --git a/client/files.tsx b/client/files.tsx
+index 918510a..0ddc2cf 100644
+--- a/client/files.tsx
++++ b/client/files.tsx
+@@ -11,17 +11,21 @@
+  * on disk while open and unedited is simply reloaded. The daemon confines
+  * every path to the home (`server/files.ts`).
+  *
++ * A file or folder can be revealed in the file manager, or its path copied,
++ * from the open file's toolbar or a right-click (a long press on a phone).
++ * Reveal opens on the machine the daemon runs on (`server/reveal.ts`).
++ *
+  * The open folder, the open file and its unsaved text live in module scope,
+  * because the surface unmounts every time the captain opens a workspace.
+  */
+ import type { PluginTheme } from "@getpaseo/plugin";
+ import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
+-import { Icon, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
++import { Icon, TextInput, copyText, useToast } from "@getpaseo/plugin/client/react-native";
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+ import { Platform, Pressable, ScrollView, Text, View } from "react-native";
+ 
+-import { listHomeFiles, readHomeFile, readHomeImage, writeHomeFile, type HomeEntry } from "../shared/files";
++import { listHomeFiles, readHomeFile, readHomeImage, revealHomePath, writeHomeFile, type HomeEntry } from "../shared/files";
+ import { imageTypeOf, MAX_IMAGE_BYTES, SVG_TYPE } from "../shared/images";
+ import { relativeTime } from "./format";
+ import { useKeyboardOverlap } from "./keyboard";
+@@ -29,7 +33,9 @@ import { ImageViewer, type MarkdownImages } from "./image-view";
+ import { isSaveKey, type WebKeyPressEvent } from "./keys";
+ import { Markdown } from "./markdown";
+ import { isDirty, markSaved, openedImage, type OpenFile } from "./open-file";
++import { absolutePath, menuPosition, revealLabel } from "./reveal";
+ import { Banner, IconButton, MONOSPACE, errorText } from "./ui";
++import { contextMenuProps, type MenuPoint } from "./web";
+ 
+ interface FilesMemory {
+   dir: string;
+@@ -65,6 +71,20 @@ interface PendingAction {
+   run: () => void;
+ }
+ 
++/** The right-click menu: what it is for, and where it is drawn in the view. */
++interface FileMenu {
++  path: string;
++  kind: HomeEntry["kind"];
++  left: number;
++  top: number;
++}
++
++/** The menu's box, for keeping it inside the view; its height is that of its three rows and the note. */
++const MENU_SIZE = { width: 250, height: 150 };
++
++/** Said wherever Reveal is offered: the panel may be open on a phone or another computer. */
++const REVEAL_NOTE = "Reveal opens on the machine running Paseo, which may not be this one.";
++
+ /** A file another part of the panel asks the view to open — the charter's Compare, a watch's name. `at` tells two asks apart. */
+ export interface FilesRequest {
+   path: string;
+@@ -84,6 +104,7 @@ export function FilesView({
+   const read = useRpc(readHomeFile);
+   const readImage = useRpc(readHomeImage);
+   const write = useRpc(writeHomeFile);
++  const revealPath = useRpc(revealHomePath);
+   const toast = useToast();
+   const queryClient = useQueryClient();
+ 
+@@ -96,6 +117,9 @@ export function FilesView({
+   /** An action held back because the open file has unsaved changes. */
+   const [pending, setPending] = useState<PendingAction | null>(null);
+   const [newName, setNewName] = useState<string | null>(null);
++  const [menu, setMenu] = useState<FileMenu | null>(null);
++  const [hoveredItem, setHoveredItem] = useState<string | null>(null);
++  const root = useRef<View>(null);
+   const editorPane = useRef<View>(null);
+   const keyboard = useKeyboardOverlap(editorPane);
+ 
+@@ -120,6 +144,32 @@ export function FilesView({
+   });
+ 
+   const dirty = isDirty(open);
++  const home = listing.data?.home ?? null;
++  const reveal = revealLabel(home);
++
++  /** Shows `path` in the file manager of the daemon's machine; neither touches the open file, so nothing is held back. */
++  function showInFileManager(path: string): void {
++    setMenu(null);
++    revealPath({ path })
++      .then((result) => toast.show(`Opened ${result.manager} on ${result.host}`, { variant: "success" }))
++      .catch((caught: unknown) => toast.error(errorText(caught)));
++  }
++
++  /** Copies `path` as the daemon's machine has it, or as the home names it with `relativeOnly` — or before the home is known. */
++  function copyPath(path: string, relativeOnly = false): void {
++    setMenu(null);
++    const text = relativeOnly || home === null ? path : absolutePath(home, path);
++    copyText(text)
++      .then(() => toast.show(`Copied ${text}`, { variant: "success" }))
++      .catch((caught: unknown) => toast.error(errorText(caught)));
++  }
++
++  /** Opens the right-click menu for `path` at `point`, kept inside the view. */
++  function openMenu(path: string, kind: HomeEntry["kind"], point: MenuPoint): void {
++    root.current?.measureInWindow((x, y, width, height) =>
++      setMenu({ path, kind, ...menuPosition(point, { x, y }, { width, height }, MENU_SIZE) }),
++    );
++  }
+ 
+   /** Runs `action` now, or once the captain has decided what to do with unsaved changes. */
+   function guarded(label: string, action: () => void): void {
+@@ -298,6 +348,40 @@ export function FilesView({
+         backgroundColor: colors.surface1,
+       },
+       confirmText: { flex: 1, minWidth: 160, color: colors.foreground, fontSize: 12 },
++      menuBackdrop: { position: "absolute" as const, left: 0, right: 0, top: 0, bottom: 0 },
++      menu: {
++        position: "absolute" as const,
++        width: MENU_SIZE.width,
++        paddingVertical: 4,
++        borderWidth: 1,
++        borderColor: colors.border,
++        borderRadius: 8,
++        backgroundColor: colors.surface1,
++        shadowColor: "#000",
++        shadowOpacity: 0.25,
++        shadowRadius: 12,
++        shadowOffset: { width: 0, height: 4 },
++        elevation: 8,
++      },
++      menuItem: {
++        flexDirection: "row" as const,
++        alignItems: "center" as const,
++        gap: 8,
++        paddingHorizontal: 12,
++        paddingVertical: 8,
++      },
++      menuItemText: { color: colors.foreground, fontSize: 13 },
++      menuNote: {
++        color: colors.foregroundMuted,
++        fontSize: 11,
++        lineHeight: 15,
++        paddingHorizontal: 12,
++        paddingTop: 6,
++        paddingBottom: 4,
++        borderTopWidth: 1,
++        borderTopColor: colors.border,
++        marginTop: 4,
++      },
+     };
+   }, [theme, compact]);
+ 
+@@ -340,6 +424,12 @@ export function FilesView({
+                 disabled={listing.isFetching}
+                 onPress={() => void listing.refetch()}
+               />
++              <IconButton
++                icon="FolderOpen"
++                label={`${reveal}: this folder`}
++                theme={theme}
++                onPress={() => showInFileManager(dir)}
++              />
+             </>
+           ) : (
+             <>
+@@ -374,6 +464,7 @@ export function FilesView({
+             accessibilityRole="button"
+             accessibilityLabel={`${entry.kind === "dir" ? "Folder" : "File"} ${entry.name}`}
+             style={[styles.entry, open?.path === entry.path ? styles.entryOpen : null]}
++            {...contextMenuProps((point) => openMenu(entry.path, entry.kind, point))}
+             onPress={() =>
+               entry.kind === "dir"
+                 ? setDir(entry.path)
+@@ -449,7 +540,8 @@ export function FilesView({
+     editorBody = (
+       <Text style={styles.muted}>
+         Pick a file to read or edit it. The first mate reads its charter from AGENTS.md and your standing orders
+-        from data/captain.md; its backlog, projects and each worker's brief are under data/.
++        from data/captain.md; its backlog, projects and each worker's brief are under data/. Right-click a file, or
++        use its toolbar, to reveal it or copy its path. {REVEAL_NOTE}
+       </Text>
+     );
+   } else if (open.kind === "unreadable") {
+@@ -525,7 +617,10 @@ export function FilesView({
+   const editorPaneView = (
+     <View ref={editorPane} style={[styles.editorPane, { paddingBottom: keyboard }]}>
+       {open === null && !compact ? null : (
+-        <View style={styles.editorHeader}>
++        <View
++          style={styles.editorHeader}
++          {...(open === null ? {} : contextMenuProps((point) => openMenu(open.path, "file", point)))}
++        >
+           {compact ? (
+             <IconButton
+               icon="ArrowLeft"
+@@ -582,6 +677,8 @@ export function FilesView({
+                 disabled={loadingPath !== null}
+                 onPress={() => guarded("reload it from disk", () => load(open.path, { asText: open.kind === "text" }))}
+               />
++              <IconButton icon="FolderOpen" label="Reveal" showLabel theme={theme} onPress={() => showInFileManager(open.path)} />
++              <IconButton icon="Copy" label="Copy path" theme={theme} onPress={() => copyPath(open.path)} />
+               {open.kind === "text" ? (
+                 <IconButton
+                   icon="Save"
+@@ -633,11 +730,56 @@ export function FilesView({
+     </View>
+   );
+ 
+-  if (compact) return <View style={styles.root}>{open === null && loadingPath === null ? listPane : editorPaneView}</View>;
++  const menuItems: { icon: string; label: string; run: (path: string) => void }[] = [
++    { icon: "FolderOpen", label: reveal, run: showInFileManager },
++    { icon: "Copy", label: "Copy path", run: (path) => copyPath(path) },
++    { icon: "Copy", label: "Copy relative path", run: (path) => copyPath(path, true) },
++  ];
++  // Drawn over the whole view, above both panes; a press or right-click anywhere outside it closes it.
++  const menuView =
++    menu === null ? null : (
++      <>
++        <Pressable
++          style={styles.menuBackdrop}
++          accessibilityLabel="Close the menu"
++          onPress={() => setMenu(null)}
++          {...contextMenuProps(() => setMenu(null))}
++        />
++        <View accessibilityRole="menu" style={[styles.menu, { left: menu.left, top: menu.top }]}>
++          {menuItems.map((item) => (
++            <Pressable
++              key={item.label}
++              accessibilityRole="menuitem"
++              style={({ pressed }) => [
++                styles.menuItem,
++                pressed || hoveredItem === item.label ? { backgroundColor: theme.colors.surface2 } : null,
++              ]}
++              onHoverIn={() => setHoveredItem(item.label)}
++              onHoverOut={() => setHoveredItem(null)}
++              onPress={() => item.run(menu.path)}
++            >
++              <Icon name={item.icon} size={14} color={theme.colors.foregroundMuted} />
++              <Text style={styles.menuItemText}>{item.label}</Text>
++            </Pressable>
++          ))}
++          <Text style={styles.menuNote}>{REVEAL_NOTE}</Text>
++        </View>
++      </>
++    );
++
++  if (compact) {
++    return (
++      <View ref={root} style={styles.root}>
++        {open === null && loadingPath === null ? listPane : editorPaneView}
++        {menuView}
++      </View>
++    );
++  }
+   return (
+-    <View style={styles.root}>
++    <View ref={root} style={styles.root}>
+       {listPane}
+       {editorPaneView}
++      {menuView}
+     </View>
+   );
+ }
+diff --git a/client/reveal.test.ts b/client/reveal.test.ts
+new file mode 100644
+index 0000000..173aa91
+--- /dev/null
++++ b/client/reveal.test.ts
+@@ -0,0 +1,53 @@
++import { describe, expect, it } from "vitest";
++
++import { absolutePath, menuPosition, revealLabel } from "./reveal";
++
++describe("absolutePath", () => {
++  it("writes a home file's path with the home's own separators", () => {
++    expect(absolutePath("C:\\Users\\cap\\fm", "data/scout, x/a b.md")).toBe("C:\\Users\\cap\\fm\\data\\scout, x\\a b.md");
++    expect(absolutePath("/Users/cap/fm", "data/a b.md")).toBe("/Users/cap/fm/data/a b.md");
++    expect(absolutePath("\\\\server\\share\\fm", "AGENTS.md")).toBe("\\\\server\\share\\fm\\AGENTS.md");
++  });
++
++  it("does not double a trailing separator, and keeps a root whole", () => {
++    expect(absolutePath("C:\\Users\\cap\\fm\\", "AGENTS.md")).toBe("C:\\Users\\cap\\fm\\AGENTS.md");
++    expect(absolutePath("C:\\", "AGENTS.md")).toBe("C:\\AGENTS.md");
++    expect(absolutePath("/", "AGENTS.md")).toBe("/AGENTS.md");
++  });
++
++  it("is the home itself for the empty path", () => {
++    expect(absolutePath("C:\\Users\\cap\\fm\\", "")).toBe("C:\\Users\\cap\\fm");
++    expect(absolutePath("C:\\", "")).toBe("C:\\");
++    expect(absolutePath("/home/cap/fm/", "")).toBe("/home/cap/fm");
++  });
++});
++
++describe("revealLabel", () => {
++  it("names Explorer for a Windows home, and the file manager otherwise or before the home is known", () => {
++    expect(revealLabel("C:\\Users\\cap\\fm")).toBe("Reveal in Explorer");
++    expect(revealLabel("\\\\server\\share")).toBe("Reveal in Explorer");
++    expect(revealLabel("/Users/cap/fm")).toBe("Reveal in file manager");
++    expect(revealLabel(null)).toBe("Reveal in file manager");
++  });
++});
++
++describe("menuPosition", () => {
++  const menu = { width: 250, height: 150 };
++  const frame = { width: 800, height: 600 };
++
++  it("opens at the pointer, relative to the frame", () => {
++    expect(menuPosition({ x: 300, y: 200 }, { x: 100, y: 50 }, frame, menu)).toEqual({ left: 200, top: 150 });
++  });
++
++  it("moves left and up to stay inside the frame", () => {
++    expect(menuPosition({ x: 890, y: 640 }, { x: 100, y: 50 }, frame, menu)).toEqual({ left: 546, top: 446 });
++  });
++
++  it("stays at the top-left when the frame is smaller than the menu", () => {
++    expect(menuPosition({ x: 150, y: 90 }, { x: 100, y: 50 }, { width: 200, height: 100 }, menu)).toEqual({ left: 4, top: 4 });
++  });
++
++  it("never opens above or left of the frame", () => {
++    expect(menuPosition({ x: 90, y: 40 }, { x: 100, y: 50 }, frame, menu)).toEqual({ left: 4, top: 4 });
++  });
++});
+diff --git a/client/reveal.ts b/client/reveal.ts
+new file mode 100644
+index 0000000..97a0406
+--- /dev/null
++++ b/client/reveal.ts
+@@ -0,0 +1,60 @@
++/**
++ * The Files view's Reveal and Copy path, as pure functions: the path a home
++ * file has on the daemon's machine, what Reveal is called there, and where
++ * the right-click menu goes.
++ */
++
++/** A drive letter or a `\\server\share` path: the daemon runs on Windows. */
++function isWindowsPath(path: string): boolean {
++  return /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith("\\\\");
++}
++
++/**
++ * The path `rel` (home-relative, `/`-separated) has on the machine the
++ * daemon runs on, written the way `home` is: with backslashes when the home
++ * is a Windows path, slashes otherwise. `""` is the home itself.
++ */
++export function absolutePath(home: string, rel: string): string {
++  const separator = isWindowsPath(home) ? "\\" : "/";
++  const base = home.replace(/[\\/]+$/, "");
++  // Trimming would leave a drive's root as `C:` and the POSIX root as nothing.
++  const root = base === "" || /^[a-zA-Z]:$/.test(base) ? `${base}${separator}` : base;
++  if (rel === "") return root;
++  return `${root.endsWith(separator) ? root : `${root}${separator}`}${rel.split("/").join(separator)}`;
++}
++
++/**
++ * What Reveal is called for a home on the daemon's machine: Explorer's name
++ * when the home is a Windows path, which says where it opens. A POSIX path
++ * does not tell macOS from Linux, so there it is the file manager.
++ */
++export function revealLabel(home: string | null): string {
++  return home !== null && isWindowsPath(home) ? "Reveal in Explorer" : "Reveal in file manager";
++}
++
++export interface Point {
++  x: number;
++  y: number;
++}
++
++export interface Size {
++  width: number;
++  height: number;
++}
++
++/** Room kept between the menu and the frame's edge. */
++const MARGIN = 4;
++
++/**
++ * Where a menu of `menu` size opens for a click at `click` (window
++ * coordinates) inside a frame at `origin` of `frame` size: at the pointer,
++ * moved left or up just enough to stay inside the frame, and never past its
++ * top-left corner when the frame is smaller than the menu.
++ */
++export function menuPosition(click: Point, origin: Point, frame: Size, menu: Size): { left: number; top: number } {
++  const clamp = (value: number, room: number) => Math.max(MARGIN, Math.min(value, room - MARGIN));
++  return {
++    left: clamp(click.x - origin.x, frame.width - menu.width),
++    top: clamp(click.y - origin.y, frame.height - menu.height),
++  };
++}
+diff --git a/client/web.ts b/client/web.ts
+index 63f0339..18342ed 100644
+--- a/client/web.ts
++++ b/client/web.ts
+@@ -7,9 +7,10 @@
+  *
+  * The exports are the chat pane's resize drag, copied from
+  * `github-board/client/web.ts` — there is no workspace root to share it from —
+- * and the chat's file picker, paste and drop.
++ * the chat's file picker, paste and drop, and the Files view's right-click
++ * menu.
+  */
+-import { Platform } from "react-native";
++import { Platform, type GestureResponderEvent } from "react-native";
+ 
+ import { rasterImageType } from "../shared/attachments";
+ 
+@@ -291,3 +292,42 @@ export function receiveFiles(
+   listeners.forEach(([type, listener]) => element.addEventListener?.(type, listener));
+   return () => listeners.forEach(([type, listener]) => element.removeEventListener?.(type, listener));
+ }
++
++/** Where a context menu was asked for, in window coordinates. */
++export interface MenuPoint {
++  x: number;
++  y: number;
++}
++
++/**
++ * Props that ask for a context menu on the view they are spread onto: a
++ * right-click on the web renderer, and a long press on native, which has no
++ * right-click. react-native-web hands `onContextMenu` from `Pressable` and
++ * `View` to the element (its forwarded props, which Paseo's own context menus
++ * rely on too), so the browser's menu is held back and `onOpen` gets the
++ * pointer. A long press is not asked for on the web, where react-native-web
++ * would take a slow mouse click for one. Right-click is not a press there, so
++ * a row's `onPress` does not also run.
++ */
++export function contextMenuProps(onOpen: (point: MenuPoint) => void): {
++  onContextMenu?: (event: unknown) => void;
++  onLongPress?: (event: GestureResponderEvent) => void;
++} {
++  if (Platform.OS !== "web") {
++    return { onLongPress: (event) => onOpen({ x: event.nativeEvent.pageX, y: event.nativeEvent.pageY }) };
++  }
++  return {
++    onContextMenu: (event) => {
++      if (typeof event !== "object" || event === null) return;
++      const x = Reflect.get(event, "clientX");
++      const y = Reflect.get(event, "clientY");
++      if (typeof x !== "number" || typeof y !== "number") return;
++      const preventDefault = Reflect.get(event, "preventDefault");
++      if (typeof preventDefault === "function") preventDefault.call(event);
++      // Only this menu: an ancestor with a menu of its own does not open one as well.
++      const stopPropagation = Reflect.get(event, "stopPropagation");
++      if (typeof stopPropagation === "function") stopPropagation.call(event);
++      onOpen({ x, y });
++    },
++  };
++}
+diff --git a/index.server.ts b/index.server.ts
+index 975fe77..1b60920 100644
+--- a/index.server.ts
++++ b/index.server.ts
+@@ -15,6 +15,7 @@ import { registerCrewSeen } from "./server/crew-seen";
+ import { ReportCache, loadFleet, readAgentTools } from "./server/fleet";
+ import { findFiles, listDirectory, readTextFile, requireHome, writeTextFile } from "./server/files";
+ import { readHomeImageFile } from "./server/images";
++import { revealInHome } from "./server/reveal";
+ import { CHARTER_FILE, NEW_CHARTER_FILE, acknowledgeCharter, writeNewCharter } from "./server/charter-file";
+ import { isHomeReady, prepareHome, removeSuggestion } from "./server/home";
+ import {
+@@ -53,7 +54,7 @@ import {
+ } from "./shared/fleet";
+ import { readQuotaSnapshot } from "./server/quota";
+ import { readQuota } from "./shared/quota";
+-import { findHomeFiles, listHomeFiles, readHomeFile, readHomeImage, writeHomeFile } from "./shared/files";
++import { findHomeFiles, listHomeFiles, readHomeFile, readHomeImage, revealHomePath, writeHomeFile } from "./shared/files";
+ import { startWatches } from "./server/watch-service";
+ import { displaySettings } from "./shared/settings";
+ 
+@@ -140,6 +141,8 @@ export default function contribute(server: PluginServerContext) {
+   server.handle(readHomeFile, async ({ path }) => readTextFile(await home(), path));
+   server.handle(readHomeImage, async (input) => readHomeImageFile(await home(), input));
+   server.handle(findHomeFiles, async ({ paths }) => ({ files: await findFiles(await home(), paths) }));
++  // Opens on the daemon's machine, whichever client asked; see server/reveal.ts.
++  server.handle(revealHomePath, async ({ path }) => revealInHome(await home(), path));
+   server.handle(writeHomeFile, async (input) => {
+     const written = await writeTextFile(await home(), input);
+     // The charter's source, saved in the panel, reaches AGENTS.md at once rather than at the next reload.
+diff --git a/server/reveal.test.ts b/server/reveal.test.ts
+new file mode 100644
+index 0000000..c2beaac
+--- /dev/null
++++ b/server/reveal.test.ts
+@@ -0,0 +1,213 @@
++import { EventEmitter } from "node:events";
++import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import { explorerArgument, revealCommand, revealInHome, revealTarget, startDetached, type Spawner } from "./reveal";
++
++let outer: string;
++let home: string;
++
++beforeEach(async () => {
++  outer = await realpath(await mkdtemp(join(tmpdir(), "firstmate-reveal-")));
++  home = join(outer, "home");
++  await mkdir(join(home, "data", "scout, the second"), { recursive: true });
++  await writeFile(join(home, "data", "scout, the second", "my report, v2.md"), "# Report\n");
++  await writeFile(join(home, "AGENTS.md"), "charter");
++  await writeFile(join(outer, "outside.md"), "not the home's");
++});
++
++afterEach(async () => {
++  await rm(outer, { recursive: true, force: true });
++});
++
++/** A spawner that records what it was asked to start, and then starts, fails to start, or throws. */
++function fakeSpawner(outcome: "spawn" | Error | "throw" = "spawn") {
++  const calls: { command: string; args: string[]; options: Parameters<Spawner>[2] }[] = [];
++  let unrefs = 0;
++  const spawner: Spawner = (command, args, options) => {
++    calls.push({ command, args, options });
++    if (outcome === "throw") throw new Error("spawn EINVAL");
++    const child = Object.assign(new EventEmitter(), { unref: () => void (unrefs += 1) });
++    queueMicrotask(() => (outcome === "spawn" ? child.emit("spawn") : child.emit("error", outcome)));
++    return child;
++  };
++  return { spawner, calls, unrefs: () => unrefs };
++}
++
++describe("explorerArgument", () => {
++  it("quotes the path whole, so a space or a comma stays in it", () => {
++    expect(explorerArgument("C:\\Users\\cap\\my files, old\\a b.md")).toBe('"C:\\Users\\cap\\my files, old\\a b.md"');
++  });
++
++  it("writes it with backslashes, normalized", () => {
++    expect(explorerArgument("C:/Users/cap/./data/../AGENTS.md")).toBe('"C:\\Users\\cap\\AGENTS.md"');
++  });
++
++  it("drops a trailing backslash, which would escape the closing quote, except on a drive's root", () => {
++    expect(explorerArgument("C:\\Users\\cap\\data\\")).toBe('"C:\\Users\\cap\\data"');
++    expect(explorerArgument("D:\\")).toBe('"D:\\"');
++  });
++
++  it("keeps a network path", () => {
++    expect(explorerArgument("\\\\server\\share\\a, b.txt")).toBe('"\\\\server\\share\\a, b.txt"');
++  });
++
++  it("refuses a relative path and one with a double quote", () => {
++    expect(() => explorerArgument("data\\x.md")).toThrow(/not an absolute Windows path/);
++    expect(() => explorerArgument('C:\\a"b.md')).toThrow(/double quote/);
++  });
++});
++
++describe("revealCommand", () => {
++  const env = { SystemRoot: "C:\\Windows" };
++
++  it("selects a file in Explorer, by Explorer's full path, with the quotes passed verbatim", () => {
++    expect(revealCommand("C:\\Users\\cap\\home\\data\\a, b c.md", "file", "win32", env)).toEqual({
++      command: "C:\\Windows\\explorer.exe",
++      args: ['/select,"C:\\Users\\cap\\home\\data\\a, b c.md"'],
++      verbatim: true,
++      manager: "Explorer",
++    });
++  });
++
++  it("opens a folder in Explorer", () => {
++    expect(revealCommand("C:\\Users\\cap\\home\\data", "dir", "win32", env)).toMatchObject({
++      command: "C:\\Windows\\explorer.exe",
++      args: ['"C:\\Users\\cap\\home\\data"'],
++      verbatim: true,
++    });
++  });
++
++  it("finds the Windows folder from windir, or assumes C:\\Windows", () => {
++    expect(revealCommand("C:\\x.md", "file", "win32", { windir: "E:\\WINNT" }).command).toBe("E:\\WINNT\\explorer.exe");
++    expect(revealCommand("C:\\x.md", "file", "win32", {}).command).toBe("C:\\Windows\\explorer.exe");
++  });
++
++  it("reveals a file in Finder and opens a folder there, one argument each", () => {
++    expect(revealCommand("/Users/cap/home/a, b c.md", "file", "darwin")).toEqual({
++      command: "/usr/bin/open",
++      args: ["-R", "/Users/cap/home/a, b c.md"],
++      verbatim: false,
++      manager: "Finder",
++    });
++    expect(revealCommand("/Users/cap/home/data", "dir", "darwin").args).toEqual(["/Users/cap/home/data"]);
++  });
++
++  it("opens a file's folder, or the folder itself, with xdg-open elsewhere", () => {
++    expect(revealCommand("/home/cap/fm/data/a b.md", "file", "linux")).toEqual({
++      command: "xdg-open",
++      args: ["/home/cap/fm/data"],
++      verbatim: false,
++      manager: "the file manager",
++    });
++    expect(revealCommand("/home/cap/fm/data", "dir", "freebsd").args).toEqual(["/home/cap/fm/data"]);
++  });
++
++  it("refuses a relative path on POSIX, which could be read as an option", () => {
++    expect(() => revealCommand("-R", "file", "darwin")).toThrow(/not an absolute path/);
++    expect(() => revealCommand("data/a.md", "file", "linux")).toThrow(/not an absolute path/);
++  });
++});
++
++describe("startDetached", () => {
++  it("starts the program detached, without a shell or a window hidden, and does not wait for it", async () => {
++    const fake = fakeSpawner();
++    await startDetached(revealCommand("C:\\a b.md", "file", "win32", {}), fake.spawner);
++    expect(fake.calls).toHaveLength(1);
++    expect(fake.calls[0]!.options).toMatchObject({
++      detached: true,
++      stdio: "ignore",
++      shell: false,
++      windowsHide: false,
++      windowsVerbatimArguments: true,
++    });
++    expect(fake.unrefs()).toBe(1);
++  });
++
++  it("passes POSIX arguments for Node to quote", async () => {
++    const fake = fakeSpawner();
++    await startDetached(revealCommand("/a b.md", "file", "darwin"), fake.spawner);
++    expect(fake.calls[0]!.options.windowsVerbatimArguments).toBe(false);
++  });
++
++  it("says which program was missing", async () => {
++    const missing = Object.assign(new Error("spawn xdg-open ENOENT"), { code: "ENOENT" });
++    const fake = fakeSpawner(missing);
++    await expect(startDetached(revealCommand("/a.md", "file", "linux"), fake.spawner)).rejects.toThrow(
++      "xdg-open was not found, so the file manager could not be opened.",
++    );
++  });
++
++  it("passes on any other failure to start, thrown or reported", async () => {
++    await expect(startDetached(revealCommand("/a.md", "file", "linux"), fakeSpawner(new Error("EACCES")).spawner)).rejects.toThrow("EACCES");
++    await expect(startDetached(revealCommand("/a.md", "file", "linux"), fakeSpawner("throw").spawner)).rejects.toThrow("EINVAL");
++  });
++});
++
++describe("revealTarget", () => {
++  it("finds a file in the home, by its real path", async () => {
++    await expect(revealTarget(home, "data/scout, the second/my report, v2.md")).resolves.toEqual({
++      path: "data/scout, the second/my report, v2.md",
++      absolute: join(home, "data", "scout, the second", "my report, v2.md"),
++      kind: "file",
++    });
++  });
++
++  it("takes backslashes, and finds folders and the home itself", async () => {
++    await expect(revealTarget(home, "data\\scout, the second")).resolves.toMatchObject({ path: "data/scout, the second", kind: "dir" });
++    await expect(revealTarget(home, "")).resolves.toMatchObject({ path: "", absolute: home, kind: "dir" });
++  });
++
++  it("refuses anything missing", async () => {
++    await expect(revealTarget(home, "data/nothing.md")).rejects.toThrow('"data/nothing.md" does not exist');
++  });
++
++  it("refuses paths outside the home: up, absolute, or a drive", async () => {
++    await expect(revealTarget(home, "../outside.md")).rejects.toThrow(/outside the home/);
++    await expect(revealTarget(home, "data/../../outside.md")).rejects.toThrow(/outside the home/);
++    await expect(revealTarget(home, join(outer, "outside.md"))).rejects.toThrow(/not a path inside the home/);
++    await expect(revealTarget(home, "C:\\Windows\\explorer.exe")).rejects.toThrow(/not a path inside the home/);
++    await expect(revealTarget(home, "/etc/passwd")).rejects.toThrow(/not a path inside the home/);
++  });
++
++  it("refuses a junction or symlink that leads out of the home, and anything through it", async () => {
++    // A junction needs no privilege on Windows; elsewhere the type is ignored.
++    await symlink(outer, join(home, "escape"), "junction");
++    await expect(revealTarget(home, "escape")).rejects.toThrow(/leads outside the home/);
++    await expect(revealTarget(home, "escape/outside.md")).rejects.toThrow(/leads outside the home/);
++  });
++
++  it("shows a link inside the home as what it points to", async () => {
++    await symlink(join(home, "data"), join(home, "shortcut"), "junction");
++    await expect(revealTarget(home, "shortcut")).resolves.toMatchObject({ absolute: join(home, "data"), kind: "dir" });
++  });
++
++  it("refuses a dangling link", async () => {
++    await symlink(join(home, "gone"), join(home, "dangling"), "junction");
++    await expect(revealTarget(home, "dangling")).rejects.toThrow(/does not exist/);
++  });
++});
++
++describe("revealInHome", () => {
++  it("starts Explorer on the file with it selected, and says where", async () => {
++    const fake = fakeSpawner();
++    const result = await revealInHome(home, "data/scout, the second/my report, v2.md", {
++      platform: "win32",
++      env: { SystemRoot: "C:\\Windows" },
++      spawner: fake.spawner,
++    });
++    expect(result).toMatchObject({ path: "data/scout, the second/my report, v2.md", kind: "file", manager: "Explorer" });
++    expect(result.host.length).toBeGreaterThan(0);
++    const absolute = join(home, "data", "scout, the second", "my report, v2.md");
++    expect(fake.calls[0]!.args).toEqual([`/select,${explorerArgument(absolute)}`]);
++  });
++
++  it("starts nothing for a path it refuses", async () => {
++    const fake = fakeSpawner();
++    await expect(revealInHome(home, "../outside.md", { platform: "win32", spawner: fake.spawner })).rejects.toThrow();
++    await expect(revealInHome(home, "missing.md", { platform: "darwin", spawner: fake.spawner })).rejects.toThrow();
++    expect(fake.calls).toEqual([]);
++  });
++});
+diff --git a/server/reveal.ts b/server/reveal.ts
+new file mode 100644
+index 0000000..0469a77
+--- /dev/null
++++ b/server/reveal.ts
+@@ -0,0 +1,169 @@
++/**
++ * A file or folder in the home, shown in the file manager of the machine the
++ * daemon runs on — Explorer, Finder, or whatever `xdg-open` picks. That is
++ * the captain's desktop when Paseo runs there; from a phone or another
++ * computer, the window still opens on the daemon's machine.
++ *
++ * The path is confined exactly as a read is (`resolveInHome`: no `..`, no
++ * absolute path, no symlink or junction that lands outside), and then
++ * resolved to its real path, which is checked again and is what gets shown,
++ * so the file manager is pointed at the very thing that was checked. Only an
++ * existing file or folder is shown.
++ *
++ * The file manager is started from an argument list, never through a shell,
++ * and not waited on: Explorer exits non-zero even when it worked, so all that
++ * counts is that it started.
++ */
++import type { SpawnOptions } from "node:child_process";
++import { spawn } from "node:child_process";
++import { realpath, stat } from "node:fs/promises";
++import { hostname } from "node:os";
++import { isAbsolute, posix, relative, win32 } from "node:path";
++
++import { resolveInHome } from "./files";
++
++export type RevealKind = "file" | "dir";
++
++/** How to show one path: a program and its arguments, as `spawn` takes them. */
++export interface RevealCommand {
++  command: string;
++  args: string[];
++  /**
++   * Windows only: pass `args` to the program exactly as written. Node would
++   * otherwise quote `/select,"C:\a b\x"` into a form Explorer does not read,
++   * so the quotes are written here instead (see `explorerArgument`).
++   */
++  verbatim: boolean;
++  /** What to call the program in a message. */
++  manager: string;
++}
++
++/**
++ * A path for Explorer's command line, in the double quotes that keep a
++ * space or a comma — which Explorer otherwise splits its arguments at — inside
++ * the path. A double quote cannot be in a Windows file name, so none can end
++ * the quoted part early; one is refused all the same rather than trusted.
++ */
++export function explorerArgument(absolute: string): string {
++  const path = win32.normalize(absolute);
++  if (!win32.isAbsolute(path)) throw new Error(`"${absolute}" is not an absolute Windows path.`);
++  if (path.includes('"')) throw new Error(`"${absolute}" has a double quote in it, which Explorer cannot be given.`);
++  // A trailing backslash would escape the closing quote; only a drive's root keeps one.
++  const trimmed = /^[a-zA-Z]:\\$/.test(path) ? path : path.replace(/\\+$/, "");
++  return `"${trimmed}"`;
++}
++
++/**
++ * The command that shows `absolute`, a file or a folder, on `platform`: on
++ * Windows, Explorer with the file selected in its folder, or the folder
++ * opened; on macOS, Finder the same way (`open -R`, `open`); elsewhere,
++ * `xdg-open` on the file's folder, or on the folder itself.
++ */
++export function revealCommand(
++  absolute: string,
++  kind: RevealKind,
++  platform: NodeJS.Platform = process.platform,
++  env: NodeJS.ProcessEnv = process.env,
++): RevealCommand {
++  if (platform === "win32") {
++    // By full path: the daemon's PATH may not have the Windows folder, and nothing else named explorer should run.
++    const explorer = win32.join(env.SystemRoot ?? env.windir ?? "C:\\Windows", "explorer.exe");
++    const target = explorerArgument(absolute);
++    return { command: explorer, args: [kind === "file" ? `/select,${target}` : target], verbatim: true, manager: "Explorer" };
++  }
++  // An absolute POSIX path starts with `/`, so neither program can take it for an option.
++  if (!posix.isAbsolute(absolute)) throw new Error(`"${absolute}" is not an absolute path.`);
++  if (platform === "darwin") {
++    return { command: "/usr/bin/open", args: kind === "file" ? ["-R", absolute] : [absolute], verbatim: false, manager: "Finder" };
++  }
++  return {
++    command: "xdg-open",
++    args: [kind === "file" ? posix.dirname(absolute) : absolute],
++    verbatim: false,
++    manager: "the file manager",
++  };
++}
++
++/** The part of a child process a reveal uses: whether it started. */
++export interface StartedProcess {
++  once(event: "spawn", listener: () => void): unknown;
++  once(event: "error", listener: (error: Error) => void): unknown;
++  unref(): void;
++}
++
++export type Spawner = (command: string, args: string[], options: SpawnOptions) => StartedProcess;
++
++/**
++ * Starts `command` on its own and resolves once it has started, without
++ * waiting for it to exit; rejects when it cannot start at all.
++ */
++export function startDetached(command: RevealCommand, spawner: Spawner = spawn): Promise<void> {
++  return new Promise((resolve, reject) => {
++    let child: StartedProcess;
++    try {
++      child = spawner(command.command, command.args, {
++        detached: true,
++        stdio: "ignore",
++        // Explorer's window is the point, and it has no console to hide; hiding it could hide the window.
++        windowsHide: false,
++        windowsVerbatimArguments: command.verbatim,
++        shell: false,
++      });
++    } catch (error) {
++      reject(error);
++      return;
++    }
++    child.once("error", (error) =>
++      reject(
++        (error as NodeJS.ErrnoException).code === "ENOENT"
++          ? new Error(`${command.command} was not found, so ${command.manager} could not be opened.`)
++          : error,
++      ),
++    );
++    child.once("spawn", () => {
++      child.unref();
++      resolve();
++    });
++  });
++}
++
++function isInside(root: string, candidate: string): boolean {
++  const between = relative(root, candidate);
++  return between === "" || (!between.startsWith("..") && !isAbsolute(between));
++}
++
++/** The real path and kind of `path`, an existing file or folder in the home, or a clear refusal. */
++export async function revealTarget(home: string, path: string): Promise<{ path: string; absolute: string; kind: RevealKind }> {
++  const { absolute, relative: rel } = await resolveInHome(home, path);
++  const shown = rel === "" ? "The home" : `"${rel}"`;
++  let real: string;
++  try {
++    real = await realpath(absolute);
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code === "ENOENT") throw new Error(`${shown} does not exist, so there is nothing to show.`);
++    throw error;
++  }
++  // `resolveInHome` checked this already; the real path is what is shown, so it is checked again as that.
++  if (!isInside(await realpath(home), real)) throw new Error(`${shown} leads outside the home.`);
++  const info = await stat(real);
++  if (!info.isFile() && !info.isDirectory()) throw new Error(`${shown} is neither a file nor a folder.`);
++  return { path: rel, absolute: real, kind: info.isDirectory() ? "dir" : "file" };
++}
++
++export interface RevealDeps {
++  platform?: NodeJS.Platform;
++  env?: NodeJS.ProcessEnv;
++  spawner?: Spawner;
++}
++
++/** What `firstmate.files.reveal` does: shows `path` in the daemon machine's file manager. */
++export async function revealInHome(
++  home: string,
++  path: string,
++  deps: RevealDeps = {},
++): Promise<{ path: string; kind: RevealKind; manager: string; host: string }> {
++  const target = await revealTarget(home, path);
++  const command = revealCommand(target.absolute, target.kind, deps.platform, deps.env);
++  await startDetached(command, deps.spawner);
++  return { path: target.path, kind: target.kind, manager: command.manager, host: hostname() };
++}
+diff --git a/shared/files.ts b/shared/files.ts
+index db6cab1..a55f5b3 100644
+--- a/shared/files.ts
++++ b/shared/files.ts
+@@ -97,3 +97,23 @@ export const readHomeImage = defineRpc({
+     modifiedMs: z.number(),
+   }),
+ });
++
++/**
++ * Shows a file or folder in the home in the file manager — Explorer, Finder,
++ * or what `xdg-open` picks — of the machine the daemon runs on, which is not
++ * the captain's when the panel is open on a phone or another computer. A file
++ * is selected in its folder; a folder, or `""` for the home, is opened. Only
++ * an existing file or folder in the home is shown, confined as a read is.
++ */
++export const revealHomePath = defineRpc({
++  name: "firstmate.files.reveal",
++  input: z.object({ path: z.string().max(MAX_FILE_PATH_LENGTH) }),
++  output: z.object({
++    path: z.string(),
++    kind: z.enum(["dir", "file"]),
++    /** What opened it, for a message: "Explorer", "Finder" or "the file manager". */
++    manager: z.string(),
++    /** The name of the machine it opened on. */
++    host: z.string(),
++  }),
++});

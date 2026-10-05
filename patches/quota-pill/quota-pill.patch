@@ -1,0 +1,623 @@
+diff --git a/original/client/chat.tsx b/modified/client/chat.tsx
+index 257e618..d07580c 100644
+--- a/original/client/chat.tsx
++++ b/modified/client/chat.tsx
+@@ -30,6 +30,7 @@ import { MateControls } from "./mate-controls";
+ import { useMateSender } from "./mate-send";
+ import { Markdown } from "./markdown";
+ import { PermissionCard, usePendingRequests } from "./permission-card";
++import { QuotaPill } from "./quota-pill";
+ import { transcriptRows, type TranscriptRow } from "./transcript-rows";
+ import { IconButton, JumpToEnd, MONOSPACE, Spinner, errorText } from "./ui";
+ import { useKeyboardOverlap } from "./keyboard";
+@@ -434,6 +435,7 @@ export function MateChat({
+               disabled={sending}
+               onPress={() => sendCommand("ahoy")}
+             />
++            <QuotaPill theme={theme} />
+             <MateControls
+               theme={theme}
+               compact={compact}
+diff --git a/modified/client/quota-pill.tsx b/modified/client/quota-pill.tsx
+new file mode 100644
+index 0000000..b284216
+--- /dev/null
++++ b/modified/client/quota-pill.tsx
+@@ -0,0 +1,178 @@
++/**
++ * Codex and Claude quota USED, beside the chat's Bearings and Ahoy buttons:
++ * a Codex icon and a Claude icon with their percent, the session (five-hour) window. Pressing it opens a
++ * small card below with session and weekly use, reset times and freshness.
++ * The numbers come from the daemon's read of Usage Monitor's saved readings
++ * (server/quota.ts); this never calls a vendor.
++ */
++import type { PluginTheme } from "@getpaseo/plugin";
++import { useRpc } from "@getpaseo/plugin/client";
++import { useQuery } from "@tanstack/react-query";
++import { useEffect, useMemo, useState } from "react";
++import { AppState, Image, Pressable, Text, View } from "react-native";
++
++import {
++  QUOTA_POLL_MS,
++  QUOTA_PROVIDERS,
++  QUOTA_QUERY_KEY,
++  freshnessWords,
++  providerName,
++  quotaCells,
++  readQuota,
++  type QuotaProviderId,
++  type QuotaTone,
++  type QuotaWindow,
++} from "../shared/quota";
++import { QUOTA_LOGOS } from "../shared/quota-logos";
++
++const ICON_SIZE = 14;
++// One source object per provider: a new one each render makes the image reload.
++const LOGO_SOURCES = {
++  claude: { uri: QUOTA_LOGOS.claude },
++  codex: { uri: QUOTA_LOGOS.codex },
++};
++
++/** The provider's mark, tinted like the text beside it. Hidden from screen readers: the label names the provider in words. */
++function ProviderIcon({ id, color, size = ICON_SIZE }: { id: QuotaProviderId; color: string; size?: number }) {
++  return (
++    <Image
++      accessible={false}
++      accessibilityElementsHidden
++      importantForAccessibility="no-hide-descendants"
++      accessibilityIgnoresInvertColors
++      source={LOGO_SOURCES[id]}
++      style={{ width: size, height: size, tintColor: color }}
++      resizeMode="contain"
++    />
++  );
++}
++
++function resetText(resetsAt: string | null): string {
++  if (resetsAt === null) return "reset unknown";
++  const at = new Date(resetsAt);
++  return Number.isNaN(at.getTime()) ? "reset unknown" : `resets ${at.toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" })}`;
++}
++
++function windowText(window: QuotaWindow | null): string {
++  return window === null ? "—" : `${Math.round(window.usedPercent)}% used · ${resetText(window.resetsAt)}`;
++}
++
++export function QuotaPill({ theme }: { theme: PluginTheme }) {
++  const colors = theme.colors;
++  const read = useRpc(readQuota);
++  const [open, setOpen] = useState(false);
++  const [nowMs, setNowMs] = useState(() => Date.now());
++  const query = useQuery({
++    queryKey: QUOTA_QUERY_KEY,
++    queryFn: () => read({}),
++    refetchInterval: QUOTA_POLL_MS,
++    refetchOnWindowFocus: true,
++    refetchOnReconnect: true,
++  });
++  const { refetch, dataUpdatedAt } = query;
++
++  // Coming back to the foreground re-reads at once; the ages tick with each read.
++  useEffect(() => {
++    const subscription = AppState.addEventListener("change", (state) => {
++      if (state === "active") void refetch();
++    });
++    return () => subscription.remove();
++  }, [refetch]);
++  useEffect(() => setNowMs(Date.now()), [dataUpdatedAt]);
++  useEffect(() => {
++    const timer = setInterval(() => setNowMs(Date.now()), QUOTA_POLL_MS);
++    return () => clearInterval(timer);
++  }, []);
++
++  const styles = useMemo(
++    () => ({
++      pill: {
++        flexDirection: "row" as const,
++        alignItems: "center" as const,
++        minHeight: 28,
++        paddingHorizontal: 10,
++        paddingVertical: 6,
++        borderRadius: 8,
++        borderWidth: 1,
++        borderColor: colors.border,
++        backgroundColor: colors.surface1,
++      },
++      text: { fontSize: 12, fontWeight: "500" as const },
++      cell: { flexDirection: "row" as const, alignItems: "center" as const, gap: 4 },
++      titleRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
++      card: {
++        width: "100%" as const,
++        gap: 4,
++        padding: 10,
++        borderRadius: 8,
++        borderWidth: 1,
++        borderColor: colors.border,
++        backgroundColor: colors.surface1,
++      },
++      title: { color: colors.foreground, fontSize: 12, fontWeight: "600" as const },
++      line: { color: colors.foregroundMuted, fontSize: 11 },
++    }),
++    [colors],
++  );
++  const toneColor: Record<QuotaTone, string> = {
++    normal: colors.foreground,
++    muted: colors.foregroundMuted,
++    warning: colors.statusWarning,
++    danger: colors.statusDanger,
++  };
++
++  const snapshot = query.data;
++  if (snapshot === undefined && !query.isError) {
++    return (
++      <View style={styles.pill} accessibilityLabel="Quota loading">
++        <Text style={[styles.text, { color: colors.foregroundMuted }]}>Quota …</Text>
++      </View>
++    );
++  }
++  if (snapshot === undefined || snapshot.state === "unavailable") {
++    return (
++      <View style={styles.pill} accessibilityLabel="Quota unavailable">
++        <Text style={[styles.text, { color: colors.foregroundMuted }]}>Quota unavailable</Text>
++      </View>
++    );
++  }
++
++  const cells = quotaCells(snapshot, nowMs);
++  return (
++    <>
++      <Pressable
++        style={styles.pill}
++        accessibilityRole="button"
++        accessibilityLabel={`Quota used. ${cells.map((cell) => cell.label).join(". ")}`}
++        accessibilityState={{ expanded: open }}
++        onPress={() => setOpen((was) => !was)}
++      >
++        {cells.map((cell, index) => (
++          <View key={cell.id} style={styles.cell}>
++            {index === 0 ? null : <Text style={[styles.text, { color: colors.foregroundMuted }]}>{" · "}</Text>}
++            <ProviderIcon id={cell.id} color={toneColor[cell.tone]} />
++            <Text style={[styles.text, { color: toneColor[cell.tone] }]}>{cell.text}</Text>
++          </View>
++        ))}
++      </Pressable>
++      {open ? (
++        <View style={styles.card}>
++          {QUOTA_PROVIDERS.map((id) => {
++            const provider = snapshot.providers.find((entry) => entry.id === id);
++            return (
++              <View key={id}>
++                <View style={styles.titleRow}>
++                  <ProviderIcon id={id} color={colors.foreground} />
++                  <Text style={styles.title}>{providerName(id)}</Text>
++                </View>
++                <Text style={styles.line}>Session: {windowText(provider?.session ?? null)}</Text>
++                <Text style={styles.line}>Weekly: {windowText(provider?.weekly ?? null)}</Text>
++                <Text style={styles.line}>{freshnessWords(id, provider?.fetchedAt ?? null, nowMs)}</Text>
++              </View>
++            );
++          })}
++        </View>
++      ) : null}
++    </>
++  );
++}
+diff --git a/original/index.server.ts b/modified/index.server.ts
+index b760d6f..912aab0 100644
+--- a/original/index.server.ts
++++ b/modified/index.server.ts
+@@ -49,6 +49,8 @@ import {
+   toggleWatch,
+   writeConfig,
+ } from "./shared/fleet";
++import { readQuotaSnapshot } from "./server/quota";
++import { readQuota } from "./shared/quota";
+ import { findHomeFiles, listHomeFiles, readHomeFile, writeHomeFile } from "./shared/files";
+ import { startWatches } from "./server/watch-service";
+ import { displaySettings } from "./shared/settings";
+@@ -86,6 +88,9 @@ export default function contribute(server: PluginServerContext) {
+     return { agentTools: (await readAgentTools(paseo)) === true };
+   });
+ 
++  // Usage Monitor's saved readings, for the chat's quota pill; see server/quota.ts.
++  server.handle(readQuota, () => readQuotaSnapshot());
++
+   server.handle(launchMateRpc, (input, { paseo }) => launchMate(paseo, input));
+   server.handle(adoptMateRpc, async ({ agentId }, { paseo }) => ({ config: await adoptMate(paseo, agentId) }));
+   server.handle(releaseMateRpc, async () => ({ config: await releaseMate() }));
+diff --git a/modified/server/quota.test.ts b/modified/server/quota.test.ts
+new file mode 100644
+index 0000000..8c3dacc
+--- /dev/null
++++ b/modified/server/quota.test.ts
+@@ -0,0 +1,125 @@
++import { mkdtemp, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { describe, expect, it } from "vitest";
++
++import { formatAge, isStale, quotaCell, quotaCells, type QuotaProvider } from "../shared/quota";
++import { MAX_FILE_BYTES, parseQuotaFile, readQuotaSnapshot } from "./quota";
++
++const NOW = Date.parse("2026-01-01T12:00:00.000Z");
++const minutesAgo = (m: number) => new Date(NOW - m * 60_000).toISOString();
++
++function quota(id: string, percent: unknown, label = "Session", resetsAt: string | null = "2026-01-01T15:00:00Z") {
++  return { kind: "quota", id, label, percent, window: { label, resetsAt, durationMs: 1 } };
++}
++function file(providers: Record<string, unknown>, version: unknown = 1) {
++  return JSON.stringify({ version, providers });
++}
++const good = file({
++  codex: { fetchedAt: minutesAgo(2), readings: [quota("session", 32), quota("weekly", 10, "Weekly", null)] },
++  claude: { fetchedAt: minutesAgo(1), readings: [quota("session", 61.4), quota("weekly", 4, "Weekly")] },
++});
++
++describe("parseQuotaFile", () => {
++  it("keeps percent, window, reset and read time only", () => {
++    const snapshot = parseQuotaFile(good, NOW);
++    expect(snapshot.state).toBe("ok");
++    expect(snapshot.providers[0]).toEqual({
++      id: "codex",
++      session: { usedPercent: 32, window: "Session", resetsAt: "2026-01-01T15:00:00.000Z" },
++      weekly: { usedPercent: 10, window: "Weekly", resetsAt: null },
++      fetchedAt: minutesAgo(2),
++    });
++  });
++
++  it("leaves a missing provider empty without hiding the other", () => {
++    const snapshot = parseQuotaFile(
++      file({ claude: { fetchedAt: minutesAgo(1), readings: [quota("session", 5)] } }),
++      NOW,
++    );
++    expect(snapshot.state).toBe("ok");
++    expect(snapshot.providers[0]).toEqual({ id: "codex", session: null, weekly: null, fetchedAt: null });
++    expect(quotaCells(snapshot, NOW).map((c) => c.text)).toEqual(["—", "5%"]);
++  });
++
++  it.each([
++    ["not json", "{nope"],
++    ["wrong version", file({}, 2)],
++    ["array root", "[]"],
++    ["no providers", JSON.stringify({ version: 1 })],
++  ])("is unavailable for %s", (_name, text) => {
++    expect(parseQuotaFile(text, NOW)).toEqual({ state: "unavailable", providers: [] });
++  });
++
++  it("drops bad readings: out-of-range or non-numeric percent, bad or future timestamp", () => {
++    const snapshot = parseQuotaFile(
++      file({
++        codex: { fetchedAt: minutesAgo(1), readings: [quota("session", 140), quota("weekly", "12")] },
++        claude: { fetchedAt: new Date(NOW + 3_600_000).toISOString(), readings: [quota("session", 5)] },
++      }),
++      NOW,
++    );
++    expect(snapshot.providers[0]?.session).toBeNull();
++    expect(snapshot.providers[0]?.weekly).toBeNull();
++    expect(snapshot.providers[1]?.session).toBeNull();
++    const badTime = parseQuotaFile(file({ codex: { fetchedAt: "garbage", readings: [quota("session", 1)] } }), NOW);
++    expect(badTime.providers[0]?.session).toBeNull();
++  });
++
++  it("passes on no extra fields", () => {
++    const text = file({
++      codex: { fetchedAt: minutesAgo(1), token: "secret-value", readings: [{ ...quota("session", 3), token: "secret-value" }] },
++    });
++    expect(JSON.stringify(parseQuotaFile(text, NOW))).not.toContain("secret-value");
++  });
++});
++
++describe("readQuotaSnapshot", () => {
++  it("is unavailable for a missing file and an oversized one, ok for a good one", async () => {
++    const dir = await mkdtemp(join(tmpdir(), "quota-"));
++    expect((await readQuotaSnapshot(join(dir, "none.json"), NOW)).state).toBe("unavailable");
++    const big = join(dir, "big.json");
++    await writeFile(big, " ".repeat(MAX_FILE_BYTES + 1));
++    expect((await readQuotaSnapshot(big, NOW)).state).toBe("unavailable");
++    const ok = join(dir, "ok.json");
++    await writeFile(ok, good);
++    expect((await readQuotaSnapshot(ok, NOW)).state).toBe("ok");
++  });
++});
++
++describe("formatting", () => {
++  const codex = (fetchedAt: string | null, percent = 32): QuotaProvider => ({
++    id: "codex",
++    session: { usedPercent: percent, window: "Session", resetsAt: null },
++    weekly: null,
++    fetchedAt,
++  });
++
++  it("shows percent used for both providers", () => {
++    expect(quotaCells(parseQuotaFile(good, NOW), NOW).map((c) => c.text)).toEqual(["32%", "61%"]);
++  });
++
++  it("uses source-aware staleness thresholds", () => {
++    expect(isStale("codex", minutesAgo(11), NOW)).toBe(true);
++    expect(isStale("codex", minutesAgo(9), NOW)).toBe(false);
++    expect(isStale("claude", minutesAgo(30), NOW)).toBe(false);
++    expect(isStale("claude", minutesAgo(46), NOW)).toBe(true);
++  });
++
++  it("keeps the last value and shows its age when stale", () => {
++    const cell = quotaCell(codex(minutesAgo(125)), "codex", NOW);
++    expect(cell.text).toBe("32% · 2h old");
++    expect(cell.stale).toBe(true);
++    expect(cell.tone).toBe("warning");
++    expect(cell.label).toBe("Codex: 32 percent used, Session window, stale, updated 2h ago");
++  });
++
++  it("colours by how much is used", () => {
++    expect(quotaCell(codex(minutesAgo(1), 80), "codex", NOW).tone).toBe("warning");
++    expect(quotaCell(codex(minutesAgo(1), 95), "codex", NOW).tone).toBe("danger");
++  });
++
++  it("formats ages", () => {
++    expect([0, 5 * 60_000, 3 * 3_600_000, 72 * 3_600_000].map(formatAge)).toEqual(["just now", "5m", "3h", "3d"]);
++  });
++});
+diff --git a/modified/server/quota.ts b/modified/server/quota.ts
+new file mode 100644
+index 0000000..ea302b8
+--- /dev/null
++++ b/modified/server/quota.ts
+@@ -0,0 +1,96 @@
++/**
++ * Reads Usage Monitor's saved last-good readings, `$PASEO_HOME/usage-limits/last-readings.json`,
++ * for the chat's quota pill. Read-only and local: no credential file is opened
++ * and no vendor endpoint is called. The file is another plugin's cache, so it
++ * is validated strictly and only the percent, window name, reset time and
++ * read time leave this module. Anything malformed makes the whole snapshot
++ * `unavailable` rather than showing a guess.
++ */
++import { readFile, stat } from "node:fs/promises";
++import { join } from "node:path";
++
++import { QUOTA_PROVIDERS, type QuotaProvider, type QuotaSnapshot, type QuotaWindow } from "../shared/quota";
++import { paseoHome } from "./data-dir";
++
++const SUPPORTED_VERSION = 1;
++/** The real file is a few kilobytes; anything past this is not it. */
++export const MAX_FILE_BYTES = 256 * 1024;
++/** A reading dated further ahead than this is a broken clock or file, not a reading. */
++const MAX_FUTURE_MS = 5 * 60 * 1000;
++const MAX_LABEL = 40;
++
++const UNAVAILABLE: QuotaSnapshot = { state: "unavailable", providers: [] };
++
++export function quotaFilePath(): string {
++  return join(paseoHome(), "usage-limits", "last-readings.json");
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function isoOrNull(value: unknown): string | null {
++  if (typeof value !== "string") return null;
++  const ms = Date.parse(value);
++  return Number.isNaN(ms) ? null : new Date(ms).toISOString();
++}
++
++function label(value: unknown): string | null {
++  return typeof value === "string" && value.trim() !== "" ? value.trim().slice(0, MAX_LABEL) : null;
++}
++
++function quotaWindow(reading: unknown): QuotaWindow | null {
++  if (!isRecord(reading) || reading.kind !== "quota") return null;
++  const percent = reading.percent;
++  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) return null;
++  const window = isRecord(reading.window) ? reading.window : {};
++  return {
++    usedPercent: percent,
++    window: label(window.label) ?? label(reading.label) ?? "quota",
++    resetsAt: isoOrNull(window.resetsAt),
++  };
++}
++
++function provider(id: QuotaProvider["id"], entry: unknown, nowMs: number): QuotaProvider {
++  const empty: QuotaProvider = { id, session: null, weekly: null, fetchedAt: null };
++  if (!isRecord(entry) || !Array.isArray(entry.readings)) return empty;
++  const fetchedAt = isoOrNull(entry.fetchedAt);
++  if (fetchedAt === null || Date.parse(fetchedAt) - nowMs > MAX_FUTURE_MS) return empty;
++  const readings: unknown[] = entry.readings;
++  const find = (readingId: string) =>
++    quotaWindow(readings.find((reading) => isRecord(reading) && reading.id === readingId));
++  return { id, session: find("session"), weekly: find("weekly"), fetchedAt };
++}
++
++/** Pure: the file's text to the snapshot the chat draws. */
++export function parseQuotaFile(text: string, nowMs: number): QuotaSnapshot {
++  let document: unknown;
++  try {
++    document = JSON.parse(text);
++  } catch {
++    return UNAVAILABLE;
++  }
++  if (!isRecord(document) || document.version !== SUPPORTED_VERSION || !isRecord(document.providers)) {
++    return UNAVAILABLE;
++  }
++  const providers = document.providers;
++  return {
++    state: "ok",
++    providers: QUOTA_PROVIDERS.map((id) =>
++      provider(id, Object.hasOwn(providers, id) ? providers[id] : undefined, nowMs),
++    ),
++  };
++}
++
++export async function readQuotaSnapshot(
++  path: string = quotaFilePath(),
++  nowMs: number = Date.now(),
++): Promise<QuotaSnapshot> {
++  try {
++    const info = await stat(path);
++    if (!info.isFile() || info.size > MAX_FILE_BYTES) return UNAVAILABLE;
++    return parseQuotaFile(await readFile(path, "utf8"), nowMs);
++  } catch {
++    return UNAVAILABLE;
++  }
++}
+diff --git a/modified/shared/quota-logos.ts b/modified/shared/quota-logos.ts
+new file mode 100644
+index 0000000..02948cc
+--- /dev/null
++++ b/modified/shared/quota-logos.ts
+@@ -0,0 +1,16 @@
++/**
++ * Claude and Codex marks for the quota pill: 64px PNGs of a single shape on a
++ * transparent background, copied from Usage Monitor's bundled provider logos.
++ * They are drawn with `tintColor` from the theme, so only their outline
++ * matters, never their own colour. No image is fetched at runtime.
++ *
++ * Provenance (as in Usage Monitor's logos.shared.ts): the Claude mark is from
++ * Simple Icons (CC0-1.0); the Codex mark is from LobeHub Icons (MIT,
++ * Copyright (c) 2024 LobeHub). Trademarks remain their owners'.
++ */
++export const QUOTA_LOGOS = {
++  claude:
++    "data:image/png;base64,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",
++  codex:
++    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAYAAACqaXHeAAADs0lEQVR42uVb0XHaQBB9T+P/KB3gCixXELmC4AqCK0CpILgCSAUmFRhXELkCKxUYKrCoYPPBMiPkw+h0B5zk98MwIM3t097u290TcSSIyADAdwApgATAoPJzCaAAkAMoSD6hLxCRVET+ih1eReSXiMRdNnzQwvA63kRk3EXjR7p4X3g8lTfQh/EAHo6wtgLARONHAqBKSK6fTySLcz/5c+NVRKYikpza+ETCw4Pt1qEDAS/qmqGhBHBHctHkz1FL4yeBGg+NFY8am/x7gLrYay0ohYqfJGe+PWDYEeMBYCoiQ98E/OiYTHlQWd6eABGJRWSsgS/tGAGx6gn7GKD7fQwg65Db78MlyWVjAlRYPNaquC7jD8lRIwI0hUx78NR39AHJrwdjQEXb98l4AIhFJP2QAE0ZD+gv9hOgqaLPxsMUz6oeMO2h2zcjQPfGEJ8QWw/IWl6/BnBDkgBu9Xu3CKh0b9sgI5kDgJafWeD2liYPcHH9HWVFcg7gX8AEFCYCXLS9ibysSwRARF4c21ADwz0XEiZe6i0ziog4srogeVsjYKBNkxCRk7xx6Qe82wZ1ialV132oalBEMp8eAGzme9eGUnoJ4Eug2eCSZBl5yt1JvQlJsgw4IMbbtVFEcgDffLJa84QCwFWo5XFUz+U+WK1hEnB5PIwALDzedHRILIUWECNsBo3rIxIQcpGVUPfpHO7t7meSqSETBD1EoUfh8q7r6onY45fDHoTLvcH4FB0YotBDyloBSAzpL9Tp8Q4uDAGrsFRvmcH4zNL4VctskXhXmiIytKiucsP1seV5oYnjeucO1eHSdMOJxQ2GhutnFteXHh5Y7EDALNrjVjbqr7qYBJtZYlO8nTkEGAmwydnjbYNBP23nCoOmJzk+wNRBtyxpcCnb4qjUwOnSWitgaFg2IRDth7c3JPMLT0VQ6niPU6fL5203O8Lnw7pas5gIyHtOwKiqWqM9+7GveHd+0BQE4wDS07GMnxuLoR1GNrL2qUeGrwBcm4z/KAjOehLs7rVQKxpVg456IBQ8A5hjM7A5qC0OnRLLEWZfv3FXqlFDxMjMxm2yjj39uVNDZI8nzCwLnLPteZKx7UUHlSDJDMDvDhDQKnA3Pi6vVdss0JiwItmqKGpcC2geTQLUCGucevagL0fOAzn04GS8j9fmhjC/2rbtExTYzAePMSC926fwgoL27XwemylN5367QMREF++CRdffMY5bErE4xlPnmclINYJv48dVrYorVI4vTG97+MB/DLWxa6RmZRAAAAAASUVORK5CYII=",
++} as const;
+diff --git a/modified/shared/quota.ts b/modified/shared/quota.ts
+new file mode 100644
+index 0000000..e034c34
+--- /dev/null
++++ b/modified/shared/quota.ts
+@@ -0,0 +1,135 @@
++/**
++ * The quota pill beside the chat's buttons: the contract between the daemon,
++ * which reads Usage Monitor's saved readings, and the chat, which draws them,
++ * plus the pure rules for what the pill says. Percentages are USED, never
++ * remaining. Nothing here carries a credential; the daemon hands over only the
++ * percent, the window's name, when it resets and when it was read.
++ */
++import { defineRpc } from "@getpaseo/plugin";
++import { z } from "zod";
++
++export const QUOTA_PROVIDERS = ["codex", "claude"] as const;
++export type QuotaProviderId = (typeof QUOTA_PROVIDERS)[number];
++
++/** Past this age a reading is shown as stale, with its age. Claude's source is polled slowly on purpose. */
++export const STALE_AFTER_MS: Record<QuotaProviderId, number> = {
++  codex: 10 * 60 * 1000,
++  claude: 45 * 60 * 1000,
++};
++
++export const QuotaWindowSchema = z.object({
++  usedPercent: z.number().min(0).max(100),
++  window: z.string(),
++  resetsAt: z.string().nullable(),
++});
++
++export const QuotaProviderSchema = z.object({
++  id: z.enum(QUOTA_PROVIDERS),
++  session: QuotaWindowSchema.nullable(),
++  weekly: QuotaWindowSchema.nullable(),
++  fetchedAt: z.string().nullable(),
++});
++
++export const QuotaSnapshotSchema = z.object({
++  /** `unavailable` is a missing, oversized or malformed file; a provider absent from a good file is just empty. */
++  state: z.enum(["ok", "unavailable"]),
++  providers: z.array(QuotaProviderSchema),
++});
++
++export type QuotaWindow = z.infer<typeof QuotaWindowSchema>;
++export type QuotaProvider = z.infer<typeof QuotaProviderSchema>;
++export type QuotaSnapshot = z.infer<typeof QuotaSnapshotSchema>;
++
++export const readQuota = defineRpc({
++  name: "firstmate.quota.read",
++  input: z.object({}),
++  output: QuotaSnapshotSchema,
++});
++
++export const QUOTA_QUERY_KEY = ["firstmate", "quota"] as const;
++export const QUOTA_POLL_MS = 60_000;
++
++const FULL: Record<QuotaProviderId, string> = { codex: "Codex", claude: "Claude" };
++
++export function providerName(id: QuotaProviderId): string {
++  return FULL[id];
++}
++
++/** Milliseconds since the reading, or null when it has none or its time is unreadable. */
++export function ageMs(fetchedAt: string | null, nowMs: number): number | null {
++  if (fetchedAt === null) return null;
++  const at = Date.parse(fetchedAt);
++  if (Number.isNaN(at)) return null;
++  return Math.max(0, nowMs - at);
++}
++
++export function isStale(id: QuotaProviderId, fetchedAt: string | null, nowMs: number): boolean {
++  const age = ageMs(fetchedAt, nowMs);
++  return age !== null && age > STALE_AFTER_MS[id];
++}
++
++/** `just now`, `5m`, `2h`, `3d`. */
++export function formatAge(ms: number): string {
++  const minutes = Math.floor(ms / 60_000);
++  if (minutes < 1) return "just now";
++  if (minutes < 60) return `${minutes}m`;
++  const hours = Math.floor(minutes / 60);
++  if (hours < 48) return `${hours}h`;
++  return `${Math.floor(hours / 24)}d`;
++}
++
++export type QuotaTone = "normal" | "muted" | "warning" | "danger";
++
++export type QuotaCell = {
++  id: QuotaProviderId;
++  /** `32%`, `—`, or `61% · 2h old` when stale; the provider is drawn as an icon beside it. */
++  text: string;
++  tone: QuotaTone;
++  stale: boolean;
++  /** Spoken by a screen reader: provider, percent used, window, freshness. */
++  label: string;
++};
++
++export function usedTone(percent: number): QuotaTone {
++  if (percent >= 90) return "danger";
++  if (percent >= 75) return "warning";
++  return "normal";
++}
++
++export function freshnessWords(id: QuotaProviderId, fetchedAt: string | null, nowMs: number): string {
++  const age = ageMs(fetchedAt, nowMs);
++  if (age === null) return "reading time unknown";
++  const stale = isStale(id, fetchedAt, nowMs) ? "stale, " : "";
++  return age < 60_000 ? `${stale}updated just now` : `${stale}updated ${formatAge(age)} ago`;
++}
++
++/** One provider's cell. A provider with no session reading shows `—` and never affects the other. */
++export function quotaCell(provider: QuotaProvider | undefined, id: QuotaProviderId, nowMs: number): QuotaCell {
++  const name = FULL[id];
++  const session = provider?.session ?? null;
++  if (session === null) {
++    return { id, text: "—", tone: "muted", stale: false, label: `${name}: no quota reading` };
++  }
++  const fetchedAt = provider?.fetchedAt ?? null;
++  const stale = isStale(id, fetchedAt, nowMs);
++  const age = ageMs(fetchedAt, nowMs);
++  const percent = Math.round(session.usedPercent);
++  const base = `${percent}%`;
++  return {
++    id,
++    text: stale && age !== null ? `${base} · ${formatAge(age)} old` : base,
++    tone: stale ? "warning" : usedTone(session.usedPercent),
++    stale,
++    label: `${name}: ${percent} percent used, ${session.window} window, ${freshnessWords(id, fetchedAt, nowMs)}`,
++  };
++}
++
++export function quotaCells(snapshot: QuotaSnapshot, nowMs: number): QuotaCell[] {
++  return QUOTA_PROVIDERS.map((id) =>
++    quotaCell(
++      snapshot.providers.find((provider) => provider.id === id),
++      id,
++      nowMs,
++    ),
++  );
++}

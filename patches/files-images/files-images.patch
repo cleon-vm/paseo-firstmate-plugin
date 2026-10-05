@@ -1,0 +1,1542 @@
+diff --git a/client/file-links.ts b/client/file-links.ts
+index bc9d5d5..b08273e 100644
+--- a/client/file-links.ts
++++ b/client/file-links.ts
+@@ -11,10 +11,13 @@
+  */
+ 
+ import { MAX_FILE_PATH_LENGTH } from "../shared/files";
++import { isUrlTarget, isWebTarget } from "../shared/images";
+ import { inlineTexts, parseMarkdown } from "./markdown-parse";
+ 
+ /** Bold, inline code and links, in one pass; everything else stays as written. */
+ const INLINE = /(\*\*[^*\n]+\*\*|__[^_\n]+__|`[^`\n]+`|\[[^\]\n]*\]\([^)\s]+\)|https?:\/\/[^\s)<>]+)/g;
++/** The same with a Markdown image first, for a preview that draws them. */
++const INLINE_WITH_IMAGES = new RegExp(`(!\\[[^\\]\\n]*\\]\\([^)\\s]+\\)|${INLINE.source.slice(1)}`, "g");
+ 
+ /** A run of plain text that could be a path: whatever brackets, quotes, commas and spaces leave. A source only; each walk makes its own. */
+ const WORD = /[^\s()[\]{}<>"'`,;]+/g;
+@@ -31,7 +34,11 @@ export type InlineToken =
+   | { kind: "code"; text: string }
+   | { kind: "link"; text: string; url: string }
+   /** A file in the home; `code` when it was written as inline code, which keeps that look. */
+-  | { kind: "file"; text: string; path: string; code: boolean };
++  | { kind: "file"; text: string; path: string; code: boolean }
++  /** `![alt](target)` with a path for a target, only when images are asked for; the daemon finds the file. */
++  | { kind: "image"; alt: string; target: string };
++
++export type ImageToken = Extract<InlineToken, { kind: "image" }>;
+ 
+ /** Home-relative path of the file a candidate names, or null when it names none. */
+ export type FileLookup = (candidate: string) => string | null;
+@@ -78,11 +85,12 @@ function plainTokens(text: string, lookup: FileLookup): InlineToken[] {
+  * Markdown link's target and plain text are checked for files. A plain URL's
+  * trailing punctuation is dropped from what it opens, not from what it shows.
+  */
+-export function inlineTokens(text: string, lookup: FileLookup): InlineToken[] {
++export function inlineTokens(text: string, lookup: FileLookup, options: { images?: boolean } = {}): InlineToken[] {
+   // Splitting on a capturing group interleaves plain text (even indexes) with the tokens it matched.
+-  return text.split(INLINE).flatMap((part, index): InlineToken[] => {
++  return text.split(options.images === true ? INLINE_WITH_IMAGES : INLINE).flatMap((part, index): InlineToken[] => {
+     if (part === "") return [];
+     if (index % 2 === 0) return plainTokens(part, lookup);
++    if (part.startsWith("![")) return [imageToken(part)];
+     if (part.startsWith("`")) {
+       const code = part.slice(1, -1);
+       const candidate = pathCandidate(code.trim());
+@@ -104,6 +112,49 @@ export function inlineTokens(text: string, lookup: FileLookup): InlineToken[] {
+   });
+ }
+ 
++/**
++ * `![alt](target)`: an image when the target is a path. A web address is
++ * never fetched — it is the alt text, linked to it — and any other URL, a
++ * `data:` one included, is the alt text alone.
++ */
++function imageToken(part: string): InlineToken {
++  const match = /^!\[([^\]]*)\]\(([^)]+)\)$/.exec(part);
++  const alt = match?.[1] ?? "";
++  const target = match?.[2] ?? "";
++  if (isWebTarget(target)) return { kind: "link", text: alt === "" ? target : alt, url: target };
++  if (isUrlTarget(target)) return { kind: "text", text: alt };
++  return { kind: "image", alt, target };
++}
++
++/**
++ * Tokens as the preview lays them out: each image on its own, and the text
++ * between images, without the line breaks around them, as runs.
++ */
++export function splitAtImages(tokens: readonly InlineToken[]): Array<InlineToken[] | ImageToken> {
++  const parts: Array<InlineToken[] | ImageToken> = [];
++  let run: InlineToken[] = [];
++  function flush(): void {
++    const first = run[0];
++    if (first?.kind === "text") run[0] = { kind: "text", text: first.text.replace(/^[ \t]*\n/, "") };
++    const last = run[run.length - 1];
++    if (last?.kind === "text") run[run.length - 1] = { kind: "text", text: last.text.replace(/\n[ \t]*$/, "") };
++    if (run.some((token) => token.kind !== "text" || token.text.trim() !== "")) {
++      parts.push(run.filter((token) => token.kind !== "text" || token.text !== ""));
++    }
++    run = [];
++  }
++  for (const token of tokens) {
++    if (token.kind === "image") {
++      flush();
++      parts.push(token);
++    } else {
++      run.push(token);
++    }
++  }
++  flush();
++  return parts;
++}
++
+ /**
+  * Every path `source` mentions that could be linked, once per mention, in
+  * order. Only the text the renderer draws inline is walked, so a path in a
+diff --git a/client/files.tsx b/client/files.tsx
+index 34a091a..918510a 100644
+--- a/client/files.tsx
++++ b/client/files.tsx
+@@ -1,7 +1,9 @@
+ /**
+  * The first mate's home, as files: browse it, read any text file, edit and
+  * save it — the charter, the captain's standing orders, the backlog, the
+- * briefs and reports.
++ * briefs and reports — and look at its images: plots, drawings, screenshots.
++ * An image is view-only, and a Markdown preview draws the images the file
++ * names (`./image-view`).
+  *
+  * The first mate writes these same files, so an edit is saved against the
+  * version it was opened at: a file that changed since is refused, and the
+@@ -19,12 +21,14 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+ import { Platform, Pressable, ScrollView, Text, View } from "react-native";
+ 
+-import { listHomeFiles, readHomeFile, writeHomeFile, type HomeEntry } from "../shared/files";
++import { listHomeFiles, readHomeFile, readHomeImage, writeHomeFile, type HomeEntry } from "../shared/files";
++import { imageTypeOf, MAX_IMAGE_BYTES, SVG_TYPE } from "../shared/images";
+ import { relativeTime } from "./format";
+ import { useKeyboardOverlap } from "./keyboard";
++import { ImageViewer, type MarkdownImages } from "./image-view";
+ import { isSaveKey, type WebKeyPressEvent } from "./keys";
+ import { Markdown } from "./markdown";
+-import { isDirty, markSaved, type OpenFile } from "./open-file";
++import { isDirty, markSaved, openedImage, type OpenFile } from "./open-file";
+ import { Banner, IconButton, MONOSPACE, errorText } from "./ui";
+ 
+ interface FilesMemory {
+@@ -78,6 +82,7 @@ export function FilesView({
+ }) {
+   const list = useRpc(listHomeFiles);
+   const read = useRpc(readHomeFile);
++  const readImage = useRpc(readHomeImage);
+   const write = useRpc(writeHomeFile);
+   const toast = useToast();
+   const queryClient = useQueryClient();
+@@ -122,9 +127,17 @@ export function FilesView({
+     else action();
+   }
+ 
+-  function load(path: string, options: { quiet?: boolean } = {}): void {
++  /** Opens `path`: an image as one, unless `asText` — an SVG's source — and everything else as text. */
++  function load(path: string, options: { quiet?: boolean; asText?: boolean } = {}): void {
+     if (options.quiet !== true) setLoadingPath(path);
+     setError(null);
++    if (options.asText !== true && imageTypeOf(path) !== null) {
++      readImage({ path })
++        .then((result) => setOpen(openedImage(result)))
++        .catch((caught: unknown) => setError({ text: errorText(caught), conflict: false }))
++        .finally(() => setLoadingPath(null));
++      return;
++    }
+     read({ path })
+       .then((result) => {
+         if (result.content === null) {
+@@ -188,9 +201,12 @@ export function FilesView({
+   // The first mate changed the open file on disk. Unedited, it is simply
+   // reloaded; edited, the captain is told and chooses.
+   const onDisk = listing.data?.entries.find((entry) => open !== null && entry.path === open.path);
+-  const changedOnDisk = open?.kind === "text" && onDisk !== undefined && onDisk.modifiedMs !== open.modifiedMs;
++  const changedOnDisk =
++    (open?.kind === "text" || open?.kind === "image") && onDisk !== undefined && onDisk.modifiedMs !== open.modifiedMs;
+   useEffect(() => {
+-    if (changedOnDisk && !dirty && open !== null && loadingPath === null) load(open.path, { quiet: true });
++    if (changedOnDisk && !dirty && open !== null && loadingPath === null) {
++      load(open.path, { quiet: true, asText: open.kind === "text" });
++    }
+     // Keyed on the change alone: `load` and `open` are new every render, and
+     // listing them would reload on every keystroke.
+   }, [changedOnDisk, dirty]);
+@@ -365,7 +381,15 @@ export function FilesView({
+             }
+           >
+             <Icon
+-              name={entry.kind === "dir" ? "Folder" : isMarkdown(entry.name) ? "FileText" : "File"}
++              name={
++                entry.kind === "dir"
++                  ? "Folder"
++                  : isMarkdown(entry.name)
++                    ? "FileText"
++                    : imageTypeOf(entry.name) !== null
++                      ? "Image"
++                      : "File"
++              }
+               size={14}
+               color={entry.kind === "dir" ? theme.colors.accent : theme.colors.foregroundMuted}
+             />
+@@ -433,10 +457,33 @@ export function FilesView({
+       <Text style={styles.muted}>
+         {open.reason === "binary"
+           ? `${open.path} is not a text file, so it is not shown here.`
+-          : `${open.path} is ${formatSize(open.size)}, too large to open here.`}
++          : open.reason === "imageTooLarge"
++            ? `${open.path} is ${formatSize(open.size)}, over the ${formatSize(MAX_IMAGE_BYTES)} limit for showing an image here.`
++            : `${open.path} is ${formatSize(open.size)}, too large to open here.`}
+       </Text>
+     );
++  } else if (open.kind === "image") {
++    editorBody = (
++      <ImageViewer
++        key={open.path}
++        theme={theme}
++        path={open.path}
++        mimeType={open.mimeType}
++        size={open.size}
++        data={open.data}
++      />
++    );
+   } else if (preview && isMarkdown(open.path)) {
++    const from = open.path;
++    const images: MarkdownImages = {
++      from,
++      load: (target) => readImage({ path: target, relativeTo: from }),
++      onOpen: (path) =>
++        guarded(`open ${path}`, () => {
++          setDir(parentOf(path));
++          load(path);
++        }),
++    };
+     editorBody = (
+       <ScrollView contentContainerStyle={styles.preview}>
+         <Markdown
+@@ -444,6 +491,7 @@ export function FilesView({
+           theme={theme}
+           fontSize={14}
+           onOpenLink={(url) => void openExternalUrl(url).catch((caught: unknown) => toast.error(errorText(caught)))}
++          images={images}
+         />
+       </ScrollView>
+     );
+@@ -492,7 +540,9 @@ export function FilesView({
+                 {open.path}
+               </Text>
+               <Text style={styles.editorStatus} numberOfLines={1}>
+-                {open.kind !== "text"
++                {open.kind === "image"
++                  ? `${formatSize(open.size)} · view only · ${relativeTime(new Date(open.modifiedMs).toISOString())}`
++                  : open.kind !== "text"
+                   ? ""
+                   : dirty
+                     ? "Unsaved changes"
+@@ -507,12 +557,30 @@ export function FilesView({
+                   onPress={() => setPreview(!preview)}
+                 />
+               ) : null}
++              {open.kind === "image" && imageTypeOf(open.path) === SVG_TYPE ? (
++                <IconButton
++                  icon="Code"
++                  label="Edit source"
++                  showLabel
++                  theme={theme}
++                  onPress={() => load(open.path, { asText: true })}
++                />
++              ) : null}
++              {open.kind === "text" && imageTypeOf(open.path) === SVG_TYPE ? (
++                <IconButton
++                  icon="Image"
++                  label="View image"
++                  showLabel
++                  theme={theme}
++                  onPress={() => guarded("view it as an image", () => load(open.path))}
++                />
++              ) : null}
+               <IconButton
+                 icon="RefreshCw"
+                 label="Reload from disk"
+                 theme={theme}
+                 disabled={loadingPath !== null}
+-                onPress={() => guarded("reload it from disk", () => load(open.path))}
++                onPress={() => guarded("reload it from disk", () => load(open.path, { asText: open.kind === "text" }))}
+               />
+               {open.kind === "text" ? (
+                 <IconButton
+@@ -548,7 +616,7 @@ export function FilesView({
+               theme={theme}
+               tone="warning"
+               text="This file changed on disk while you were editing it — the first mate may have written it."
+-              action={{ label: "Load theirs", icon: "RefreshCw", onPress: () => load(open.path) }}
++              action={{ label: "Load theirs", icon: "RefreshCw", onPress: () => load(open.path, { asText: true }) }}
+             />
+           ) : null}
+           {error === null ? null : (
+diff --git a/client/image-view.tsx b/client/image-view.tsx
+new file mode 100644
+index 0000000..07ecb06
+--- /dev/null
++++ b/client/image-view.tsx
+@@ -0,0 +1,265 @@
++/**
++ * Images from the first mate's home, drawn: the Files view's viewer for an
++ * open image, and an image a Markdown preview names.
++ *
++ * Both draw with `Image` from a base64 data URI (`shared/images.ts`), SVG
++ * included, so an SVG is only ever an image — never markup in the page, never
++ * run. Images are view-only; nothing here writes.
++ */
++import type { PluginTheme } from "@getpaseo/plugin";
++import { useQuery } from "@tanstack/react-query";
++import { useEffect, useMemo, useState } from "react";
++import { Image, Pressable, ScrollView, Text, View, type LayoutChangeEvent } from "react-native";
++
++import { imageDataUri, MAX_IMAGE_BYTES, SVG_TYPE } from "../shared/images";
++import { formatBytes } from "./attachments";
++import { errorText } from "./format";
++import { fittedSize, stepZoom, zoomLabel, type Zoom } from "./image-zoom";
++import { IconButton } from "./ui";
++
++type Size = { width: number; height: number };
++
++/** The data URI for an image, or null when its data is not an image's. */
++function dataUriOf(mimeType: string, data: string): string | null {
++  try {
++    return imageDataUri(mimeType, data);
++  } catch {
++    return null;
++  }
++}
++
++/** The image's own size in pixels, once known; null until then, or when it cannot be told (an SVG without one). */
++function useNaturalSize(uri: string | null): Size | null {
++  const [size, setSize] = useState<Size | null>(null);
++  useEffect(() => {
++    setSize(null);
++    if (uri === null) return;
++    let live = true;
++    Image.getSize(
++      uri,
++      (width, height) => {
++        if (live && width > 0 && height > 0) setSize({ width, height });
++      },
++      () => {},
++    );
++    return () => {
++      live = false;
++    };
++  }, [uri]);
++  return size;
++}
++
++function useLayoutSize(): [Size, (event: LayoutChangeEvent) => void] {
++  const [size, setSize] = useState<Size>({ width: 0, height: 0 });
++  return [
++    size,
++    (event) => {
++      const { width, height } = event.nativeEvent.layout;
++      setSize((current) => (current.width === width && current.height === height ? current : { width, height }));
++    },
++  ];
++}
++
++function failedText(path: string, mimeType: string): string {
++  return mimeType === SVG_TYPE
++    ? `${path} could not be drawn. Not every device draws SVG images; Edit source shows its text.`
++    : `${path} could not be drawn: it may be damaged, or in a form this device does not read.`;
++}
++
++/** The open image in the Files view: fitted to the pane, or zoomed and scrollable. */
++export function ImageViewer({
++  theme,
++  path,
++  mimeType,
++  size,
++  data,
++}: {
++  theme: PluginTheme;
++  path: string;
++  mimeType: string;
++  size: number;
++  data: string;
++}) {
++  const uri = useMemo(() => dataUriOf(mimeType, data), [mimeType, data]);
++  const natural = useNaturalSize(uri);
++  const [pane, onPaneLayout] = useLayoutSize();
++  const [zoom, setZoom] = useState<Zoom>("fit");
++  const [failed, setFailed] = useState(false);
++  useEffect(() => setFailed(false), [uri]);
++
++  const styles = useMemo(() => {
++    const { colors } = theme;
++    return {
++      root: { flex: 1, minHeight: 0 },
++      toolbar: {
++        flexDirection: "row" as const,
++        flexWrap: "wrap" as const,
++        alignItems: "center" as const,
++        gap: 6,
++        paddingHorizontal: 10,
++        paddingVertical: 6,
++        borderBottomWidth: 1,
++        borderBottomColor: colors.border,
++      },
++      facts: { flex: 1, minWidth: 120, color: colors.foregroundMuted, fontSize: 11 },
++      zoom: { minWidth: 40, textAlign: "center" as const, color: colors.foreground, fontSize: 12 },
++      fitPane: { flex: 1, minHeight: 0, alignItems: "center" as const, justifyContent: "center" as const, padding: 12 },
++      scroll: { flex: 1, minHeight: 0 },
++      scrollContent: { padding: 12 },
++      muted: { color: colors.foregroundMuted, fontSize: 12, padding: 12, lineHeight: 17 },
++      image: { backgroundColor: colors.surface1 },
++    };
++  }, [theme]);
++
++  const facts = [natural === null ? null : `${natural.width} × ${natural.height} px`, formatBytes(size), mimeType]
++    .filter((fact) => fact !== null)
++    .join(" · ");
++
++  let body;
++  if (uri === null || failed) {
++    body = <Text style={styles.muted}>{failedText(path, mimeType)}</Text>;
++  } else if (zoom === "fit") {
++    const box = fittedSize(natural, Math.max(0, pane.width - 24), Math.max(0, pane.height - 24));
++    body = (
++      <View style={styles.fitPane} onLayout={onPaneLayout}>
++        {pane.width === 0 ? null : (
++          <Image
++            source={{ uri }}
++            style={[styles.image, box]}
++            resizeMode="contain"
++            accessibilityLabel={`Image ${path}`}
++            accessibilityIgnoresInvertColors
++            onError={() => setFailed(true)}
++          />
++        )}
++      </View>
++    );
++  } else {
++    // An SVG that declares no size has none to scale; it is drawn at a size of its own.
++    const base = natural ?? { width: 800, height: 600 };
++    const drawn = { width: Math.round(base.width * zoom), height: Math.round(base.height * zoom) };
++    body = (
++      <ScrollView style={styles.scroll} contentContainerStyle={styles.scrollContent}>
++        <ScrollView horizontal>
++          <Image
++            source={{ uri }}
++            style={[styles.image, drawn]}
++            resizeMode="contain"
++            accessibilityLabel={`Image ${path}`}
++            accessibilityIgnoresInvertColors
++            onError={() => setFailed(true)}
++          />
++        </ScrollView>
++      </ScrollView>
++    );
++  }
++
++  return (
++    <View style={styles.root}>
++      <View style={styles.toolbar}>
++        <Text style={styles.facts} numberOfLines={1}>
++          {facts}
++        </Text>
++        <IconButton icon="ZoomOut" label="Zoom out" theme={theme} onPress={() => setZoom(stepZoom(zoom, "out"))} />
++        <Text style={styles.zoom}>{zoomLabel(zoom)}</Text>
++        <IconButton icon="ZoomIn" label="Zoom in" theme={theme} onPress={() => setZoom(stepZoom(zoom, "in"))} />
++        <IconButton
++          icon={zoom === "fit" ? "Maximize" : "Shrink"}
++          label={zoom === "fit" ? "Actual size" : "Fit to the pane"}
++          showLabel
++          theme={theme}
++          onPress={() => setZoom(zoom === "fit" ? 1 : "fit")}
++        />
++      </View>
++      {body}
++    </View>
++  );
++}
++
++/** What a Markdown preview's images are read with: the file they are written in, and how to open one in Files. */
++export interface MarkdownImages {
++  /** The Markdown file's home-relative path; a relative target is looked up beside it first. */
++  from: string;
++  load: (target: string) => Promise<{ path: string; mimeType: string; data: string | null; size: number }>;
++  onOpen: ((path: string) => void) | null;
++}
++
++/**
++ * An image a Markdown file names by a path in the home, as wide as the text
++ * at most and never wider than itself. One the home does not have is its alt
++ * text, with why.
++ */
++export function MarkdownImage({
++  theme,
++  alt,
++  target,
++  images,
++  fontSize,
++}: {
++  theme: PluginTheme;
++  alt: string;
++  target: string;
++  images: MarkdownImages;
++  fontSize: number;
++}) {
++  const image = useQuery({
++    queryKey: ["firstmate", "files", "markdown-image", images.from, target],
++    queryFn: () => images.load(target),
++    retry: false,
++  });
++  const uri = image.data?.data == null ? null : dataUriOf(image.data.mimeType, image.data.data);
++  const natural = useNaturalSize(uri);
++  const [box, onLayout] = useLayoutSize();
++  const [failed, setFailed] = useState(false);
++  useEffect(() => setFailed(false), [uri]);
++
++  const muted = { color: theme.colors.foregroundMuted, fontSize: fontSize - 1, fontStyle: "italic" as const };
++  const name = alt.trim() === "" ? target : alt;
++
++  let content;
++  if (image.isPending) {
++    content = <Text style={muted}>Loading image {name}…</Text>;
++  } else if (image.error !== null) {
++    content = (
++      <Text style={muted}>
++        Image not shown: {name} — {errorText(image.error)}
++      </Text>
++    );
++  } else if (image.data.data === null) {
++    content = (
++      <Text style={muted}>
++        Image not shown: {name} is {formatBytes(image.data.size)}, over the {formatBytes(MAX_IMAGE_BYTES)} limit for images in the
++        preview.
++      </Text>
++    );
++  } else if (uri === null || failed) {
++    content = <Text style={muted}>{failedText(image.data.path, image.data.mimeType)}</Text>;
++  } else {
++    const found = image.data;
++    const drawn = fittedSize(natural, box.width);
++    content =
++      box.width === 0 ? null : (
++        <Pressable
++          accessibilityRole={images.onOpen === null ? "image" : "button"}
++          accessibilityLabel={name}
++          accessibilityHint={images.onOpen === null ? undefined : `Opens ${found.path} in Files`}
++          disabled={images.onOpen === null}
++          onPress={() => images.onOpen?.(found.path)}
++          style={{ alignSelf: "flex-start" }}
++        >
++          <Image
++            source={{ uri }}
++            style={[{ backgroundColor: theme.colors.surface1, borderRadius: 4 }, drawn]}
++            resizeMode="contain"
++            accessibilityIgnoresInvertColors
++            onError={() => setFailed(true)}
++          />
++        </Pressable>
++      );
++  }
++  return (
++    <View style={{ alignSelf: "stretch" }} onLayout={onLayout}>
++      {content}
++    </View>
++  );
++}
+diff --git a/client/image-zoom.ts b/client/image-zoom.ts
+new file mode 100644
+index 0000000..cbf7225
+--- /dev/null
++++ b/client/image-zoom.ts
+@@ -0,0 +1,35 @@
++/** How the Files view draws an open image: fitted to the pane, or at a scale of its own size. Pure, so it is testable. */
++export type Zoom = "fit" | number;
++
++export const ZOOM_STEPS: readonly number[] = [0.1, 0.25, 0.5, 0.75, 1, 1.5, 2, 3, 4, 6, 8];
++
++/**
++ * One step in or out. Out of "fit", in is the image's own size and out is half
++ * of it, since how large "fit" draws depends on the pane; at either end the
++ * zoom stays where it is.
++ */
++export function stepZoom(current: Zoom, direction: "in" | "out"): Zoom {
++  if (current === "fit") return direction === "in" ? 1 : 0.5;
++  if (direction === "in") return ZOOM_STEPS.find((step) => step > current + 1e-9) ?? current;
++  return [...ZOOM_STEPS].reverse().find((step) => step < current - 1e-9) ?? current;
++}
++
++export function zoomLabel(zoom: Zoom): string {
++  return zoom === "fit" ? "Fit" : `${Math.round(zoom * 100)}%`;
++}
++
++/**
++ * The box an image is drawn in to fit within `maxWidth` by `maxHeight`, never
++ * larger than its own size, keeping its shape. An image whose size is not
++ * known yet — or an SVG that declares none — gets a 4:3 box.
++ */
++export function fittedSize(
++  natural: { width: number; height: number } | null,
++  maxWidth: number,
++  maxHeight: number = Number.POSITIVE_INFINITY,
++): { width: number; height: number } {
++  const known = natural !== null && natural.width > 0 && natural.height > 0;
++  const ratio = known ? natural.height / natural.width : 3 / 4;
++  const width = Math.max(1, Math.min(maxWidth, known ? natural.width : maxWidth, maxHeight / ratio));
++  return { width: Math.round(width), height: Math.round(width * ratio) };
++}
+diff --git a/client/images.test.ts b/client/images.test.ts
+new file mode 100644
+index 0000000..7712bad
+--- /dev/null
++++ b/client/images.test.ts
+@@ -0,0 +1,197 @@
++import { readdirSync, readFileSync } from "node:fs";
++import { join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { describe, expect, it } from "vitest";
++
++import { imageDataUri, imageTypeOf, isUrlTarget, isWebTarget, SVG_TYPE } from "../shared/images";
++import { fileCandidates, inlineTokens, splitAtImages, type FileLookup } from "./file-links";
++import { fittedSize, stepZoom, zoomLabel } from "./image-zoom";
++import { isDirty, markSaved, openedImage } from "./open-file";
++
++const none: FileLookup = () => null;
++
++describe("imageTypeOf", () => {
++  it("knows PNG, JPEG, GIF, WebP and SVG by extension, in any case", () => {
++    expect(imageTypeOf("a.png")).toBe("image/png");
++    expect(imageTypeOf("a.jpg")).toBe("image/jpeg");
++    expect(imageTypeOf("a.JPEG")).toBe("image/jpeg");
++    expect(imageTypeOf("a.gif")).toBe("image/gif");
++    expect(imageTypeOf("a.webp")).toBe("image/webp");
++    expect(imageTypeOf("drawings/a.Svg")).toBe(SVG_TYPE);
++  });
++
++  it("reads the name after either slash", () => {
++    expect(imageTypeOf("data\\scout\\plot.png")).toBe("image/png");
++    expect(imageTypeOf("C:\\Users\\captain\\plot.gif")).toBe("image/gif");
++    expect(imageTypeOf("data.png/notes")).toBeNull();
++    expect(imageTypeOf("data.png\\notes")).toBeNull();
++  });
++
++  it("is null for anything else", () => {
++    for (const path of ["notes.md", "a.png.txt", "png", "svg", "a.tiff", "a.bmp", "a.html", "", "folder/"]) {
++      expect(imageTypeOf(path)).toBeNull();
++    }
++  });
++});
++
++describe("imageDataUri", () => {
++  it("is a base64 data URI, SVG included", () => {
++    const svg = Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>').toString("base64");
++    const uri = imageDataUri(SVG_TYPE, svg);
++    expect(uri).toBe(`data:image/svg+xml;base64,${svg}`);
++    expect(uri).not.toMatch(/[<>"']/);
++  });
++
++  it("refuses markup, or any data that is not base64, so nothing but base64 reaches the URI", () => {
++    expect(() => imageDataUri(SVG_TYPE, "<svg><script>alert(1)</script></svg>")).toThrow(/not base64/);
++    expect(() => imageDataUri(SVG_TYPE, "PHN2Zz4=,<svg>")).toThrow(/not base64/);
++  });
++
++  it("refuses a type that is not an image's", () => {
++    expect(() => imageDataUri("text/html", "AAAA")).toThrow(/not an image type/);
++    expect(() => imageDataUri("image/png;charset=utf8,<svg>", "AAAA")).toThrow(/not an image type/);
++  });
++});
++
++describe("isUrlTarget / isWebTarget", () => {
++  it("tells a URL from a path, a drive letter being a path", () => {
++    expect(isUrlTarget("https://example.com/a.png")).toBe(true);
++    expect(isUrlTarget("data:image/png;base64,AAAA")).toBe(true);
++    expect(isUrlTarget("file:///c:/a.png")).toBe(true);
++    expect(isUrlTarget("C:\\plots\\a.png")).toBe(false);
++    expect(isUrlTarget("c:/plots/a.png")).toBe(false);
++    expect(isUrlTarget("plots/a.png")).toBe(false);
++    expect(isWebTarget("HTTPS://example.com/a.png")).toBe(true);
++    expect(isWebTarget("data:image/png;base64,AAAA")).toBe(false);
++  });
++});
++
++describe("inlineTokens with images", () => {
++  it("is an image for a path, only when images are asked for", () => {
++    expect(inlineTokens("see ![the plot](plots/a.png) here", none, { images: true })).toEqual([
++      { kind: "text", text: "see " },
++      { kind: "image", alt: "the plot", target: "plots/a.png" },
++      { kind: "text", text: " here" },
++    ]);
++  });
++
++  it("leaves the chat's tokens as they were without images", () => {
++    expect(inlineTokens("![the plot](plots/a.png)", none)).toEqual([
++      { kind: "text", text: "!" },
++      { kind: "link", text: "the plot", url: "plots/a.png" },
++    ]);
++    expect(fileCandidates("![p](plots/a.png)")).toEqual(["plots/a.png"]);
++  });
++
++  it("keeps a Windows path whole", () => {
++    expect(inlineTokens("![p](C:\\Users\\captain\\plot.png)", none, { images: true })).toEqual([
++      { kind: "image", alt: "p", target: "C:\\Users\\captain\\plot.png" },
++    ]);
++  });
++
++  it("never fetches a web image: its alt text links to it", () => {
++    expect(inlineTokens("![chart](https://example.com/c.png)", none, { images: true })).toEqual([
++      { kind: "link", text: "chart", url: "https://example.com/c.png" },
++    ]);
++    expect(inlineTokens("![](http://example.com/c.png)", none, { images: true })).toEqual([
++      { kind: "link", text: "http://example.com/c.png", url: "http://example.com/c.png" },
++    ]);
++  });
++
++  it("draws no other URL either, data: included: only its alt text", () => {
++    expect(inlineTokens("![x](data:image/svg+xml;base64,PHN2Zz4=)", none, { images: true })).toEqual([
++      { kind: "text", text: "x" },
++    ]);
++    expect(inlineTokens("![x](javascript:alert(1))", none, { images: true })[0]).toEqual({ kind: "text", text: "x" });
++  });
++
++  it("leaves HTML as text", () => {
++    expect(inlineTokens('<img src="a.png" onerror="alert(1)">', none, { images: true })).toEqual([
++      { kind: "text", text: '<img src="a.png" onerror="alert(1)">' },
++    ]);
++  });
++
++  it("still finds links and code around an image", () => {
++    const tokens = inlineTokens("`x` ![a](a.png) [b](https://b.example)", none, { images: true });
++    expect(tokens.map((token) => token.kind)).toEqual(["code", "text", "image", "text", "link"]);
++  });
++});
++
++describe("splitAtImages", () => {
++  it("puts each image on its own, between runs of text without the line breaks around it", () => {
++    const tokens = inlineTokens("Before\n![a](a.png)\n![b](b.png)\nAfter **bold**", none, { images: true });
++    expect(splitAtImages(tokens)).toEqual([
++      [{ kind: "text", text: "Before" }],
++      { kind: "image", alt: "a", target: "a.png" },
++      { kind: "image", alt: "b", target: "b.png" },
++      [
++        { kind: "text", text: "After " },
++        { kind: "bold", text: "bold" },
++      ],
++    ]);
++  });
++
++  it("is one run for text with no image", () => {
++    const tokens = inlineTokens("just **text**", none, { images: true });
++    expect(splitAtImages(tokens)).toEqual([tokens]);
++  });
++});
++
++describe("image zoom", () => {
++  it("steps in and out of fit, and between steps, stopping at the ends", () => {
++    expect(stepZoom("fit", "in")).toBe(1);
++    expect(stepZoom("fit", "out")).toBe(0.5);
++    expect(stepZoom(1, "in")).toBe(1.5);
++    expect(stepZoom(1, "out")).toBe(0.75);
++    expect(stepZoom(8, "in")).toBe(8);
++    expect(stepZoom(0.1, "out")).toBe(0.1);
++    expect(zoomLabel("fit")).toBe("Fit");
++    expect(zoomLabel(1.5)).toBe("150%");
++  });
++
++  it("fits an image to the box without enlarging it, keeping its shape", () => {
++    expect(fittedSize({ width: 2000, height: 1000 }, 500, 400)).toEqual({ width: 500, height: 250 });
++    expect(fittedSize({ width: 1000, height: 2000 }, 500, 400)).toEqual({ width: 200, height: 400 });
++    expect(fittedSize({ width: 100, height: 50 }, 500, 400)).toEqual({ width: 100, height: 50 });
++    expect(fittedSize(null, 400)).toEqual({ width: 400, height: 300 });
++    expect(fittedSize({ width: 0, height: 0 }, 400)).toEqual({ width: 400, height: 300 });
++  });
++});
++
++describe("an open image", () => {
++  const result = { path: "plots/a.png", mimeType: "image/png", data: "AAAA", size: 3, modifiedMs: 7 };
++
++  it("opens as a view-only image, or as too large", () => {
++    expect(openedImage(result)).toEqual({
++      kind: "image",
++      path: "plots/a.png",
++      mimeType: "image/png",
++      data: "AAAA",
++      size: 3,
++      modifiedMs: 7,
++    });
++    expect(openedImage({ ...result, data: null, size: 20e6 })).toEqual({
++      kind: "unreadable",
++      path: "plots/a.png",
++      reason: "imageTooLarge",
++      size: 20e6,
++    });
++  });
++
++  it("is never dirty, and a save leaves it alone", () => {
++    const image = openedImage(result);
++    expect(isDirty(image)).toBe(false);
++    expect(markSaved(image, { path: "plots/a.png", content: "x", modifiedMs: 9 })).toBe(image);
++  });
++});
++
++describe("SVG is never markup", () => {
++  it("no client file injects HTML or embeds a web view", () => {
++    const dir = fileURLToPath(new URL(".", import.meta.url));
++    for (const name of readdirSync(dir).filter((file) => /\.tsx?$/.test(file) && !file.endsWith(".test.ts"))) {
++      const source = readFileSync(join(dir, name), "utf8");
++      expect(source, name).not.toMatch(/dangerouslySetInnerHTML|innerHTML|outerHTML|WebView|<iframe|from "react-native-svg"|SvgXml/);
++      expect(source, name).not.toMatch(/svg\+xml;(utf8|charset)/);
++    }
++  });
++});
+diff --git a/client/markdown.tsx b/client/markdown.tsx
+index b424b2a..3e09af6 100644
+--- a/client/markdown.tsx
++++ b/client/markdown.tsx
+@@ -11,6 +11,11 @@
+  * handling an issue body needs and an agent's reply does not; there is no
+  * workspace root to share one from.
+  *
++ * The Files view's preview draws images too, when it passes `images`: an
++ * image the file names by a path in the home, read through the daemon
++ * (`./image-view`). A web address is never fetched; its alt text links to it.
++ * HTML is never rendered in either case.
++ *
+  * Single newlines break lines, so a list the agent wrapped by hand keeps its
+  * shape instead of reflowing.
+  */
+@@ -18,7 +23,8 @@ import type { PluginTheme } from "@getpaseo/plugin";
+ import { useMemo, type ReactNode } from "react";
+ import { Text, View } from "react-native";
+ 
+-import { inlineTokens, type FileLookup } from "./file-links";
++import { inlineTokens, splitAtImages, type FileLookup, type InlineToken } from "./file-links";
++import { MarkdownImage, type MarkdownImages } from "./image-view";
+ import { parseMarkdown, type Block } from "./markdown-parse";
+ import { MONOSPACE } from "./ui";
+ 
+@@ -84,15 +90,75 @@ interface InlineContext {
+   lookup: FileLookup;
+   onOpenLink: (url: string) => void;
+   onOpenFile: ((path: string) => void) | null;
++  /** Null draws no images: `![alt](path)` stays the text and link it always was. */
++  images: MarkdownImages | null;
++  theme: PluginTheme;
++  fontSize: number;
++}
++
++function tokensOf(text: string, context: InlineContext): InlineToken[] {
++  const lookup = context.onOpenFile === null ? noFiles : context.lookup;
++  return inlineTokens(text, lookup, { images: context.images !== null });
+ }
+ 
+ function renderInline(text: string, styles: MarkdownStyles, context: InlineContext): ReactNode[] {
++  return renderTokens(tokensOf(text, context), styles, context);
++}
++
++/**
++ * Text as one `Text`, as ever, or, when it names images, as a column of its
++ * text runs and the images between them, each image a block of its own.
++ */
++function renderText(
++  text: string,
++  style: object,
++  styles: MarkdownStyles,
++  context: InlineContext,
++  key?: number,
++): ReactNode {
++  const tokens = tokensOf(text, context);
++  if (!tokens.some((token) => token.kind === "image")) {
++    return (
++      <Text key={key} selectable style={style}>
++        {renderTokens(tokens, styles, context)}
++      </Text>
++    );
++  }
++  return (
++    <View key={key} style={{ gap: 6, flexShrink: 1 }}>
++      {splitAtImages(tokens).map((part, index) =>
++        Array.isArray(part) ? (
++          <Text key={index} selectable style={style}>
++            {renderTokens(part, styles, context)}
++          </Text>
++        ) : (
++          renderImage(part.alt, part.target, context, index)
++        ),
++      )}
++    </View>
++  );
++}
++
++function renderImage(alt: string, target: string, context: InlineContext, key: number): ReactNode {
++  if (context.images === null) return null;
++  return (
++    <MarkdownImage
++      key={key}
++      theme={context.theme}
++      alt={alt}
++      target={target}
++      images={context.images}
++      fontSize={context.fontSize}
++    />
++  );
++}
++
++function renderTokens(tokens: InlineToken[], styles: MarkdownStyles, context: InlineContext): ReactNode[] {
+   // `.map` rather than a loop, because a link's press handler closes over its
+   // target and a closure made in a `for…of` body captures the binding's final
+   // value under Hermes.
+   const { onOpenFile } = context;
+-  const lookup = onOpenFile === null ? noFiles : context.lookup;
+-  return inlineTokens(text, lookup).map((token, index) => {
++  return tokens.map((token, index) => {
+     switch (token.kind) {
+       case "text":
+         return token.text;
+@@ -120,6 +186,9 @@ function renderInline(text: string, styles: MarkdownStyles, context: InlineConte
+             {token.text}
+           </Text>
+         );
++      case "image":
++        // Only in a heading: everywhere else lays images out as blocks (`renderText`).
++        return renderImage(token.alt, token.target, context, index);
+       default:
+         return (
+           <Text key={index} accessibilityRole="link" style={styles.link} onPress={() => context.onOpenLink(token.url)}>
+@@ -145,7 +214,11 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
+             {block.items.map((item, itemIndex) => (
+               <View key={itemIndex} style={[styles.listRow, { paddingLeft: item.depth * 14 }]}>
+                 <Text style={styles.listMarker}>{item.marker}</Text>
+-                <Text style={[styles.paragraph, styles.listText]}>{renderInline(item.text, styles, context)}</Text>
++                {context.images === null ? (
++                  <Text style={[styles.paragraph, styles.listText]}>{renderInline(item.text, styles, context)}</Text>
++                ) : (
++                  <View style={styles.listText}>{renderText(item.text, styles.paragraph, styles, context)}</View>
++                )}
+               </View>
+             ))}
+           </View>
+@@ -173,9 +246,13 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
+               <View key={rowIndex} style={styles.tableRow}>
+                 {cells.map((cell, cellIndex) => (
+                   <View key={cellIndex} style={styles.tableCell}>
+-                    <Text style={[styles.paragraph, rowIndex === 0 ? styles.tableHeader : null]}>
+-                      {renderInline(cell, styles, context)}
+-                    </Text>
++                    {context.images === null ? (
++                      <Text style={[styles.paragraph, rowIndex === 0 ? styles.tableHeader : null]}>
++                        {renderInline(cell, styles, context)}
++                      </Text>
++                    ) : (
++                      renderText(cell, [styles.paragraph, rowIndex === 0 ? styles.tableHeader : null], styles, context)
++                    )}
+                   </View>
+                 ))}
+               </View>
+@@ -183,6 +260,7 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
+           </View>
+         );
+       default:
++        if (context.images !== null) return renderText(block.text, styles.paragraph, styles, context, index);
+         return (
+           <Text key={index} selectable style={styles.paragraph}>
+             {renderInline(block.text, styles, context)}
+@@ -199,6 +277,7 @@ export function Markdown({
+   onOpenLink,
+   files = noFiles,
+   onOpenFile = null,
++  images = null,
+ }: {
+   source: string;
+   theme: PluginTheme;
+@@ -207,8 +286,14 @@ export function Markdown({
+   /** Which paths the text names are files in the home — see `./file-links`; none without `onOpenFile`. */
+   files?: FileLookup;
+   onOpenFile?: ((path: string) => void) | null;
++  /** Where the images the text names are read from; none are drawn without it. */
++  images?: MarkdownImages | null;
+ }) {
+   const styles = useMarkdownStyles(theme, fontSize);
+   const blocks = useMemo(() => parseMarkdown(source), [source]);
+-  return <View style={{ gap: 6 }}>{renderBlocks(blocks, styles, { lookup: files, onOpenLink, onOpenFile })}</View>;
++  return (
++    <View style={{ gap: 6 }}>
++      {renderBlocks(blocks, styles, { lookup: files, onOpenLink, onOpenFile, images, theme, fontSize })}
++    </View>
++  );
+ }
+diff --git a/client/open-file.ts b/client/open-file.ts
+index 51b0f52..09ee3eb 100644
+--- a/client/open-file.ts
++++ b/client/open-file.ts
+@@ -1,7 +1,28 @@
+ /** The file open in the Files view. Pure, so the save bookkeeping is testable. */
+ export type OpenFile =
+   | { kind: "text"; path: string; modifiedMs: number; saved: string; draft: string }
+-  | { kind: "unreadable"; path: string; reason: "binary" | "tooLarge"; size: number };
++  /** View-only; `data` is the file as base64, drawn from a data URI (`shared/images.ts`). */
++  | { kind: "image"; path: string; modifiedMs: number; mimeType: string; size: number; data: string }
++  | { kind: "unreadable"; path: string; reason: "binary" | "tooLarge" | "imageTooLarge"; size: number };
++
++/** An image as `firstmate.files.read-image` answers it, opened: shown, or too large to be. */
++export function openedImage(result: {
++  path: string;
++  mimeType: string;
++  data: string | null;
++  size: number;
++  modifiedMs: number;
++}): OpenFile {
++  if (result.data === null) return { kind: "unreadable", path: result.path, reason: "imageTooLarge", size: result.size };
++  return {
++    kind: "image",
++    path: result.path,
++    modifiedMs: result.modifiedMs,
++    mimeType: result.mimeType,
++    size: result.size,
++    data: result.data,
++  };
++}
+ 
+ /**
+  * The open file once `content` has been saved to `path` at `modifiedMs`. The
+diff --git a/index.server.ts b/index.server.ts
+index 912aab0..9720364 100644
+--- a/index.server.ts
++++ b/index.server.ts
+@@ -13,6 +13,7 @@ import {
+ import { registerCrewSeen } from "./server/crew-seen";
+ import { ReportCache, loadFleet, readAgentTools } from "./server/fleet";
+ import { findFiles, listDirectory, readTextFile, requireHome, writeTextFile } from "./server/files";
++import { readHomeImageFile } from "./server/images";
+ import { CHARTER_FILE, NEW_CHARTER_FILE, acknowledgeCharter, writeNewCharter } from "./server/charter-file";
+ import { isHomeReady, prepareHome, removeSuggestion } from "./server/home";
+ import {
+@@ -51,7 +52,7 @@ import {
+ } from "./shared/fleet";
+ import { readQuotaSnapshot } from "./server/quota";
+ import { readQuota } from "./shared/quota";
+-import { findHomeFiles, listHomeFiles, readHomeFile, writeHomeFile } from "./shared/files";
++import { findHomeFiles, listHomeFiles, readHomeFile, readHomeImage, writeHomeFile } from "./shared/files";
+ import { startWatches } from "./server/watch-service";
+ import { displaySettings } from "./shared/settings";
+ 
+@@ -133,6 +134,7 @@ export default function contribute(server: PluginServerContext) {
+     return { home: root, ...(await listDirectory(root, path)) };
+   });
+   server.handle(readHomeFile, async ({ path }) => readTextFile(await home(), path));
++  server.handle(readHomeImage, async (input) => readHomeImageFile(await home(), input));
+   server.handle(findHomeFiles, async ({ paths }) => ({ files: await findFiles(await home(), paths) }));
+   server.handle(writeHomeFile, async (input) => {
+     const written = await writeTextFile(await home(), input);
+diff --git a/server/images.test.ts b/server/images.test.ts
+new file mode 100644
+index 0000000..b42e6dc
+--- /dev/null
++++ b/server/images.test.ts
+@@ -0,0 +1,210 @@
++import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import { MAX_IMAGE_BYTES } from "../shared/images";
++import { findMarkdownImage, imageCandidates, readHomeImageFile, readImageFile, sniffImageType } from "./images";
++
++const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, 0x49, 0x48, 0x44, 0x52]);
++const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 16, 0x4a, 0x46, 0x49, 0x46]);
++const GIF = Buffer.from("GIF89a\x01\x00\x01\x00", "latin1");
++const WEBP = Buffer.concat([Buffer.from("RIFF"), Buffer.from([24, 0, 0, 0]), Buffer.from("WEBPVP8 ")]);
++const HOSTILE_SVG = '<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"><script>alert(2)</script></svg>';
++
++let outer: string;
++let home: string;
++
++beforeEach(async () => {
++  outer = await realpath(await mkdtemp(join(tmpdir(), "firstmate-images-")));
++  home = join(outer, "home");
++  await mkdir(join(home, "data", "scout"), { recursive: true });
++  await writeFile(join(home, "data", "scout", "plot.png"), PNG);
++  await writeFile(join(home, "data", "scout", "report.md"), "# Report\n");
++  await writeFile(join(home, "top.png"), PNG);
++  await writeFile(join(home, "data", "notes.txt"), "text");
++  await writeFile(join(outer, "outside.png"), PNG);
++});
++
++afterEach(async () => {
++  await rm(outer, { recursive: true, force: true });
++});
++
++describe("sniffImageType", () => {
++  it("tells the raster types by their first bytes", () => {
++    expect(sniffImageType(PNG)).toBe("image/png");
++    expect(sniffImageType(JPEG)).toBe("image/jpeg");
++    expect(sniffImageType(GIF)).toBe("image/gif");
++    expect(sniffImageType(WEBP)).toBe("image/webp");
++  });
++
++  it("has no signature for SVG or text, nor for too few bytes", () => {
++    expect(sniffImageType(Buffer.from(HOSTILE_SVG))).toBeNull();
++    expect(sniffImageType(Buffer.from("hello"))).toBeNull();
++    expect(sniffImageType(Buffer.from([0x89, 0x50]))).toBeNull();
++    expect(sniffImageType(new Uint8Array())).toBeNull();
++  });
++});
++
++describe("readImageFile", () => {
++  it("reads an image in the home as base64, with its type, size and time", async () => {
++    const image = await readImageFile(home, "data/scout/plot.png");
++    expect(image).toMatchObject({ path: "data/scout/plot.png", mimeType: "image/png", size: PNG.length, tooLarge: false });
++    expect(Buffer.from(image.data ?? "", "base64").equals(PNG)).toBe(true);
++    expect(image.modifiedMs).toBeGreaterThan(0);
++  });
++
++  it("takes a Windows path with backslashes", async () => {
++    const image = await readImageFile(home, "data\\scout\\plot.png");
++    expect(image.path).toBe("data/scout/plot.png");
++  });
++
++  it("goes by the bytes, so a JPEG saved as .png draws as a JPEG", async () => {
++    await writeFile(join(home, "photo.png"), JPEG);
++    expect((await readImageFile(home, "photo.png")).mimeType).toBe("image/jpeg");
++  });
++
++  it("sends an SVG as an SVG image in base64, never as its markup", async () => {
++    await writeFile(join(home, "drawing.svg"), HOSTILE_SVG);
++    const image = await readImageFile(home, "drawing.svg");
++    expect(image.mimeType).toBe("image/svg+xml");
++    expect(image.data).not.toContain("<");
++    expect(Buffer.from(image.data ?? "", "base64").toString("utf8")).toBe(HOSTILE_SVG);
++  });
++
++  it("never calls a raster-named file holding SVG markup an SVG", async () => {
++    await writeFile(join(home, "sneaky.png"), HOSTILE_SVG);
++    expect((await readImageFile(home, "sneaky.png")).mimeType).toBe("image/png");
++  });
++
++  it("holds back an image over the cap, with its size", async () => {
++    await writeFile(join(home, "big.png"), Buffer.concat([PNG, Buffer.alloc(100)]));
++    const image = await readImageFile(home, "big.png", PNG.length + 99);
++    expect(image).toMatchObject({ path: "big.png", data: null, tooLarge: true, size: PNG.length + 100 });
++    expect((await readImageFile(home, "big.png", PNG.length + 100)).tooLarge).toBe(false);
++  });
++
++  it("caps at 15 MB by default", async () => {
++    expect(MAX_IMAGE_BYTES).toBe(15 * 1024 * 1024);
++    await writeFile(join(home, "huge.png"), Buffer.alloc(MAX_IMAGE_BYTES + 1));
++    expect(await readImageFile(home, "huge.png")).toMatchObject({ data: null, tooLarge: true });
++  });
++
++  it("refuses anything but an image, a folder, and what is missing", async () => {
++    await expect(readImageFile(home, "data/notes.txt")).rejects.toThrow(/not an image/);
++    await mkdir(join(home, "folder.png"));
++    await expect(readImageFile(home, "folder.png")).rejects.toThrow(/not a file/);
++    await expect(readImageFile(home, "missing.png")).rejects.toThrow();
++  });
++
++  it("refuses a path out of the home, as the text read does", async () => {
++    await expect(readImageFile(home, "../outside.png")).rejects.toThrow(/outside the home/);
++    await expect(readImageFile(home, "data/../../outside.png")).rejects.toThrow(/outside the home/);
++    await expect(readImageFile(home, join(outer, "outside.png"))).rejects.toThrow(/not a path inside the home/);
++    await expect(readImageFile(home, "C:\\Windows\\x.png")).rejects.toThrow(/not a path inside the home/);
++  });
++
++  it("refuses a link that leads out of the home", async () => {
++    // A junction needs no privilege on Windows; elsewhere the type is ignored.
++    await symlink(outer, join(home, "escape"), "junction");
++    await expect(readImageFile(home, "escape/outside.png")).rejects.toThrow(/leads outside the home/);
++  });
++});
++
++describe("imageCandidates", () => {
++  const userHome = "/users/captain";
++
++  it("looks beside the Markdown file first, then from the home", () => {
++    expect(imageCandidates("plot.png", "data/scout/report.md", userHome)).toEqual([
++      "data/scout/plot.png",
++      "plot.png",
++    ]);
++    expect(imageCandidates("data/scout/plot.png", "data/scout/report.md", userHome)).toEqual([
++      "data/scout/data/scout/plot.png",
++      "data/scout/plot.png",
++    ]);
++    expect(imageCandidates("./plot.png", "README.md", userHome)).toEqual(["./plot.png"]);
++  });
++
++  it("turns backslashes into slashes in a relative path", () => {
++    expect(imageCandidates("figs\\plot.png", "data\\scout\\report.md", userHome)).toEqual([
++      "data/scout/figs/plot.png",
++      "figs/plot.png",
++    ]);
++  });
++
++  it("keeps a drive-letter or UNC path absolute, for the daemon to confine", () => {
++    expect(imageCandidates("C:\\Users\\captain\\plot.png", "r.md", userHome)).toEqual(["C:\\Users\\captain\\plot.png"]);
++    expect(imageCandidates("C:/Users/captain/plot.png", "r.md", userHome)).toEqual(["C:/Users/captain/plot.png"]);
++    expect(imageCandidates("\\\\server\\share\\plot.png", "r.md", userHome)).toEqual(["\\\\server\\share\\plot.png"]);
++  });
++
++  it("tries /… both as given and from the home", () => {
++    expect(imageCandidates("/data/plot.png", "r.md", userHome)).toEqual(["/data/plot.png", "data/plot.png"]);
++  });
++
++  it("expands ~/ to the user's home folder", () => {
++    expect(imageCandidates("~/pics/a.png", "r.md", userHome)).toEqual([join(userHome, "pics/a.png")]);
++  });
++
++  it("has none for a URL of any kind", () => {
++    for (const url of ["https://example.com/a.png", "http://x/a.png", "data:image/png;base64,AAAA", "file:///c:/a.png", "javascript:alert(1)"]) {
++      expect(imageCandidates(url, "r.md", userHome)).toEqual([]);
++    }
++  });
++
++  it("also tries a percent-decoded spelling, and unwraps <…>", () => {
++    expect(imageCandidates("my%20plot.png", "r.md", userHome)).toEqual(["my%20plot.png", "my plot.png"]);
++    expect(imageCandidates("<plot.png>", "d/r.md", userHome)).toEqual(["d/plot.png", "plot.png"]);
++    expect(imageCandidates("bad%zz.png", "r.md", userHome)).toEqual(["bad%zz.png"]);
++  });
++});
++
++describe("findMarkdownImage", () => {
++  const from = "data/scout/report.md";
++
++  it("finds an image beside the Markdown file, or from the home", async () => {
++    expect(await findMarkdownImage(home, "plot.png", from)).toBe("data/scout/plot.png");
++    expect(await findMarkdownImage(home, "./plot.png", from)).toBe("data/scout/plot.png");
++    expect(await findMarkdownImage(home, "data/scout/plot.png", from)).toBe("data/scout/plot.png");
++    expect(await findMarkdownImage(home, "top.png", from)).toBe("top.png");
++    expect(await findMarkdownImage(home, "../../top.png", from)).toBe("top.png");
++    expect(await findMarkdownImage(home, "/top.png", from)).toBe("top.png");
++  });
++
++  it("finds one by an absolute path inside the home, in either slash", async () => {
++    expect(await findMarkdownImage(home, join(home, "data", "scout", "plot.png"), from)).toBe("data/scout/plot.png");
++    expect(await findMarkdownImage(home, join(home, "top.png").replace(/\\/g, "/"), from)).toBe("top.png");
++  });
++
++  it("finds none outside the home, even when the file is there", async () => {
++    expect(await findMarkdownImage(home, "../../../outside.png", from)).toBeNull();
++    expect(await findMarkdownImage(home, "..\\..\\..\\outside.png", from)).toBeNull();
++    expect(await findMarkdownImage(home, join(outer, "outside.png"), from)).toBeNull();
++    await symlink(outer, join(home, "escape"), "junction");
++    expect(await findMarkdownImage(home, "escape/outside.png", "report.md")).toBeNull();
++  });
++
++  it("finds none for a URL, a file that is not an image, or one that is missing", async () => {
++    expect(await findMarkdownImage(home, "https://example.com/top.png", from)).toBeNull();
++    expect(await findMarkdownImage(home, "file:///top.png", from)).toBeNull();
++    expect(await findMarkdownImage(home, "../notes.txt", from)).toBeNull();
++    expect(await findMarkdownImage(home, "missing.png", from)).toBeNull();
++  });
++});
++
++describe("readHomeImageFile", () => {
++  it("reads a Files path as it is, and a Markdown target by what it names", async () => {
++    expect((await readHomeImageFile(home, { path: "top.png" })).path).toBe("top.png");
++    expect((await readHomeImageFile(home, { path: "plot.png", relativeTo: "data/scout/report.md" })).path).toBe(
++      "data/scout/plot.png",
++    );
++  });
++
++  it("says so when a Markdown target names no image in the home", async () => {
++    await expect(readHomeImageFile(home, { path: "../../../outside.png", relativeTo: "data/scout/report.md" })).rejects.toThrow(
++      /not an image in the first mate's home/,
++    );
++    await expect(readHomeImageFile(home, { path: "https://example.com/a.png", relativeTo: "r.md" })).rejects.toThrow();
++  });
++});
+diff --git a/server/images.ts b/server/images.ts
+new file mode 100644
+index 0000000..85e7ede
+--- /dev/null
++++ b/server/images.ts
+@@ -0,0 +1,117 @@
++/**
++ * Images in the home, read for the Files view and the Markdown preview (see
++ * `shared/images.ts` for how they are drawn).
++ *
++ * An image is confined exactly as a text file is: its path goes through
++ * `resolveInHome`, so nothing outside the home — through `..`, an absolute
++ * path or a symlink — is read. A Markdown image's target is first turned into
++ * the paths it could mean (`imageCandidates`), each of which `findFiles`
++ * checks the same way, and the one found is then read through
++ * `resolveInHome` again.
++ */
++import { stat, readFile } from "node:fs/promises";
++import { homedir } from "node:os";
++import { join } from "node:path";
++
++import { imageTypeOf, isUrlTarget, MAX_IMAGE_BYTES } from "../shared/images";
++import { findFiles, resolveInHome } from "./files";
++
++/** The raster type the first bytes say a file is, whatever its extension, or null. SVG is text and has no signature. */
++export function sniffImageType(bytes: Uint8Array): string | null {
++  const starts = (signature: readonly number[], at = 0) => signature.every((byte, index) => bytes[at + index] === byte);
++  if (starts([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
++  if (starts([0xff, 0xd8, 0xff])) return "image/jpeg";
++  if (starts([0x47, 0x49, 0x46, 0x38]) && (bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61) return "image/gif";
++  if (starts([0x52, 0x49, 0x46, 0x46]) && starts([0x57, 0x45, 0x42, 0x50], 8)) return "image/webp";
++  return null;
++}
++
++export interface HomeImage {
++  path: string;
++  mimeType: string;
++  data: string | null;
++  tooLarge: boolean;
++  size: number;
++  modifiedMs: number;
++}
++
++/**
++ * An image in the home as base64, or its size alone when it is over the cap.
++ * Its type is the one its bytes say, so a JPEG saved as `.png` still draws,
++ * and a `.png` holding anything else is never called an SVG.
++ */
++export async function readImageFile(home: string, path: string, maxBytes = MAX_IMAGE_BYTES): Promise<HomeImage> {
++  const { absolute, relative: rel } = await resolveInHome(home, path);
++  const byExtension = imageTypeOf(rel);
++  if (byExtension === null) throw new Error(`"${rel}" is not an image the Files view shows.`);
++  const info = await stat(absolute);
++  if (!info.isFile()) throw new Error(`"${rel}" is not a file.`);
++  const base = { path: rel, mimeType: byExtension, size: info.size, modifiedMs: Math.floor(info.mtimeMs) };
++  if (info.size > maxBytes) return { ...base, data: null, tooLarge: true };
++  const bytes = await readFile(absolute);
++  // Grown since the stat: the cap is on what is sent.
++  if (bytes.length > maxBytes) return { ...base, size: bytes.length, data: null, tooLarge: true };
++  return { ...base, mimeType: sniffImageType(bytes) ?? byExtension, data: bytes.toString("base64"), tooLarge: false };
++}
++
++function parentOf(path: string): string {
++  const cut = path.lastIndexOf("/");
++  return cut === -1 ? "" : path.slice(0, cut);
++}
++
++/**
++ * The paths a Markdown image's `target`, written in the file at `from`
++ * (home-relative), could mean, most likely first: beside the Markdown file,
++ * then from the home itself. An absolute path — a drive letter, `\\server`,
++ * `/…` — and `~/…`, the user's home folder, are kept absolute, and count only
++ * if they land inside the first mate's home; `/…` is also tried from that
++ * home, as a site root would be. A URL of any kind is no path, so it has none.
++ * These are candidates only: nothing here decides what is inside the home.
++ */
++export function imageCandidates(target: string, from: string, userHome: string = homedir()): string[] {
++  let raw = target.trim();
++  if (raw.startsWith("<") && raw.endsWith(">")) raw = raw.slice(1, -1).trim();
++  if (raw === "" || isUrlTarget(raw)) return [];
++  const spellings = [raw];
++  try {
++    const decoded = decodeURI(raw);
++    if (decoded !== raw) spellings.push(decoded);
++  } catch {
++    // Not percent-encoded after all.
++  }
++  const found: string[] = [];
++  for (const spelling of spellings) {
++    if (/^~[\\/]/.test(spelling)) {
++      found.push(join(userHome, spelling.slice(2)));
++    } else if (/^[a-zA-Z]:[\\/]/.test(spelling) || /^[\\/]{2}/.test(spelling)) {
++      found.push(spelling);
++    } else if (/^[\\/]/.test(spelling)) {
++      found.push(spelling, spelling.replace(/^[\\/]+/, ""));
++    } else {
++      const relative = spelling.replace(/\\/g, "/");
++      const dir = parentOf(from.replace(/\\/g, "/"));
++      found.push(dir === "" ? relative : `${dir}/${relative}`, relative);
++    }
++  }
++  return [...new Set(found)];
++}
++
++/** The home-relative path of the image a Markdown file at `from` names as `target`, or null when it names none in the home. */
++export async function findMarkdownImage(home: string, target: string, from: string): Promise<string | null> {
++  const candidates = imageCandidates(target, from).filter((candidate) => imageTypeOf(candidate) !== null);
++  if (candidates.length === 0) return null;
++  const files = await findFiles(home, candidates);
++  for (const candidate of candidates) {
++    const path = files[candidate];
++    if (path !== undefined) return path;
++  }
++  return null;
++}
++
++/** What `firstmate.files.read-image` answers: the image at `path`, or the one a Markdown file at `relativeTo` names. */
++export async function readHomeImageFile(home: string, input: { path: string; relativeTo?: string | undefined }): Promise<HomeImage> {
++  if (input.relativeTo === undefined) return readImageFile(home, input.path);
++  const found = await findMarkdownImage(home, input.path, input.relativeTo);
++  if (found === null) throw new Error(`"${input.path}" is not an image in the first mate's home.`);
++  return readImageFile(home, found);
++}
+diff --git a/shared/files.ts b/shared/files.ts
+index 4b48876..db6cab1 100644
+--- a/shared/files.ts
++++ b/shared/files.ts
+@@ -76,3 +76,24 @@ export const findHomeFiles = defineRpc({
+   input: z.object({ paths: z.array(z.string().max(MAX_FILE_PATH_LENGTH)).max(MAX_FILE_CANDIDATES) }),
+   output: z.object({ files: z.record(z.string(), z.string()) }),
+ });
++
++/**
++ * An image in the home, as base64, for the Files view and the Markdown
++ * preview (see `./images`). Only a PNG, JPEG, GIF, WebP or SVG, by extension;
++ * anything else is refused. With `relativeTo`, `path` is a Markdown image's
++ * target, looked up beside that Markdown file first and then in the home, and
++ * the answer's `path` is the file it named.
++ */
++export const readHomeImage = defineRpc({
++  name: "firstmate.files.read-image",
++  input: z.object({ path: z.string().min(1).max(MAX_FILE_PATH_LENGTH), relativeTo: z.string().optional() }),
++  output: z.object({
++    path: z.string(),
++    mimeType: z.string(),
++    /** Null for an image over `MAX_IMAGE_BYTES`, with `tooLarge` set. */
++    data: z.string().nullable(),
++    tooLarge: z.boolean(),
++    size: z.number(),
++    modifiedMs: z.number(),
++  }),
++});
+diff --git a/shared/images.ts b/shared/images.ts
+new file mode 100644
+index 0000000..41b62ce
+--- /dev/null
++++ b/shared/images.ts
+@@ -0,0 +1,58 @@
++/**
++ * Images in the first mate's home, for the Files view and the Markdown
++ * preview: which files are shown as images, how large they may be, and the
++ * data URI they are drawn from.
++ *
++ * Every image is drawn by `Image` from a base64 data URI, SVG included. An SVG
++ * is never put into the page as markup: loaded as an image, a browser draws it
++ * without running its scripts, loading anything it links to, or letting it
++ * handle events, so an SVG the first mate — or a clone under `projects/` —
++ * happens to contain can do no more than a PNG can.
++ */
++
++/** Larger images are listed but not shown: the RPC carries the whole file, as base64. */
++export const MAX_IMAGE_BYTES = 15 * 1024 * 1024;
++
++export const SVG_TYPE = "image/svg+xml";
++
++const IMAGE_BY_EXTENSION: Readonly<Record<string, string>> = {
++  png: "image/png",
++  jpg: "image/jpeg",
++  jpeg: "image/jpeg",
++  gif: "image/gif",
++  webp: "image/webp",
++  svg: SVG_TYPE,
++};
++
++/** The image type the Files view shows `path` as, by its extension, or null when it is not one. Either slash separates. */
++export function imageTypeOf(path: string): string | null {
++  const name = path.slice(Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\")) + 1);
++  const dot = name.lastIndexOf(".");
++  if (dot === -1) return null;
++  return IMAGE_BY_EXTENSION[name.slice(dot + 1).toLowerCase()] ?? null;
++}
++
++/**
++ * What an `Image` draws: a data URI, base64 always — never `utf8,` with the
++ * file's own text in it, so not even an SVG's markup appears in the URI.
++ */
++export function imageDataUri(mimeType: string, base64: string): string {
++  if (!/^image\/[a-z0-9.+-]+$/i.test(mimeType)) throw new Error(`"${mimeType}" is not an image type.`);
++  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(base64)) throw new Error("Image data is not base64.");
++  return `data:${mimeType};base64,${base64}`;
++}
++
++/** A URL scheme — but not a Windows drive letter, which is a path. */
++const SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
++const DRIVE = /^[a-zA-Z]:([\\/]|$)/;
++
++/** Whether a Markdown image's target is a URL rather than a path: http(s), data, file or any other scheme. Never fetched. */
++export function isUrlTarget(target: string): boolean {
++  const trimmed = target.trim();
++  return SCHEME.test(trimmed) && !DRIVE.test(trimmed);
++}
++
++/** Whether a Markdown image's target is a web address, which the preview shows as a link, not an image. */
++export function isWebTarget(target: string): boolean {
++  return /^https?:\/\//i.test(target.trim());
++}
+diff --git a/shared/rpc-names.test.ts b/shared/rpc-names.test.ts
+new file mode 100644
+index 0000000..f37c6d5
+--- /dev/null
++++ b/shared/rpc-names.test.ts
+@@ -0,0 +1,68 @@
++import { readdirSync, readFileSync } from "node:fs";
++import { join, relative } from "node:path";
++import { fileURLToPath } from "node:url";
++import { describe, expect, it } from "vitest";
++
++import * as files from "./files";
++import * as fleet from "./fleet";
++import * as quota from "./quota";
++
++/**
++ * The daemon's own check (`validateMethod` in Paseo's plugin-process.js): a
++ * name it refuses fails `server.handle`, which fails the whole plugin load.
++ * No capitals, so `camelCase` names are out.
++ */
++const DAEMON_METHOD_PATTERN = /^[a-z][a-z0-9._-]*$/;
++
++const ROOT = fileURLToPath(new URL("..", import.meta.url));
++
++function sources(dir: string): string[] {
++  return readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
++    const path = join(dir, entry.name);
++    if (entry.isDirectory()) return entry.name === "node_modules" || entry.name === "patches" ? [] : sources(path);
++    return /\.tsx?$/.test(entry.name) && !entry.name.endsWith(".test.ts") ? [path] : [];
++  });
++}
++
++/** Every `defineRpc({ name: "..." })` in the plugin's source, by file. */
++function declaredNames(): { file: string; name: string }[] {
++  return sources(ROOT).flatMap((path) =>
++    [...readFileSync(path, "utf8").matchAll(/defineRpc\(\{\s*name:\s*"([^"]*)"/g)].map((match) => ({
++      file: relative(ROOT, path),
++      name: match[1]!,
++    })),
++  );
++}
++
++function contractNames(module: Record<string, unknown>): string[] {
++  return Object.values(module).flatMap((value) =>
++    value && typeof value === "object" && "name" in value && "input" in value && "output" in value
++      ? [String((value as { name: unknown }).name)]
++      : [],
++  );
++}
++
++describe("plugin RPC names", () => {
++  const declared = declaredNames();
++
++  it("finds the RPCs in the source", () => {
++    expect(declared.map((rpc) => rpc.name)).toContain("firstmate.files.read-image");
++    expect(declared.length).toBeGreaterThan(20);
++  });
++
++  it("are all accepted by the daemon", () => {
++    expect(declared.filter((rpc) => !DAEMON_METHOD_PATTERN.test(rpc.name.trim()))).toEqual([]);
++  });
++
++  it("are unique", () => {
++    const names = declared.map((rpc) => rpc.name.trim());
++    expect(names.filter((name, i) => names.indexOf(name) !== i)).toEqual([]);
++  });
++
++  it("include every contract the shared modules export", () => {
++    const exported = [...contractNames(files), ...contractNames(fleet), ...contractNames(quota)];
++    expect(exported.length).toBeGreaterThan(20);
++    expect(exported.filter((name) => !DAEMON_METHOD_PATTERN.test(name))).toEqual([]);
++    expect(exported.filter((name) => !declared.some((rpc) => rpc.name === name))).toEqual([]);
++  });
++});

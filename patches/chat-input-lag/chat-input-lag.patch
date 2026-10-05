@@ -1,0 +1,271 @@
+diff --git a/client/chat.tsx b/client/chat.tsx
+index d07580c..d02a054 100644
+--- a/client/chat.tsx
++++ b/client/chat.tsx
+@@ -7,7 +7,7 @@ import type { PluginTheme } from "@getpaseo/plugin";
+ import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
+ import { Icon, TextInput, useToast } from "@getpaseo/plugin/client/react-native";
+ import { useQuery } from "@tanstack/react-query";
+-import { useEffect, useMemo, useRef, useState } from "react";
++import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+ import { Image, Platform, Pressable, SafeAreaView, ScrollView, Text, View } from "react-native";
+ 
+ import { MAX_FILE_CANDIDATES, findHomeFiles } from "../shared/files";
+@@ -310,11 +310,11 @@ export function MateChat({
+     if (sendMateCommand(command)) follow.pin();
+   }
+ 
+-  function openLink(url: string): void {
++  const openLink = useCallback((url: string): void => {
+     void openExternalUrl(url).catch((caught: unknown) => toast.error(errorText(caught)));
+-  }
++  }, [toast]);
+ 
+-  function renderGroup(group: Group) {
++  const renderGroup = useCallback((group: Group) => {
+     if ("tools" in group) {
+       const open = openGroups.has(group.key);
+       const shown = open ? group.tools : group.tools.slice(-TOOL_RUN_VISIBLE);
+@@ -379,7 +379,10 @@ export function MateChat({
+           </View>
+         );
+     }
+-  }
++  }, [openGroups, theme, styles, files, onOpenFile, openLink]);
++
++  // Composer edits leave the history's rendered Markdown and inline tokens alone.
++  const renderedGroups = useMemo(() => groups.map(renderGroup), [groups, renderGroup]);
+ 
+   return (
+     <View ref={pane} style={[styles.pane, { paddingBottom: keyboard }]}>
+@@ -389,7 +392,7 @@ export function MateChat({
+           {groups.length === 0 && pending.length === 0 ? (
+             <Text style={styles.hint}>{timeline.loading ? "Loading the conversation…" : "Nothing said yet. Ask below."}</Text>
+           ) : (
+-            groups.map(renderGroup)
++            renderedGroups
+           )}
+           {pending.map((request) => (
+             // A direct child of the transcript, so its layout is in the transcript's coordinates.
+
+diff --git a/client/chat.test.ts b/client/chat.test.ts
+new file mode 100644
+--- /dev/null
++++ b/client/chat.test.ts
+@@ -0,0 +1,216 @@
++import { createElement, type ElementType } from "react";
++import { act, create, type ReactTestRenderer } from "react-test-renderer";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type { PluginTheme } from "@getpaseo/plugin";
++import type { AgentSummary } from "../shared/fleet";
++import type { TimelineEntry } from "./transcript-rows";
++
++// The daemon and native host are system boundaries. Keep the chat, timeline
++// hook, draft stores, grouping and Markdown renderer real.
++const host = vi.hoisted(() => ({
++  entries: [] as unknown[],
++  refresh: () => {},
++  files: {} as Record<string, string>,
++  toast: { error: vi.fn(), show: vi.fn() },
++  openUrl: vi.fn().mockResolvedValue(undefined),
++  rpc: vi.fn().mockResolvedValue({}),
++}));
++
++vi.mock("react-native", () => ({
++  View: "View", Text: "Text", Pressable: "Pressable", ScrollView: "ScrollView",
++  SafeAreaView: "SafeAreaView", Image: "Image", ActivityIndicator: "ActivityIndicator",
++  Platform: { OS: "web", select: (options: { default: unknown }) => options.default },
++  AppState: { addEventListener: () => ({ remove: () => {} }) },
++}));
++vi.mock("@getpaseo/plugin/client/react-native", () => ({
++  Icon: "Icon", TextInput: "TextInput",
++  Modal: Object.assign(() => null, { Content: "ModalContent" }),
++  useToast: () => host.toast,
++}));
++vi.mock("@getpaseo/plugin/client", () => {
++  const paseo = {
++    agents: { ref: () => ({
++      timeline: {
++        refetch: async () => ({ entries: host.entries, agent: null, hasOlder: false }),
++        subscribe: (refresh: () => void) => { host.refresh = refresh; return () => {}; },
++      },
++    }) },
++  };
++  return { usePaseo: () => paseo, useRpc: () => host.rpc, openExternalUrl: host.openUrl };
++});
++vi.mock("@tanstack/react-query", () => ({
++  useQuery: ({ queryKey }: { queryKey: string[] }) => ({
++    data: queryKey.includes("files") ? { files: host.files } : undefined,
++    refetch: host.rpc, dataUpdatedAt: 0,
++  }),
++}));
++// A counting wrapper still executes the production Markdown renderer and hooks.
++vi.mock("./markdown", async (original) => {
++  const actual = await original<typeof import("./markdown")>();
++  return { ...actual, Markdown: vi.fn(actual.Markdown) };
++});
++vi.mock("./file-links", async (original) => {
++  const actual = await original<typeof import("./file-links")>();
++  return { ...actual, inlineTokens: vi.fn(actual.inlineTokens) };
++});
++
++import { MateChat } from "./chat";
++import { Markdown } from "./markdown";
++import { inlineTokens } from "./file-links";
++import { drafts } from "./draft";
++
++const theme = { colors: {
++  foreground: "#eee", foregroundMuted: "#aaa", surface0: "#111", surface1: "#222",
++  surface2: "#333", border: "#555", accent: "#08f", accentForeground: "#fff",
++  statusDanger: "#f00", statusWarning: "#fa0", statusSuccess: "#0f0",
++} } as PluginTheme;
++const mate: AgentSummary = {
++  id: "chat-render-test", workspaceId: null, title: "Mate", provider: "codex", model: null,
++  status: "idle", cwd: "/home", pendingPermissions: 0, requiresAttention: false,
++  lastError: null, updatedAt: "0", labels: {},
++};
++const changed = () => {};
++const openFile = vi.fn();
++let renderer: ReactTestRenderer | undefined;
++const TextHost = "Text" as ElementType;
++const InputHost = "TextInput" as ElementType;
++
++function message(seq: number, type: "user_message" | "assistant_message", text: string) {
++  return { seqStart: seq, seqEnd: seq, item: { type, text } } as TimelineEntry;
++}
++function history() {
++  return Array.from({ length: 75 }, (_, index) => [
++    message(index * 2, "user_message", `Captain ${index}`),
++    message(index * 2 + 1, "assistant_message", [
++      `# Reply ${index}`, "**Bold** and `code` [docs](https://example.com/docs) data/backlog.md",
++      "- list item", "> quoted words", "```ts\nconst value = 1;\n```",
++      "| Name | Value |\n| --- | --- |\n| row | cell |",
++    ].join("\n\n")),
++  ]).flat();
++}
++async function mount(nextTheme = theme, onOpenFile = openFile, compact = false) {
++  await act(async () => {
++    const element = createElement(MateChat, { mate, theme: nextTheme, compact, onChanged: changed, onOpenFile });
++    if (renderer) renderer.update(element);
++    else renderer = create(element);
++  });
++}
++async function refresh(entries: TimelineEntry[]) {
++  host.entries = entries;
++  await act(async () => { host.refresh(); await vi.advanceTimersByTimeAsync(300); });
++}
++function sources() {
++  return renderer!.root.findAllByType(Markdown).map((node) => node.props.source);
++}
++function text() {
++  return renderer!.root.findAllByType(TextHost).map((node) =>
++    node.children.filter((child) => typeof child === "string" || typeof child === "number").join(""),
++  ).join(" ");
++}
++
++beforeEach(() => {
++  vi.useFakeTimers();
++  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
++  host.entries = history();
++  host.files = { "data/backlog.md": "data/backlog.md" };
++  drafts.set(mate.id, "");
++  vi.clearAllMocks();
++});
++afterEach(async () => {
++  const mounted = renderer;
++  if (mounted) await act(async () => mounted.unmount());
++  renderer = undefined;
++  vi.useRealTimers();
++});
++
++describe("first mate chat history", () => {
++  it("keeps long mixed Markdown history idle while the composer changes", async () => {
++    await mount();
++    expect(sources()).toHaveLength(75);
++    expect(Markdown).toHaveBeenCalledTimes(75);
++    expect(inlineTokens).toHaveBeenCalled();
++    vi.mocked(Markdown).mockClear();
++    vi.mocked(inlineTokens).mockClear();
++    for (const value of ["a", "ab", "abc"]) {
++      await act(async () => renderer!.root.findByType(InputHost).props.onChangeText(value));
++      expect(renderer!.root.findByType(InputHost).props.value).toBe(value);
++      expect(Markdown).toHaveBeenCalledTimes(0);
++      expect(inlineTokens).toHaveBeenCalledTimes(0);
++    }
++    expect(host.rpc).not.toHaveBeenCalled();
++  });
++
++  it("updates new replies, streaming tails and replaced history in timeline order", async () => {
++    await mount();
++    vi.mocked(Markdown).mockClear();
++    const extended = [...history(), message(150, "user_message", "Next question"), message(151, "assistant_message", "Streaming **reply")];
++    await refresh(extended);
++    expect(Markdown).toHaveBeenCalledTimes(76);
++    expect(sources().at(-1)).toBe("Streaming **reply");
++    expect(text().indexOf("Captain 0")).toBeLessThan(text().indexOf("Reply 0"));
++    expect(text().indexOf("Reply 74")).toBeLessThan(text().indexOf("Next question"));
++    await refresh([...extended, message(152, "assistant_message", " complete**")]);
++    expect(sources()).toHaveLength(76);
++    expect(sources().at(-1)).toBe("Streaming **reply complete**");
++    expect(text()).toContain("reply complete");
++    const replaced = history();
++    replaced[1] = message(1, "assistant_message", "# Revised first reply");
++    await refresh(replaced);
++    expect(sources()).toHaveLength(75);
++    expect(sources()[0]).toBe("# Revised first reply");
++    expect(text()).not.toContain("Streaming");
++  });
++
++  it("refreshes file links, open callbacks, theme and compact styles", async () => {
++    await mount();
++    function link(label: string) {
++      return renderer!.root.findAllByType(TextHost).find((node) => node.props.onPress && node.children.includes(label))!;
++    }
++    await act(async () => link("docs").props.onPress());
++    expect(host.openUrl).toHaveBeenCalledWith("https://example.com/docs");
++    await act(async () => link("data/backlog.md").props.onPress());
++    expect(openFile).toHaveBeenCalledWith("data/backlog.md");
++
++    host.files = { "data/backlog.md": "data/renamed.md" };
++    const nextOpen = vi.fn();
++    vi.mocked(Markdown).mockClear();
++    await mount(theme, nextOpen);
++    expect(Markdown).toHaveBeenCalledTimes(75);
++    await act(async () => link("data/backlog.md").props.onPress());
++    expect(nextOpen).toHaveBeenCalledWith("data/renamed.md");
++
++    const latestOpen = vi.fn();
++    await mount(theme, latestOpen);
++    await act(async () => link("data/backlog.md").props.onPress());
++    expect(latestOpen).toHaveBeenCalledWith("data/renamed.md");
++    expect(nextOpen).toHaveBeenCalledTimes(1);
++
++    const nextTheme = { ...theme, colors: { ...theme.colors, accent: "#f0f" } };
++    await mount(nextTheme, nextOpen);
++    expect(link("docs").props.style).toEqual(expect.objectContaining({ color: "#f0f" }));
++    vi.mocked(Markdown).mockClear();
++    await mount(nextTheme, nextOpen, true);
++    expect(Markdown).toHaveBeenCalledTimes(75);
++    expect(renderer!.root.findByType("ScrollView" as ElementType).props.contentContainerStyle.padding).toBe(10);
++  });
++
++  it("expands folded tools and updates the streaming tool status", async () => {
++    const tools = Array.from({ length: 4 }, (_, index) => ({
++      seqStart: 150 + index, seqEnd: 150 + index,
++      item: { type: "tool_call", name: "Read", status: "completed", detail: { type: "read", filePath: `file-${index}` } },
++    } as TimelineEntry));
++    host.entries = [...history(), ...tools];
++    await mount();
++    expect(text()).toContain("+ 2 more tool calls");
++    expect(text()).not.toContain("Read file-0");
++    const expand = renderer!.root.findAllByType("Pressable" as ElementType).find((node) => node.props.accessibilityLabel === "Show 2 more tool calls")!;
++    await act(async () => expand.props.onPress());
++    expect(text()).toContain("Read file-0");
++    expect(text().indexOf("Read file-0")).toBeLessThan(text().indexOf("Read file-3"));
++    expect(text()).not.toContain("more tool calls");
++    const running = { ...tools[3], item: { ...tools[3].item, status: "running" } } as TimelineEntry;
++    await refresh([...history(), ...tools.slice(0, 3), running]);
++    expect(renderer!.root.findAllByType("ActivityIndicator" as ElementType)).toHaveLength(1);
++    expect(text()).toContain("Read file-0");
++  });
++});

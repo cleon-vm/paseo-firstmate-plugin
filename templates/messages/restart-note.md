@@ -1,0 +1,3 @@
+<!-- Sent to a restarted first mate after data/opening.md: it has the records but not the conversation, and Paseo's own notes about crewmates its predecessor started go nowhere; FirstMate relays them (server/crew-relay.ts). -->
+
+This is a fresh start: another first mate held the helm before you, and its conversation is gone; what it knew is in your records. Paseo will not tell you about crewmates your predecessor started, so FirstMate relays their news to you as `<firstmate-crew>` notes (section 7). While any are in flight, still keep a heartbeat as section 7 says: it catches what the relay cannot see.
