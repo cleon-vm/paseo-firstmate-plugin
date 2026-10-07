@@ -1,12 +1,12 @@
 # Local changes
 
-This is a private working copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.2.1**, as installed from npm on the local machine, with six local patches applied. It is not a fork and nothing here has been sent upstream.
+This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.2.1**, taken from the npm package, with six local patches applied. It is not a fork and nothing here has been sent upstream.
 
 - Upstream: https://github.com/gpambrozio/paseo-plugins (monorepo, plugin in `firstmate/`)
 - The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the six patches below are local.
-- `README.md` and `CHANGELOG.md` are upstream's; `README.md` has local-source install instructions.
+- `README.md` and `CHANGELOG.md` are upstream's; `README.md` also has install instructions for this repository and a note on the patches.
 
-Every file outside `patches/`, `LOCAL-CHANGES.md` and `.gitignore` is stock 0.2.1 plus all six patches. The installed npm copy still has the first five until the captain installs this private source. The package version remains 0.2.1; each patch README records its local version note.
+Every file outside `patches/`, `LOCAL-CHANGES.md` and `.gitignore` is stock 0.2.1 plus all six patches. The package version remains 0.2.1; each patch README records its local version note.
 
 ## The patches
 
@@ -68,7 +68,7 @@ git -c core.autocrlf=false apply --check <repo>/patches/chat-input-lag/chat-inpu
 git -c core.autocrlf=false apply <repo>/patches/chat-input-lag/chat-input-lag.patch
 ```
 
-Then `paseo plugin reload firstmate`. To install the private working copy over the npm source instead, once the reviewed change is available in `<plugin-dir>`, remove FirstMate, then install the directory with its existing ID and reload:
+Then `paseo plugin reload firstmate`. To install this repository over the npm source instead, from a clone at `<plugin-dir>`, remove FirstMate, then install the directory with its existing ID and reload:
 
 ```
 paseo plugin remove firstmate
@@ -76,7 +76,7 @@ paseo plugin install <plugin-dir> --id firstmate
 paseo plugin reload firstmate
 ```
 
-Removing FirstMate ends its running session. Back up `%USERPROFILE%\.paseo\plugin-data\firstmate\home` first: it was kept intact when this was done on 2026-10-02, but `plugin remove` is described only as removing plugin configuration. After reinstalling, the first mate resumes from its records; keep `--id firstmate` so the plugin data folder is reused. A plain install while the plugin exists fails with `already configured`. To install a branch instead, use the private Git URL with `--ref`, for example `paseo plugin install 'https://github.com/cleon-vm/paseo-firstmate-plugin.git' --id firstmate --ref fm/chat-input-lag`; see the patch README. Installation is the captain's step and was not run while making this patch.
+Removing FirstMate ends its running session. Back up `%USERPROFILE%\.paseo\plugin-data\firstmate\home` first: `plugin remove` is described only as removing plugin configuration. After reinstalling, the first mate resumes from its records; keep `--id firstmate` so the plugin data folder is reused. A plain install while the plugin exists fails with `already configured`. To install from GitHub instead, use `paseo plugin install 'https://github.com/cleon-vm/paseo-firstmate-plugin.git' --id firstmate --ref main`.
 
 If a check fails, the update changed a patched file. Check upstream's `CHANGELOG.md` first (upstream may have fixed the issue itself), then follow the per-patch README: compare the new file with `original/`, and either copy `modified/` over it (if upstream didn't otherwise change the file) or redo the small edit by hand. To refresh this repo afterwards, copy the new `$P` over the working tree (without `node_modules`), keep `patches/`, `LOCAL-CHANGES.md` and `.gitignore`, and commit.
 

@@ -12,19 +12,18 @@ A **FirstMate** panel in the sidebar puts the conversation with the first mate b
 crew — Queued, Working, Blocked, Parked, Done, Failed and Idle — with each worker's last word on what
 it is doing and a link to its pull request.
 
-![A 30-second loop of FirstMate at work, zooming in on each step: one message to the first mate asks
-for a dark mode toggle and a speed-conversion fix in a small web app; two cards appear in Queued and
-move to Working, each worker in its own worktree; one worker is watched live, its commands and edits
-scrolling past; each card reaches Done with "Captain's call: land branch …" beside the first mate's
-report; the message "land both" sends them to main, and the first mate's Bearings report, with both
-cards marked landed, closes it out.](docs/demo.webp)
-
 This is a Paseo-native take on [firstmate](https://github.com/kunchenguid/firstmate) by Kun Chen, by
 way of [ABorakati/paseo-firstmate](https://github.com/ABorakati/paseo-firstmate). Where those run the
 crew in terminal sessions and supervise it with shell scripts, this one uses nothing but Paseo: the
 workers are ordinary Paseo agents you can open, read and type into like any other, in worktrees Paseo
 manages, and Paseo itself tells the first mate when a worker finishes, fails or asks for permission.
 There is nothing else to install.
+
+This repository is a patched copy of FirstMate 0.2.1 from
+[gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with six local patches on
+top: a quota pill, Windows watches, images in the Files view, a notification relay after a restart,
+Reveal in explorer, and a fix for lag while typing in the chat. [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
+describes each one and how to reapply or undo it.
 
 ## What you need
 
@@ -41,12 +40,15 @@ There is nothing else to install.
 ## Install
 
 ```bash
-paseo plugin install npm:@gpambrozio/paseo-firstmate
+paseo plugin install https://github.com/cleon-vm/paseo-firstmate-plugin.git --id firstmate --ref main
 ```
 
-To hack on it, clone the repository and run `npm install` and `npm run typecheck`. To switch an
-existing install to this local copy, remove the plugin, then install the directory with the same ID
-and reload it:
+`paseo plugin install npm:@gpambrozio/paseo-firstmate` installs upstream's stock FirstMate, without
+the six patches.
+
+To hack on it, clone the repository and run `npm install` and `npm test -- --exclude 'patches/**'`.
+To switch an existing install to a local clone, remove the plugin, then install the directory with the
+same ID and reload it:
 
 ```powershell
 paseo plugin remove firstmate
@@ -54,13 +56,11 @@ paseo plugin install <plugin-dir> --id firstmate
 paseo plugin reload firstmate
 ```
 
-Removing FirstMate ends its running session. The first mate's records folder,
-`%USERPROFILE%\.paseo\plugin-data\firstmate\home`, was kept intact when this was done on
-2026-10-02, but `plugin remove` is documented only as removing plugin configuration; back up that
-folder first. After reinstalling, the first mate resumes from its records. Keep `--id firstmate` so
+Removing FirstMate ends its running session. The first mate's records folder is
+`%USERPROFILE%\.paseo\plugin-data\firstmate\home`; `plugin remove` is documented only as removing
+plugin configuration, so back that folder up first. After reinstalling, the first mate resumes from its records. Keep `--id firstmate` so
 the plugin reuses the same data folder. A plain install while FirstMate is configured fails with
-`already configured`. To install a branch instead, use `paseo plugin install
-https://github.com/cleon-vm/paseo-firstmate-plugin.git --id firstmate --ref <branch>`. Everything the plugin
+`already configured`. To install another branch, change `--ref main` in the install command above. Everything the plugin
 writes into the first mate's home — its charter, the records it starts with, the home's icon — is in
 `templates/`, as the files it becomes; `paseo plugin reload firstmate` puts a change to work.
 
@@ -108,17 +108,7 @@ writes into the first mate's home — its charter, the records it starts with, t
   out; anything you were typing stays in the message box. The trash button beside a suggestion takes it
   off the list without sending it. With no suggestions there is no card and no tab.
 
-![After the voyage: the first mate's Bearings report in the chat — Captain's Call: nothing needs your
-action; Recently Landed: the knots fix and the dark mode toggle, both landed on main; Underway and
-Charted Next: nothing — beside the board, where both cards sit in Done marked "landed".](docs/landed.png)
-
 ## The board
-
-![The FirstMate panel mid-voyage: the first mate's chat on the left explaining the two workers it sent
-off; on the right the board, with "Add a dark mode toggle to the header" in Working, its card open on
-Watch, Steer, Interrupt, Relaunch and End, and "Fix knots-to-km/h conversion and add a test" in Done,
-reading "Done: ready in branch fm/fix-knots-kmh" and "Captain's call: land branch
-fm/fix-knots-kmh".](docs/board.png)
 
 Each card is a worker, a backlog item, or both. Press one for its actions:
 
@@ -133,11 +123,6 @@ Each card is a worker, a backlog item, or both. Press one for its actions:
 - **Relaunch** — asks the first mate for a fresh worker in the same worktree, with your note. The work
   on disk carries over; the conversation does not.
 - **End** — archives the worker. Its workspace and worktree are left exactly as they are.
-
-![Watching a worker: the chat with the first mate stays on the left; in the board's place, the worker's
-card with its actions beside its live transcript — the brief it was given, then Read, Edit and Shell
-rows for each step (npm test among them), its notes between them, and a spinner on the step under
-way.](docs/watch.png)
 
 A column with nobody in it is hidden, so the board shows only what has workers in it. On a wide
 screen up to three columns sit side by side; past three they take two rows, with the extra one in the

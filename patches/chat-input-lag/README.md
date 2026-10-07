@@ -26,7 +26,7 @@ npm test -- --exclude 'patches/**'
 
 Four chat tests cover zero renders/tokenization while typing, new replies and streaming tails, history replacement/order, URL/file links and callback replacement, theme/compact styles, folded-tool expansion and streaming status. The real chat, timeline hook, draft stores and Markdown renderer execute; daemon/query/native-host boundaries use fixtures. The renderer's deprecation warning is nonfatal; timings are not production latency measurements.
 
-All 151 active tests and the focused TypeScript check pass. Unfiltered `npm test` already fails on incomplete historical copies in `patches/`; those are patch records rather than independent modules. `npm run typecheck` already lacks a `tsconfig.json`; `npm run lint` already lacks a script. No CI workflow exists in this private copy. No installed plugin was changed or reloaded, and no live performance recording was taken.
+All 151 active tests and the focused TypeScript check pass. Unfiltered `npm test` already fails on incomplete historical copies in `patches/`; those are patch records rather than independent modules. `npm run typecheck` already lacks a `tsconfig.json`; `npm run lint` already lacks a script. No CI workflow exists in this copy. No installed plugin was changed or reloaded, and no live performance recording was taken.
 
 ## Reapply after an npm update
 
@@ -39,9 +39,9 @@ git -c core.autocrlf=false apply <repo>/patches/chat-input-lag/chat-input-lag.pa
 
 Then reload FirstMate. If the check fails, compare the updated chat with `original/client/chat.tsx`; copy `modified/client/chat.tsx` only if there are no other upstream changes, otherwise redo the callback/memo edits. The test-only renderer is needed to run the regression, not to install the plugin.
 
-## Install the private source
+## Install this source
 
-Paseo accepts a directory, Git repository or npm package as its install source. After this branch is reviewed and made available in `<plugin-dir>`, the captain can replace the npm source with that directory:
+Paseo accepts a directory, Git repository or npm package as its install source. From a clone at `<plugin-dir>`, you can replace the npm source with that directory:
 
 ```powershell
 paseo plugin remove firstmate
@@ -49,9 +49,9 @@ paseo plugin install <plugin-dir> --id firstmate
 paseo plugin reload firstmate
 ```
 
-Removing FirstMate ends its running session. Back up `%USERPROFILE%\.paseo\plugin-data\firstmate\home` first: it was kept intact when this was done on 2026-10-02, but `plugin remove` is described only as removing plugin configuration. After reinstalling, the first mate resumes from its records; keep `--id firstmate` so the plugin data folder is reused. A plain install while the plugin exists fails with `already configured`.
+Removing FirstMate ends its running session. Back up `%USERPROFILE%\.paseo\plugin-data\firstmate\home` first: `plugin remove` is described only as removing plugin configuration. After reinstalling, the first mate resumes from its records; keep `--id firstmate` so the plugin data folder is reused. A plain install while the plugin exists fails with `already configured`.
 
-Or install the ready branch directly with `paseo plugin remove firstmate`, then `paseo plugin install 'https://github.com/cleon-vm/paseo-firstmate-plugin.git' --id firstmate --ref fm/chat-input-lag` and `paseo plugin reload firstmate`. These are instructions only; neither install nor reload was run for this task.
+Or install from GitHub directly with `paseo plugin remove firstmate`, then `paseo plugin install 'https://github.com/cleon-vm/paseo-firstmate-plugin.git' --id firstmate --ref main` and `paseo plugin reload firstmate`.
 
 ## Restore
 
