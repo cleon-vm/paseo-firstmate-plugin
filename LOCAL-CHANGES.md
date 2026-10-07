@@ -39,7 +39,6 @@ checkout; its patch snapshots and root-comparison exclusions are unchanged.
 
 ## Where the plugin lives
 
-
 The installed copy (`$P`) is under the Paseo plugins folder:
 
 ```

@@ -36,11 +36,12 @@ interface ReadJob {
   paseo: PaseoApi;
   agent: PaseoAgent;
   previous: CachedReport | undefined;
-  expired: boolean;
+  invalidated: boolean;
 }
 
 export class ReportCache {
   private readonly reports = new Map<string, CachedReport>();
+  private readonly crewIds = new Set<string>();
   private readonly pending = new Map<string, ReadJob>();
   private readonly queue: ReadJob[] = [];
   private readonly retryAfter = new Map<string, number>();
@@ -59,6 +60,7 @@ export class ReportCache {
         const report = entry.report === null ? null : CrewReportSchema.safeParse(entry.report);
         if (report === null || report.success) {
           this.reports.set(entry.id, { updatedAt: entry.updatedAt, report: report === null ? null : report.data });
+          this.crewIds.add(entry.id);
         }
       }
     } catch (error) {
@@ -68,6 +70,7 @@ export class ReportCache {
 
   /** Returns the last known line (null means unknown), and schedules a stale read. */
   reportFor(paseo: PaseoApi, agent: PaseoAgent): CrewReportSummary | null {
+    this.crewIds.add(agent.id);
     const cached = this.reports.get(agent.id);
     if (agent.status !== "running" && agent.status !== "initializing" && cached?.updatedAt !== agent.updatedAt) {
       this.refresh(paseo, agent);
@@ -77,7 +80,7 @@ export class ReportCache {
 
   private refresh(paseo: PaseoApi, agent: PaseoAgent): void {
     if (this.stopped || this.pending.has(agent.id) || (this.retryAfter.get(agent.id) ?? 0) > Date.now()) return;
-    const job = { paseo, agent, previous: this.reports.get(agent.id), expired: false };
+    const job = { paseo, agent, previous: this.reports.get(agent.id), invalidated: false };
     this.pending.set(agent.id, job);
     this.queue.push(job);
     this.pump();
@@ -86,13 +89,12 @@ export class ReportCache {
   private pump(): void {
     while (!this.stopped && this.active < REPORT_CONCURRENCY && this.queue.length > 0) {
       const job = this.queue.shift()!;
-      if (job.expired) {
+      if (job.invalidated) {
         this.pending.delete(job.agent.id);
         continue;
       }
       this.active += 1;
       const deadline = setTimeout(() => {
-        job.expired = true;
         this.retryAfter.set(job.agent.id, Date.now() + REPORT_DEADLINE_MS);
       }, REPORT_DEADLINE_MS);
       deadline.unref?.();
@@ -101,7 +103,9 @@ export class ReportCache {
       void Promise.resolve().then(() => job.paseo.agents.ref(job.agent.id).timeline.refetch({
         direction: "tail", limit: 30, projection: "projected",
       })).then((page) => {
-        if (job.expired || this.stopped || this.reports.get(job.agent.id) !== job.previous) return;
+        // The deadline keeps the board on its snapshot. A late reply is still
+        // useful unless a newer event, removal or shutdown invalidated this job.
+        if (job.invalidated || this.stopped || this.reports.get(job.agent.id) !== job.previous) return;
         this.reports.set(job.agent.id, {
           updatedAt: job.agent.updatedAt,
           report: parseCrewReport(closingText(page.entries.map((entry) => entry.item))),
@@ -118,11 +122,10 @@ export class ReportCache {
     }
   }
 
-  /** Hook timelines already contain the reply; do not issue another RPC. */
+  /** Accept known crew replies directly; a later poll can reconcile updatedAt. */
   turnEnded(event: PluginLifecycleEvents["agent.turn_ended"]): void {
-    if (this.stopped) return;
+    if (this.stopped || !this.crewIds.has(event.agent.id)) return;
     const report = parseCrewReport(closingText(event.timeline));
-    if (report === null && !this.reports.has(event.agent.id) && !this.pending.has(event.agent.id)) return;
     // Hooks have no updatedAt. The next poll can reconcile, while object identity
     // keeps an older in-flight read from overwriting this event's report.
     this.reports.set(event.agent.id, { updatedAt: "", report });
@@ -133,7 +136,7 @@ export class ReportCache {
     this.offs.push(server.on("agent.turn_ended", (event) => this.turnEnded(event)));
     const closed = (event: { agent: { id: string } }) => {
       const job = this.pending.get(event.agent.id);
-      if (job !== undefined) job.expired = true;
+      if (job !== undefined) job.invalidated = true;
       const cached = this.reports.get(event.agent.id);
       if (cached !== undefined) {
         this.reports.set(event.agent.id, { ...cached, updatedAt: "" });
@@ -152,12 +155,14 @@ export class ReportCache {
   }
 
   retain(ids: ReadonlySet<string>): void {
+    this.crewIds.clear();
+    for (const id of ids) this.crewIds.add(id);
     let changed = false;
     for (const id of this.reports.keys()) {
       if (!ids.has(id)) { this.reports.delete(id); changed = true; }
     }
     for (const [id, job] of this.pending) {
-      if (!ids.has(id)) job.expired = true;
+      if (!ids.has(id)) job.invalidated = true;
     }
     for (const id of this.retryAfter.keys()) if (!ids.has(id)) this.retryAfter.delete(id);
     if (changed) this.persist();
@@ -180,7 +185,7 @@ export class ReportCache {
   stop(): void {
     this.stopped = true;
     this.offs.splice(0).forEach((off) => off());
-    for (const job of this.pending.values()) job.expired = true;
+    for (const job of this.pending.values()) job.invalidated = true;
     this.queue.length = 0;
   }
 }

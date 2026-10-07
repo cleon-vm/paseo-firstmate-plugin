@@ -6,6 +6,8 @@ base. It does not change their UI, labels, notifications, or relay behavior.
 The board returns persistent cached reports immediately and queues stale reads.
 At most four host timeline reads run at once. Each result has a five-second
 deadline; misses keep the prior report, or null (the existing unknown state).
+Late replies still fill the cache unless a newer event, removal, or shutdown
+invalidated the read.
 Because the SDK cannot cancel a timeline refetch, a timed-out request retains its
 concurrency slot until the host settles. A daemon that never settles its reads
 can delay future refreshes, but cannot stall the board or exceed the read cap.
@@ -13,7 +15,9 @@ can delay future refreshes, but cannot stall the board or exceed the read cap.
 Reports restore from `plugin-data/firstmate/crew-reports.json` during startup.
 Writes are serialized and replace that file by rename. A missing or malformed
 file falls back to an empty cache; write failures leave the in-memory cache usable.
-Turn-end timelines update the cache directly. A closed-agent event invalidates
+Turn-end timelines from known crew update the cache directly; events from other
+agents are ignored. Board listings and report lookups establish membership,
+including running crew with no previous report. A closed-agent event invalidates
 the report for a later bounded refresh without discarding the last known text.
 
 SDK source at Paseo v0.11.0: `packages/plugin/src/server/lifecycle.ts:49-54`

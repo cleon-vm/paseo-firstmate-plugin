@@ -166,19 +166,24 @@ index 9619855..c3f1c0f 100644
      home,
 diff --git a/server/report-cache.test.ts b/server/report-cache.test.ts
 new file mode 100644
-index 0000000..8f6145e
+index 0000000..8660409
 --- /dev/null
 +++ b/server/report-cache.test.ts
-@@ -0,0 +1,174 @@
-+import { mkdir, readFile, writeFile } from "node:fs/promises";
+@@ -0,0 +1,293 @@
++import { mkdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 +import { join } from "node:path";
 +import { randomUUID } from "node:crypto";
 +import { afterEach, describe, expect, it, vi } from "vitest";
 +import type { PluginLifecycleEvents, PluginLifecycleRegistration } from "@getpaseo/plugin/server";
 +import { FirstmateConfigSchema } from "../shared/fleet";
 +import { loadFleet, ReportCache } from "./fleet";
-+import { REPORT_CONCURRENCY, REPORT_DEADLINE_MS } from "./report-cache";
++import { REPORT_CONCURRENCY, REPORT_DEADLINE_MS, registerReportCache } from "./report-cache";
 +import type { PaseoAgent, PaseoApi, TimelinePage } from "./host-types";
++
++vi.mock("node:fs/promises", async (importOriginal) => {
++  const actual = await importOriginal<typeof import("node:fs/promises")>();
++  return { ...actual, rename: vi.fn(actual.rename) };
++});
 +
 +const caches: ReportCache[] = [];
 +const cache = (file: string | null = null) => { const value = new ReportCache(file); caches.push(value); return value; };
@@ -202,9 +207,117 @@ index 0000000..8f6145e
 +  } as unknown as PaseoApi;
 +}
 +async function settled() { for (let n = 0; n < 12; n += 1) await Promise.resolve(); }
-+afterEach(() => { caches.splice(0).forEach((value) => value.stop()); vi.useRealTimers(); });
++afterEach(() => {
++  caches.splice(0).forEach((value) => value.stop());
++  vi.useRealTimers();
++  vi.unstubAllEnvs();
++  vi.mocked(rename).mockClear();
++});
 +
 +describe("background status reports", () => {
++  it("keeps the per-read deadline well below the board's 30-second timeout", () => {
++    expect(REPORT_DEADLINE_MS).toBeGreaterThan(0);
++    expect(REPORT_DEADLINE_MS).toBeLessThan(30_000);
++  });
++
++  it("fills every crew report across repeated polls when all reads exceed the deadline", async () => {
++    vi.useFakeTimers();
++    let active = 0;
++    let peak = 0;
++    const read = vi.fn((id: string) => new Promise<TimelinePage>((resolve) => {
++      active += 1;
++      peak = Math.max(peak, active);
++      setTimeout(() => {
++        active -= 1;
++        resolve(page(`done: report ${id}`));
++      }, REPORT_DEADLINE_MS + 1_000);
++    }));
++    const paseo = host(read);
++    const reports = cache();
++    const crew = Array.from({ length: 12 }, (_, n) => agent(String(n)));
++    for (let poll = 0; poll < 5; poll += 1) {
++      crew.forEach((member) => reports.reportFor(paseo, member));
++      await vi.advanceTimersByTimeAsync(REPORT_DEADLINE_MS);
++    }
++    expect(crew.map((member) => reports.reportFor(paseo, member)?.text))
++      .toEqual(crew.map((member) => `report ${member.id}`));
++    expect(read).toHaveBeenCalledTimes(crew.length);
++    expect(peak).toBeLessThanOrEqual(REPORT_CONCURRENCY);
++  });
++
++  it("wires lifecycle hooks and plugin storage through registerReportCache", async () => {
++    const home = join(process.cwd(), "scratch", "wiring", randomUUID());
++    vi.stubEnv("PASEO_HOME", home);
++    const handlers = new Map<string, (event: unknown) => void>();
++    const server = { on: (name: string, handler: (event: unknown) => void) => {
++      handlers.set(name, handler); return () => handlers.delete(name);
++    } } as unknown as PluginLifecycleRegistration;
++    const reports = registerReportCache(server);
++    caches.push(reports);
++    expect([...handlers.keys()]).toEqual(["agent.turn_ended", "agent.closed"]);
++    reports.retain(new Set(["crew"]));
++    handlers.get("agent.turn_ended")!(ended("crew", "done: wired"));
++    await reports.flush();
++    const file = join(home, "plugin-data", "firstmate", "crew-reports.json");
++    expect(JSON.parse(await readFile(file, "utf8"))).toEqual([
++      { id: "crew", updatedAt: "", report: { state: "done", text: "wired" } },
++    ]);
++    expect(cache(file).reportFor(host(() => new Promise(() => {})), { ...agent("crew"), status: "running" })?.text)
++      .toBe("wired");
++    reports.stop();
++    expect(handlers.size).toBe(0);
++  });
++
++  it("ignores non-crew turn-end status lines, including after membership is pruned", async () => {
++    const file = join(process.cwd(), "scratch", "reports", `${randomUUID()}.json`);
++    const reports = cache(file);
++    const paseo = host(() => new Promise(() => {}));
++    reports.reportFor(paseo, { ...agent("crew"), status: "running" });
++    reports.turnEnded(ended("unrelated", "done: unrelated task"));
++    reports.turnEnded(ended("crew", "paused: crew task"));
++    await reports.flush();
++    expect(JSON.parse(await readFile(file, "utf8"))).toEqual([
++      { id: "crew", updatedAt: "", report: { state: "paused", text: "crew task" } },
++    ]);
++    reports.retain(new Set());
++    reports.turnEnded(ended("crew", "done: no longer crew"));
++    await reports.flush();
++    expect(JSON.parse(await readFile(file, "utf8"))).toEqual([]);
++  });
++
++  it("replaces the saved cache atomically and leaves no temporary file after success", async () => {
++    const folder = join(process.cwd(), "scratch", "reports");
++    await mkdir(folder, { recursive: true });
++    const file = join(folder, `${randomUUID()}.json`);
++    const original = JSON.stringify([{ id: "crew", updatedAt: "v1", report: { state: "paused", text: "old" } }]);
++    await writeFile(file, original);
++    const reports = cache(file);
++    const actual = await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
++    let savedBeforeRename: string | undefined;
++    let replacement: string | undefined;
++    vi.mocked(rename).mockImplementationOnce(async (from, to) => {
++      savedBeforeRename = await readFile(file, "utf8");
++      replacement = await readFile(from, "utf8");
++      return actual.rename(from, to);
++    });
++    reports.turnEnded(ended("crew", "done: new"));
++    await reports.flush();
++    expect(savedBeforeRename).toBe(original);
++    expect(JSON.parse(replacement!)[0].report.text).toBe("new");
++    expect(vi.mocked(rename)).toHaveBeenCalledWith(`${file}.tmp`, file);
++    expect(await readFile(file, "utf8")).toBe(replacement);
++    await expect(stat(`${file}.tmp`)).rejects.toMatchObject({ code: "ENOENT" });
++  });
++
++  it("rethrows unexpected lifecycle registration errors instead of treating them as old-host fallback", () => {
++    const reports = cache();
++    const server = { on: (name: string) => {
++      if (name === "agent.closed") throw new Error("lifecycle registration failed");
++      return () => {};
++    } } as unknown as PluginLifecycleRegistration;
++    expect(() => reports.register(server)).toThrow("lifecycle registration failed");
++  });
++
 +  it("caps actual reads across repeated polls, including reads past their deadline", async () => {
 +    vi.useFakeTimers();
 +    const finish: Array<(value: TimelinePage) => void> = [];
@@ -222,7 +335,7 @@ index 0000000..8f6145e
 +    finish[0]!(page("done: late"));
 +    await settled();
 +    expect(read).toHaveBeenCalledTimes(REPORT_CONCURRENCY + 1);
-+    expect(reports.reportFor(paseo, crew[0]!)).toBeNull();
++    expect(reports.reportFor(paseo, crew[0]!)).toEqual({ state: "done", text: "late" });
 +  });
 +
 +  it("applies each read's deadline from its own start, and keeps cached reports on timeout", async () => {
@@ -231,6 +344,7 @@ index 0000000..8f6145e
 +    const read = vi.fn(() => new Promise<TimelinePage>((resolve) => finish.push(resolve)));
 +    const paseo = host(read);
 +    const reports = cache();
++    reports.retain(new Set(["0"]));
 +    reports.turnEnded(ended("0", "blocked: awaiting review"));
 +    for (let n = 0; n < 5; n += 1) reports.reportFor(paseo, agent(String(n)));
 +    await settled();
@@ -239,10 +353,12 @@ index 0000000..8f6145e
 +    await settled();
 +    expect(read).toHaveBeenCalledTimes(5);
 +    await vi.advanceTimersByTimeAsync(2);
-+    finish[0]!(page("done: too late"));
++    expect(reports.reportFor(paseo, agent("0"))).toEqual({ state: "blocked", text: "awaiting review" });
++    reports.turnEnded(ended("0", "paused: newer event"));
++    finish[0]!(page("done: stale late reply"));
 +    finish[4]!(page("paused: queued read started later"));
 +    await settled();
-+    expect(reports.reportFor(paseo, agent("0"))).toEqual({ state: "blocked", text: "awaiting review" });
++    expect(reports.reportFor(paseo, agent("0"))).toEqual({ state: "paused", text: "newer event" });
 +    expect(reports.reportFor(paseo, agent("1"))).toEqual({ state: "done", text: "on time" });
 +    expect(reports.reportFor(paseo, agent("4"))).toEqual({ state: "paused", text: "queued read started later" });
 +  });
@@ -250,6 +366,7 @@ index 0000000..8f6145e
 +  it("restores persistent status immediately after a simulated restart", async () => {
 +    const file = join(process.cwd(), "scratch", "reports", `${randomUUID()}.json`);
 +    const first = cache(file);
++    first.retain(new Set(["crew"]));
 +    first.turnEnded(ended("crew", "done: PR https://example.com/pull/1"));
 +    await first.flush();
 +    first.stop();
@@ -317,6 +434,7 @@ index 0000000..8f6145e
 +      return new Promise(() => {});
 +    }, crew);
 +    const reports = cache();
++    reports.retain(new Set(["hang"]));
 +    reports.turnEnded(ended("hang", "blocked: cached"));
 +    const fleet = await loadFleet(paseo, FirstmateConfigSchema.parse({ home }), reports);
 +    expect(fleet.cards).toHaveLength(3);
@@ -328,6 +446,7 @@ index 0000000..8f6145e
 +  it("does not erase persisted reports when crew listing fails", async () => {
 +    const home = join(process.cwd(), "scratch", "board", randomUUID());
 +    const reports = cache();
++    reports.retain(new Set(["crew"]));
 +    reports.turnEnded(ended("crew", "paused: remembered"));
 +    const paseo = host(() => new Promise(() => {}));
 +    paseo.agents.list = async () => { throw new Error("offline"); };
@@ -346,10 +465,10 @@ index 0000000..8f6145e
 +});
 diff --git a/server/report-cache.ts b/server/report-cache.ts
 new file mode 100644
-index 0000000..2de8ea4
+index 0000000..2995cd6
 --- /dev/null
 +++ b/server/report-cache.ts
-@@ -0,0 +1,192 @@
+@@ -0,0 +1,197 @@
 +/** Status reports are snapshots: board requests never wait for a timeline. */
 +import { readFileSync } from "node:fs";
 +import { mkdir, rename, writeFile } from "node:fs/promises";
@@ -388,11 +507,12 @@ index 0000000..2de8ea4
 +  paseo: PaseoApi;
 +  agent: PaseoAgent;
 +  previous: CachedReport | undefined;
-+  expired: boolean;
++  invalidated: boolean;
 +}
 +
 +export class ReportCache {
 +  private readonly reports = new Map<string, CachedReport>();
++  private readonly crewIds = new Set<string>();
 +  private readonly pending = new Map<string, ReadJob>();
 +  private readonly queue: ReadJob[] = [];
 +  private readonly retryAfter = new Map<string, number>();
@@ -411,6 +531,7 @@ index 0000000..2de8ea4
 +        const report = entry.report === null ? null : CrewReportSchema.safeParse(entry.report);
 +        if (report === null || report.success) {
 +          this.reports.set(entry.id, { updatedAt: entry.updatedAt, report: report === null ? null : report.data });
++          this.crewIds.add(entry.id);
 +        }
 +      }
 +    } catch (error) {
@@ -420,6 +541,7 @@ index 0000000..2de8ea4
 +
 +  /** Returns the last known line (null means unknown), and schedules a stale read. */
 +  reportFor(paseo: PaseoApi, agent: PaseoAgent): CrewReportSummary | null {
++    this.crewIds.add(agent.id);
 +    const cached = this.reports.get(agent.id);
 +    if (agent.status !== "running" && agent.status !== "initializing" && cached?.updatedAt !== agent.updatedAt) {
 +      this.refresh(paseo, agent);
@@ -429,7 +551,7 @@ index 0000000..2de8ea4
 +
 +  private refresh(paseo: PaseoApi, agent: PaseoAgent): void {
 +    if (this.stopped || this.pending.has(agent.id) || (this.retryAfter.get(agent.id) ?? 0) > Date.now()) return;
-+    const job = { paseo, agent, previous: this.reports.get(agent.id), expired: false };
++    const job = { paseo, agent, previous: this.reports.get(agent.id), invalidated: false };
 +    this.pending.set(agent.id, job);
 +    this.queue.push(job);
 +    this.pump();
@@ -438,13 +560,12 @@ index 0000000..2de8ea4
 +  private pump(): void {
 +    while (!this.stopped && this.active < REPORT_CONCURRENCY && this.queue.length > 0) {
 +      const job = this.queue.shift()!;
-+      if (job.expired) {
++      if (job.invalidated) {
 +        this.pending.delete(job.agent.id);
 +        continue;
 +      }
 +      this.active += 1;
 +      const deadline = setTimeout(() => {
-+        job.expired = true;
 +        this.retryAfter.set(job.agent.id, Date.now() + REPORT_DEADLINE_MS);
 +      }, REPORT_DEADLINE_MS);
 +      deadline.unref?.();
@@ -453,7 +574,9 @@ index 0000000..2de8ea4
 +      void Promise.resolve().then(() => job.paseo.agents.ref(job.agent.id).timeline.refetch({
 +        direction: "tail", limit: 30, projection: "projected",
 +      })).then((page) => {
-+        if (job.expired || this.stopped || this.reports.get(job.agent.id) !== job.previous) return;
++        // The deadline keeps the board on its snapshot. A late reply is still
++        // useful unless a newer event, removal or shutdown invalidated this job.
++        if (job.invalidated || this.stopped || this.reports.get(job.agent.id) !== job.previous) return;
 +        this.reports.set(job.agent.id, {
 +          updatedAt: job.agent.updatedAt,
 +          report: parseCrewReport(closingText(page.entries.map((entry) => entry.item))),
@@ -470,11 +593,10 @@ index 0000000..2de8ea4
 +    }
 +  }
 +
-+  /** Hook timelines already contain the reply; do not issue another RPC. */
++  /** Accept known crew replies directly; a later poll can reconcile updatedAt. */
 +  turnEnded(event: PluginLifecycleEvents["agent.turn_ended"]): void {
-+    if (this.stopped) return;
++    if (this.stopped || !this.crewIds.has(event.agent.id)) return;
 +    const report = parseCrewReport(closingText(event.timeline));
-+    if (report === null && !this.reports.has(event.agent.id) && !this.pending.has(event.agent.id)) return;
 +    // Hooks have no updatedAt. The next poll can reconcile, while object identity
 +    // keeps an older in-flight read from overwriting this event's report.
 +    this.reports.set(event.agent.id, { updatedAt: "", report });
@@ -485,7 +607,7 @@ index 0000000..2de8ea4
 +    this.offs.push(server.on("agent.turn_ended", (event) => this.turnEnded(event)));
 +    const closed = (event: { agent: { id: string } }) => {
 +      const job = this.pending.get(event.agent.id);
-+      if (job !== undefined) job.expired = true;
++      if (job !== undefined) job.invalidated = true;
 +      const cached = this.reports.get(event.agent.id);
 +      if (cached !== undefined) {
 +        this.reports.set(event.agent.id, { ...cached, updatedAt: "" });
@@ -504,12 +626,14 @@ index 0000000..2de8ea4
 +  }
 +
 +  retain(ids: ReadonlySet<string>): void {
++    this.crewIds.clear();
++    for (const id of ids) this.crewIds.add(id);
 +    let changed = false;
 +    for (const id of this.reports.keys()) {
 +      if (!ids.has(id)) { this.reports.delete(id); changed = true; }
 +    }
 +    for (const [id, job] of this.pending) {
-+      if (!ids.has(id)) job.expired = true;
++      if (!ids.has(id)) job.invalidated = true;
 +    }
 +    for (const id of this.retryAfter.keys()) if (!ids.has(id)) this.retryAfter.delete(id);
 +    if (changed) this.persist();
@@ -532,7 +656,7 @@ index 0000000..2de8ea4
 +  stop(): void {
 +    this.stopped = true;
 +    this.offs.splice(0).forEach((off) => off());
-+    for (const job of this.pending.values()) job.expired = true;
++    for (const job of this.pending.values()) job.invalidated = true;
 +    this.queue.length = 0;
 +  }
 +}
