@@ -4,12 +4,20 @@
  * and no vendor endpoint is called. The file is another plugin's cache, so it
  * is validated strictly and only the percent, window name, reset time and
  * read time leave this module. Anything malformed makes the whole snapshot
- * `unavailable` rather than showing a guess.
+ * `unavailable` rather than showing a guess. Every provider key in the file
+ * is passed on (Usage Monitor decides which it tracks); a key that is not a
+ * valid provider id is skipped.
  */
 import { readFile, stat } from "node:fs/promises";
 import { join } from "node:path";
 
-import { QUOTA_PROVIDERS, type QuotaProvider, type QuotaSnapshot, type QuotaWindow } from "../shared/quota";
+import {
+  isQuotaProviderId,
+  sortProviderIds,
+  type QuotaProvider,
+  type QuotaSnapshot,
+  type QuotaWindow,
+} from "../shared/quota";
 import { paseoHome } from "./data-dir";
 
 const SUPPORTED_VERSION = 1;
@@ -62,7 +70,7 @@ function provider(id: QuotaProvider["id"], entry: unknown, nowMs: number): Quota
   return { id, session: find("session"), weekly: find("weekly"), fetchedAt };
 }
 
-/** Pure: the file's text to the snapshot the chat draws. */
+/** Pure: the file's text to the snapshot the chat draws, providers in pill order. */
 export function parseQuotaFile(text: string, nowMs: number): QuotaSnapshot {
   let document: unknown;
   try {
@@ -76,8 +84,8 @@ export function parseQuotaFile(text: string, nowMs: number): QuotaSnapshot {
   const providers = document.providers;
   return {
     state: "ok",
-    providers: QUOTA_PROVIDERS.map((id) =>
-      provider(id, Object.hasOwn(providers, id) ? providers[id] : undefined, nowMs),
+    providers: sortProviderIds(Object.keys(providers).filter(isQuotaProviderId)).map((id) =>
+      provider(id, providers[id], nowMs),
     ),
   };
 }

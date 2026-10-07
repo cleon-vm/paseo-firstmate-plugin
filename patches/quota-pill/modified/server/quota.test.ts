@@ -3,7 +3,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
-import { formatAge, isStale, quotaCell, quotaCells, type QuotaProvider } from "../shared/quota";
+import {
+  MAX_PROVIDER_ID,
+  QuotaSnapshotSchema,
+  formatAge,
+  isQuotaProviderId,
+  isStale,
+  providerName,
+  quotaCell,
+  quotaCells,
+  sortProviderIds,
+  type QuotaProvider,
+} from "../shared/quota";
 import { MAX_FILE_BYTES, parseQuotaFile, readQuotaSnapshot } from "./quota";
 
 const NOW = Date.parse("2026-01-01T12:00:00.000Z");
@@ -32,14 +43,54 @@ describe("parseQuotaFile", () => {
     });
   });
 
-  it("leaves a missing provider empty without hiding the other", () => {
+  it("does not list a provider the file does not have", () => {
     const snapshot = parseQuotaFile(
       file({ claude: { fetchedAt: minutesAgo(1), readings: [quota("session", 5)] } }),
       NOW,
     );
     expect(snapshot.state).toBe("ok");
-    expect(snapshot.providers[0]).toEqual({ id: "codex", session: null, weekly: null, fetchedAt: null });
-    expect(quotaCells(snapshot, NOW).map((c) => c.text)).toEqual(["—", "5%"]);
+    expect(snapshot.providers.map((p) => p.id)).toEqual(["claude"]);
+    expect(quotaCells(snapshot, NOW).map((c) => c.text)).toEqual(["5%"]);
+  });
+
+  it("shows every provider in the file: known ones first, the rest alphabetically", () => {
+    const snapshot = parseQuotaFile(
+      file({
+        "opencode-go": { fetchedAt: minutesAgo(1), readings: [quota("session", 12)] },
+        zeta: { fetchedAt: minutesAgo(1), readings: [] },
+        codex: { fetchedAt: minutesAgo(2), readings: [quota("session", 76)] },
+        alpha: { fetchedAt: minutesAgo(1), readings: [quota("session", 3)] },
+      }),
+      NOW,
+    );
+    expect(snapshot.state).toBe("ok");
+    expect(snapshot.providers.map((p) => p.id)).toEqual(["codex", "alpha", "opencode-go", "zeta"]);
+    expect(quotaCells(snapshot, NOW).map((c) => [c.id, c.text])).toEqual([
+      ["codex", "76%"],
+      ["alpha", "3%"],
+      ["opencode-go", "12%"],
+      ["zeta", "—"],
+    ]);
+    expect(QuotaSnapshotSchema.parse(snapshot)).toEqual(snapshot);
+  });
+
+  it("skips keys that are not provider ids and keeps the rest", () => {
+    const entry = { fetchedAt: minutesAgo(1), readings: [quota("session", 1)] };
+    const snapshot = parseQuotaFile(
+      file({ "": entry, " codex": entry, ["x".repeat(MAX_PROVIDER_ID + 1)]: entry, "bad\nid": entry, claude: entry }),
+      NOW,
+    );
+    expect(snapshot.providers.map((p) => p.id)).toEqual(["claude"]);
+  });
+
+  it("treats prototype-named keys as plain providers", () => {
+    const text = '{"version":1,"providers":{"__proto__":{"fetchedAt":"' + minutesAgo(1) + '","readings":[]},"constructor":{}}}';
+    const snapshot = parseQuotaFile(text, NOW);
+    expect(snapshot.providers.map((p) => p.id)).toEqual(["__proto__", "constructor"]);
+    expect(quotaCells(snapshot, NOW).map((c) => c.label)).toEqual([
+      "Proto: no quota reading",
+      "Constructor: no quota reading",
+    ]);
   });
 
   it.each([
@@ -47,6 +98,8 @@ describe("parseQuotaFile", () => {
     ["wrong version", file({}, 2)],
     ["array root", "[]"],
     ["no providers", JSON.stringify({ version: 1 })],
+    ["providers as an array", JSON.stringify({ version: 1, providers: [{ id: "codex" }] })],
+    ["providers as a string", JSON.stringify({ version: 1, providers: "codex" })],
   ])("is unavailable for %s", (_name, text) => {
     expect(parseQuotaFile(text, NOW)).toEqual({ state: "unavailable", providers: [] });
   });
@@ -99,11 +152,33 @@ describe("formatting", () => {
     expect(quotaCells(parseQuotaFile(good, NOW), NOW).map((c) => c.text)).toEqual(["32%", "61%"]);
   });
 
-  it("uses source-aware staleness thresholds", () => {
+  it("uses source-aware staleness thresholds, 10 minutes for providers without their own", () => {
     expect(isStale("codex", minutesAgo(11), NOW)).toBe(true);
     expect(isStale("codex", minutesAgo(9), NOW)).toBe(false);
     expect(isStale("claude", minutesAgo(30), NOW)).toBe(false);
     expect(isStale("claude", minutesAgo(46), NOW)).toBe(true);
+    expect(isStale("opencode-go", minutesAgo(9), NOW)).toBe(false);
+    expect(isStale("opencode-go", minutesAgo(11), NOW)).toBe(true);
+    expect(isStale("toString", minutesAgo(11), NOW)).toBe(true);
+  });
+
+  it("names known providers as before and others from their id", () => {
+    expect(["codex", "claude", "opencode-go", "my_tool.v2", "toString"].map(providerName)).toEqual([
+      "Codex",
+      "Claude",
+      "Opencode Go",
+      "My Tool V2",
+      "ToString",
+    ]);
+    const cell = quotaCell({ ...codex(minutesAgo(1), 40), id: "opencode-go" }, "opencode-go", NOW);
+    expect(cell.label).toBe("Opencode Go: 40 percent used, Session window, updated 1m ago");
+  });
+
+  it("validates provider ids and orders them", () => {
+    expect(["codex", "opencode-go", "x".repeat(MAX_PROVIDER_ID)].every(isQuotaProviderId)).toBe(true);
+    expect(["", " a", "a ", "a\u0007b", "x".repeat(MAX_PROVIDER_ID + 1), 3, null].some(isQuotaProviderId)).toBe(false);
+    expect(sortProviderIds(["zed", "claude", "beta", "codex", "beta"])).toEqual(["codex", "claude", "beta", "zed"]);
+    expect(() => QuotaSnapshotSchema.parse({ state: "ok", providers: [{ id: "", session: null, weekly: null, fetchedAt: null }] })).toThrow();
   });
 
   it("keeps the last value and shows its age when stale", () => {
