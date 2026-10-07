@@ -12,8 +12,11 @@ scratch=$(mktemp -d)
 trap 'rm -rf "$scratch"' EXIT
 cp -R "$here/original/." "$scratch/"
 cd "$scratch"
-git -c core.autocrlf=false apply -p2 --directory=. --check "$here/quota-pill.patch"
-git -c core.autocrlf=false apply -p2 --directory=. "$here/quota-pill.patch"
+# TMPDIR can be inside a checkout. Stop parent repository discovery so apply
+# treats scratch as standalone, rather than silently skipping every patch path.
+ceiling=$(dirname "$scratch")
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. --check "$here/quota-pill.patch"
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. "$here/quota-pill.patch"
 status=0
 for file in $(cd "$here/modified" && find . -type f | sort); do
   if cmp -s "$here/modified/$file" "$scratch/$file"; then

@@ -25,6 +25,12 @@ top: a quota pill, Windows watches, images in the Files view, a notification rel
 Reveal in explorer, and a fix for lag while typing in the chat. [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
 describes each one and how to reapply or undo it.
 
+The board also keeps status reports in plugin storage, returns the last known
+report immediately, and refreshes stale reports in the background. Four timeline
+reads can run at once, each with a five-second deadline. Turn-end events update
+reports directly; closed-agent events invalidate them when Paseo supports that
+hook. See [the status-report fix](patches/status-line-reads/README.md).
+
 ## What you need
 
 - Paseo **0.9.0 or newer**, on the daemon and on the device running the app.

@@ -21,7 +21,24 @@ Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattribu
 
 The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it) and `modified/` (every patched or new file).
 
+## Status-report fix after the six patches
+
+The six patch records above are unchanged. A separate
+[status-report overlay](patches/status-line-reads/README.md) records the later
+changes to `index.server.ts` and `server/fleet.ts`, plus the new report cache and
+tests. Its `original/` captures the tree after all six patches; its `modified/`
+captures the current files. Apply that overlay last and undo it first. This keeps
+the six historical patches reproducible without changing their behavior.
+
+The overlay stores reports in `plugin-data/firstmate/crew-reports.json`. It adds
+no package dependency and leaves the Paseo requirement at `>=0.9.0`.
+
+The quota pill check also bounds parent repository discovery for its scratch
+apply commands. This fixes silent patch skipping when TMPDIR is inside a
+checkout; its patch snapshots and root-comparison exclusions are unchanged.
+
 ## Where the plugin lives
+
 
 The installed copy (`$P`) is under the Paseo plugins folder:
 
