@@ -1,17 +1,12 @@
 /**
  * One card on the board: a crewmate, a backlog item, or both.
  *
- * Pressing the card's header (title and summary) opens its actions. The
- * first one is the caller's: the board watches the crewmate without leaving
- * FirstMate, a panel beside a workspace opens it in Paseo. Steering,
- * interrupting and ending go to the crewmate directly; relaunching goes
- * through the first mate, because it owns the brief the new crewmate starts
- * from. Ending archives the agent and leaves its workspace and worktree
- * exactly as they are.
- *
- * Only the header is pressable. The actions and the steer box sit beside it,
- * not inside it: a press that lands in the box to place the cursor or select
- * text must not fold the card, and the box with it.
+ * Pressing the card opens its actions. The first one is the caller's: the
+ * board watches the crewmate without leaving FirstMate, a panel beside a
+ * workspace opens it in Paseo. Steering, interrupting and ending go to the
+ * crewmate directly; relaunching goes through the first mate, because it
+ * owns the brief the new crewmate starts from. Ending archives the agent and
+ * leaves its workspace and worktree exactly as they are.
  */
 import type { PluginTheme } from "@getpaseo/plugin";
 import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
@@ -120,7 +115,6 @@ export function CrewCard({
         padding: compact ? 10 : 12,
         gap: 6,
       },
-      header: { gap: 6 },
       titleRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 8 },
       title: { flex: 1, color: colors.foreground, fontSize: 13, fontWeight: "600" as const },
       meta: { color: colors.foregroundMuted, fontSize: 11 },
@@ -177,72 +171,64 @@ export function CrewCard({
   ].filter((fact): fact is string => fact !== null && fact !== "");
 
   return (
-    <View style={styles.card}>
-      <Pressable
-        accessibilityRole="button"
-        accessibilityLabel={`${card.title}. ${expanded ? "Hide" : "Show"} actions`}
-        accessibilityState={{ expanded }}
-        onPress={() => setExpanded(!expanded)}
-        style={styles.header}
-      >
-        <View style={styles.titleRow}>
-          <Text style={styles.title}>{card.title}</Text>
-          {agent === null ? null : <Chip theme={theme} text={agentStatusLabel(agent)} color={agentStatusTone(theme, agent)} />}
-        </View>
-        {facts.length === 0 ? null : <Text style={styles.meta}>{facts.join(" · ")}</Text>}
+    <Pressable
+      accessibilityRole="button"
+      accessibilityLabel={`${card.title}. ${expanded ? "Hide" : "Show"} actions`}
+      accessibilityState={{ expanded }}
+      onPress={() => setExpanded(!expanded)}
+      style={styles.card}
+    >
+      <View style={styles.titleRow}>
+        <Text style={styles.title}>{card.title}</Text>
+        {agent === null ? null : <Chip theme={theme} text={agentStatusLabel(agent)} color={agentStatusTone(theme, agent)} />}
+      </View>
+      {facts.length === 0 ? null : <Text style={styles.meta}>{facts.join(" · ")}</Text>}
 
-        {card.report === null ? null : (
-          <Text style={styles.report} numberOfLines={expanded ? undefined : 3}>
-            <Text style={styles.reportState}>{STATE_WORDS[card.report.state] ?? card.report.state}: </Text>
-            {card.report.text}
-          </Text>
-        )}
-        {backlog?.hold === null || backlog?.hold === undefined ? null : (
-          <Text style={styles.report}>
-            <Text style={styles.reportState}>Captain's call: </Text>
-            {backlog.hold}
-          </Text>
-        )}
-        {agent?.lastError === null || agent?.lastError === undefined ? null : (
-          <Text style={[styles.report, { color: theme.colors.statusDanger }]} numberOfLines={expanded ? undefined : 2}>
-            {agent.lastError}
-          </Text>
-        )}
-        {agent === null && backlog?.section === "in-flight" ? (
-          <Text style={styles.meta}>No worker is running for this item.</Text>
-        ) : null}
-
-        {card.url === null ? null : (
-          <Text
-            accessibilityRole="link"
-            style={styles.link}
-            numberOfLines={1}
-            onPress={() => {
-              void openExternalUrl(card.url ?? "").catch((caught: unknown) => toast.error(errorText(caught)));
-            }}
-          >
-            {card.url.replace(/^https?:\/\/(www\.)?github\.com\//, "")}
-          </Text>
-        )}
-        {backlog?.reportPath === null || backlog?.reportPath === undefined ? null : (
-          <Text style={styles.meta}>Report: {backlog.reportPath}</Text>
-        )}
-
-        <Text style={styles.meta}>
-          {[
-            agent === null ? null : modelLabel(agent),
-            agent === null ? backlog?.outcome ?? backlog?.since ?? null : relativeTime(agent.updatedAt),
-          ]
-            .filter((part): part is string => part !== null && part !== "")
-            .join(" · ")}
+      {card.report === null ? null : (
+        <Text style={styles.report} numberOfLines={expanded ? undefined : 3}>
+          <Text style={styles.reportState}>{STATE_WORDS[card.report.state] ?? card.report.state}: </Text>
+          {card.report.text}
         </Text>
-        {expanded && agent === null ? (
-          <View style={styles.actions}>
-            <Icon name="Info" size={12} color={theme.colors.foregroundMuted} />
-            <Text style={styles.meta}>Ask the first mate to act on backlog items.</Text>
-          </View>
-        ) : null}
-      </Pressable>
+      )}
+      {backlog?.hold === null || backlog?.hold === undefined ? null : (
+        <Text style={styles.report}>
+          <Text style={styles.reportState}>Captain's call: </Text>
+          {backlog.hold}
+        </Text>
+      )}
+      {agent?.lastError === null || agent?.lastError === undefined ? null : (
+        <Text style={[styles.report, { color: theme.colors.statusDanger }]} numberOfLines={expanded ? undefined : 2}>
+          {agent.lastError}
+        </Text>
+      )}
+      {agent === null && backlog?.section === "in-flight" ? (
+        <Text style={styles.meta}>No worker is running for this item.</Text>
+      ) : null}
+
+      {card.url === null ? null : (
+        <Text
+          accessibilityRole="link"
+          style={styles.link}
+          numberOfLines={1}
+          onPress={() => {
+            void openExternalUrl(card.url ?? "").catch((caught: unknown) => toast.error(errorText(caught)));
+          }}
+        >
+          {card.url.replace(/^https?:\/\/(www\.)?github\.com\//, "")}
+        </Text>
+      )}
+      {backlog?.reportPath === null || backlog?.reportPath === undefined ? null : (
+        <Text style={styles.meta}>Report: {backlog.reportPath}</Text>
+      )}
+
+      <Text style={styles.meta}>
+        {[
+          agent === null ? null : modelLabel(agent),
+          agent === null ? backlog?.outcome ?? backlog?.since ?? null : relativeTime(agent.updatedAt),
+        ]
+          .filter((part): part is string => part !== null && part !== "")
+          .join(" · ")}
+      </Text>
 
       {expanded && agent !== null ? (
         <View style={styles.actions}>
@@ -320,6 +306,13 @@ export function CrewCard({
           </View>
         </View>
       ) : null}
-    </View>
+
+      {expanded && agent === null ? (
+        <View style={styles.actions}>
+          <Icon name="Info" size={12} color={theme.colors.foregroundMuted} />
+          <Text style={styles.meta}>Ask the first mate to act on backlog items.</Text>
+        </View>
+      ) : null}
+    </Pressable>
   );
 }
