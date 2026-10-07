@@ -3,8 +3,10 @@
  * knows by its labels, the backlog the first mate keeps, and each crewmate's
  * last status line — joined into cards and filed into columns.
  *
- * Status lines are persistent snapshots, refreshed in the background through
- * a bounded queue. Timeline reads never delay this board response.
+ * Nothing here is cached across calls except the status lines, and those are
+ * keyed by the agent's `updatedAt`: a crewmate that has not moved is not asked
+ * for its timeline again, which is what keeps a poll every few seconds cheap
+ * with a large crew.
  */
 import { realpath } from "node:fs/promises";
 
@@ -20,15 +22,14 @@ import {
   type WatchSummary,
 } from "../shared/fleet";
 import { resolveHome } from "./config";
-import { reportUrl } from "./crew-report";
-import { ReportCache } from "./report-cache";
+import { parseCrewReport, reportUrl } from "./crew-report";
 import { readCharterState } from "./charter-file";
 import { isHomeReady, readBacklog, readProjects, readSuggestions } from "./home";
-import type { AgentListOptions, PaseoAgent, PaseoApi } from "./host-types";
-
-export { ReportCache, closingText } from "./report-cache";
+import type { AgentListOptions, PaseoAgent, PaseoApi, TimelineItem } from "./host-types";
 
 const PAGE_SIZE = 200;
+/** Enough of a timeline to reach back past a turn's last tool calls to its closing message. */
+const REPORT_TAIL = 30;
 
 export function summarizeAgent(agent: PaseoAgent): AgentSummary {
   return {
@@ -101,6 +102,59 @@ export async function fetchLiveAgent(paseo: PaseoApi, agentId: string): Promise<
   const agent = found?.agent ?? null;
   if (agent === null || (agent.archivedAt !== null && agent.archivedAt !== undefined)) return null;
   return agent;
+}
+
+/**
+ * The text a turn closed with: the assistant messages at the very end of the
+ * timeline, joined, since a streamed reply can arrive as several items. Any
+ * other item — a tool call, the user's message — ends the search.
+ */
+export function closingText(items: readonly TimelineItem[]): string | null {
+  const parts: string[] = [];
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const item = items[index];
+    if (item === undefined) break;
+    if (item.type === "assistant_message") {
+      parts.unshift(item.text);
+      continue;
+    }
+    // Plugin rows and notices can land after a turn without being part of it.
+    if (item.type === "plugin" || item.type === "notification") continue;
+    break;
+  }
+  const text = parts.join("");
+  return text.trim() === "" ? null : text;
+}
+
+interface CachedReport {
+  updatedAt: string;
+  report: CrewReportSummary | null;
+}
+
+/** Each crewmate's last status line, re-read only when the agent has moved. */
+export class ReportCache {
+  private readonly reports = new Map<string, CachedReport>();
+
+  async reportFor(paseo: PaseoApi, agent: PaseoAgent): Promise<CrewReportSummary | null> {
+    const cached = this.reports.get(agent.id);
+    // A running turn has not closed yet, so its timeline holds no new status
+    // line; the previous one stays on the card until it does.
+    if (agent.status === "running" || agent.status === "initializing") return cached?.report ?? null;
+    if (cached !== undefined && cached.updatedAt === agent.updatedAt) return cached.report;
+    const page = await paseo.agents
+      .ref(agent.id)
+      .timeline.refetch({ direction: "tail", limit: REPORT_TAIL, projection: "projected" });
+    const report = parseCrewReport(closingText(page.entries.map((entry) => entry.item)));
+    this.reports.set(agent.id, { updatedAt: agent.updatedAt, report });
+    return report;
+  }
+
+  /** Drops agents no longer in the crew, so the map cannot grow for the life of the daemon. */
+  retain(ids: ReadonlySet<string>): void {
+    for (const id of this.reports.keys()) {
+      if (!ids.has(id)) this.reports.delete(id);
+    }
+  }
 }
 
 /**
@@ -226,7 +280,6 @@ export async function loadFleet(
 ): Promise<Fleet> {
   const home = resolveHome(config);
   const warnings: string[] = [];
-  let crewListed = true;
 
   const [homeReady, backlog, projects, suggestions, mate, crewAgents, agentTools, charter, watches] = await Promise.all([
     isHomeReady(home),
@@ -244,7 +297,6 @@ export async function loadFleet(
     }),
     resolveMate(paseo, config),
     listAgents(paseo, { labels: { [CREW_LABELS.role]: CREW_LABELS.crewRole } }).catch((error: unknown) => {
-      crewListed = false;
       warnings.push(`Paseo could not list the crew: ${describe(error)}`);
       return [];
     }),
@@ -259,11 +311,16 @@ export async function loadFleet(
     }),
   ]);
 
-  if (crewListed) reports.retain(new Set(crewAgents.map((agent) => agent.id)));
-  const crew = crewAgents.map((agent) => ({
-    agent: summarizeAgent(agent),
-    report: reports.reportFor(paseo, agent),
-  }));
+  reports.retain(new Set(crewAgents.map((agent) => agent.id)));
+  const crew = await Promise.all(
+    crewAgents.map(async (agent) => ({
+      agent: summarizeAgent(agent),
+      report: await reports.reportFor(paseo, agent).catch((error: unknown) => {
+        console.error(`[firstmate] could not read the status line of ${agent.id}:`, error);
+        return null;
+      }),
+    })),
+  );
 
   return {
     home,

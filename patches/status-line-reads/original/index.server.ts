@@ -12,8 +12,7 @@ import {
 } from "./server/crew";
 import { registerCrewRelay } from "./server/crew-relay";
 import { registerCrewSeen } from "./server/crew-seen";
-import { loadFleet, readAgentTools } from "./server/fleet";
-import { registerReportCache } from "./server/report-cache";
+import { ReportCache, loadFleet, readAgentTools } from "./server/fleet";
 import { findFiles, listDirectory, readTextFile, requireHome, writeTextFile } from "./server/files";
 import { readHomeImageFile } from "./server/images";
 import { revealInHome } from "./server/reveal";
@@ -61,7 +60,7 @@ import { displaySettings } from "./shared/settings";
 
 export default function contribute(server: PluginServerContext) {
   migrateLegacyFiles();
-  const reports = registerReportCache(server);
+  const reports = new ReportCache();
   const steers = new CaptainSteers();
   // The scripts in the home's watches/ folder, run on their schedules; see server/watches.ts.
   const watches = startWatches(server, readFirstmateConfig);
@@ -179,7 +178,6 @@ export default function contribute(server: PluginServerContext) {
   });
 
   return () => {
-    reports.stop();
     unregisterRelay();
     unregisterCrewSeen();
     crewRelay.stop();
