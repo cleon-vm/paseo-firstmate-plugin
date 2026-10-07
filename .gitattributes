@@ -1,0 +1,4 @@
+# The quota pill's patch and its original/ and modified/ copies must stay LF,
+# byte-identical to the npm package, whatever core.autocrlf says. A CRLF
+# checkout of the patch does not apply to the LF files npm installs.
+patches/quota-pill/** text eol=lf

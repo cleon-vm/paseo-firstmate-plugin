@@ -15,10 +15,17 @@ From a shell in the installed plugin directory (`$P`, see `LOCAL-CHANGES.md`):
 ```
 git -c core.autocrlf=false apply -p2 --directory=. <this-repo>/patches/quota-pill/quota-pill.patch
 ```
-Add `--check` first. If the update changed `chat.tsx` or `index.server.ts` and the patch no longer applies, copy the new files from `modified/` and redo the two small edits by hand (an import + one line in each). Then `paseo plugin reload firstmate`.
+Add `--check` first. The npm package's files have LF line endings, and so must the patch: `.gitattributes` pins everything under `patches/quota-pill/` to LF in every checkout, whatever `core.autocrlf` says. Don't copy the patch or `original/` through a tool that converts them to CRLF, because a CRLF patch fails on LF files (and an LF patch on CRLF files) with `patch failed: client/chat.tsx:30` and `index.server.ts:49`. If the update changed `chat.tsx` or `index.server.ts` and the patch no longer applies, copy the new files from `modified/` and redo the two small edits by hand (an import + one line in each). Then `paseo plugin reload firstmate`.
 
 ## Restore
 Copy `original/index.server.ts` and `original/client/chat.tsx` back into `$P`, delete the new files, reload.
 
+## Verify the patch
+From the repository root (Git Bash on Windows, any POSIX shell elsewhere):
+```
+sh patches/quota-pill/check.sh
+```
+It copies `original/` (stock 0.2.1, byte-identical to the npm package's `client/chat.tsx` and `index.server.ts`) to a scratch folder and runs the preflight above, then the apply. It then checks that every resulting file is byte-identical to `modified/`, and that the files this patch adds match the repository root, ignoring line endings there. `chat.tsx` and `index.server.ts` are not compared with the root, because later patches also edit them. It prints `ok: ...` and exits 0, or names each differing file and exits 1. To check against a real npm install instead, run the preflight above in a copy of `npm pack @gpambrozio/paseo-firstmate@0.2.1`'s `package/` folder.
+
 ## Checks
-The installed copy has no dev dependencies, so `npm run typecheck`/`npm test` were not run there. In this repository `npm test -- --exclude 'patches/**'` runs `server/quota.test.ts` (21, synthetic fixtures) and `client/quota-pill.test.ts` (3, renders the pill); the client test needs the test-only `react-test-renderer`, installed without saving as in `patches/chat-input-lag/README.md`. Full typecheck is not possible without the host SDK types; only unresolved-module errors remain. Icon rendering not visually verified in the UI; a11y labels still say Claude/Codex.
+The installed copy has no dev dependencies, so `npm run typecheck`/`npm test` were not run there. In this repository `npm test -- --exclude 'patches/**'` runs `server/quota.test.ts` (21, synthetic fixtures) and `client/quota-pill.test.ts` (3, renders the pill); the client test needs the test-only `react-test-renderer`, installed without saving as in `patches/chat-input-lag/README.md`. Full typecheck is not possible without the host SDK types; only unresolved-module errors remain. Icon rendering not visually verified in the UI; a11y labels name each provider in words.
