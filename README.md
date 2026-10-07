@@ -20,9 +20,9 @@ manages, and Paseo itself tells the first mate when a worker finishes, fails or 
 There is nothing else to install.
 
 This repository is a patched copy of FirstMate 0.2.1 from
-[gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with six local patches on
+[gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with seven local patches on
 top: a quota pill, Windows watches, images in the Files view, a notification relay after a restart,
-Reveal in explorer, and a fix for lag while typing in the chat. [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
+Reveal in explorer, a fix for lag while typing in the chat, and a fix for the board card folding when you click in its steer box. [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
 describes each one and how to reapply or undo it.
 
 ## What you need
@@ -44,7 +44,7 @@ paseo plugin install https://github.com/cleon-vm/paseo-firstmate-plugin.git --id
 ```
 
 `paseo plugin install npm:@gpambrozio/paseo-firstmate` installs upstream's stock FirstMate, without
-the six patches.
+the seven patches.
 
 To hack on it, clone the repository and run `npm install` and `npm test -- --exclude 'patches/**'`.
 To switch an existing install to a local clone, remove the plugin, then install the directory with the
