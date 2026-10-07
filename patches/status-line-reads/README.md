@@ -1,6 +1,6 @@
 # Responsive status reports
 
-This overlay applies after the six existing patches, on their original 0.2.1
+This overlay applies after the seven existing patches, on their original 0.2.1
 base. It does not change their UI, labels, notifications, or relay behavior.
 
 The board returns persistent cached reports immediately and queues stale reads.
@@ -43,7 +43,7 @@ git -c core.autocrlf=false apply --check patches/status-line-reads/status-line-r
 git -c core.autocrlf=false apply patches/status-line-reads/status-line-reads.patch
 ```
 
-To undo, reverse this overlay before reversing the six older patches:
+To undo, reverse this overlay before reversing the seven older patches:
 
 ```sh
 git -c core.autocrlf=false apply --reverse patches/status-line-reads/status-line-reads.patch

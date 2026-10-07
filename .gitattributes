@@ -4,3 +4,5 @@
 patches/quota-pill/** text eol=lf
 # The later overlay also records LF source snapshots and a reproducible patch.
 patches/status-line-reads/** text eol=lf
+# Same for the steer-box fix.
+patches/steer-box-click/** text eol=lf
