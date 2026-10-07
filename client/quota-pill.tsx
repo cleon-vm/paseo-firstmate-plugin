@@ -1,6 +1,7 @@
 /**
- * Codex and Claude quota USED, beside the chat's Bearings and Ahoy buttons:
- * a Codex icon and a Claude icon with their percent, the session (five-hour) window. Pressing it opens a
+ * Quota USED, beside the chat's Bearings and Ahoy buttons: an icon and the
+ * percent of the session (five-hour) window for each provider in Usage
+ * Monitor's readings (Codex, Claude, then any other). Pressing it opens a
  * small card below with session and weekly use, reset times and freshness.
  * The numbers come from the daemon's read of Usage Monitor's saved readings
  * (server/quota.ts); this never calls a vendor.
@@ -13,11 +14,12 @@ import { AppState, Image, Pressable, Text, View } from "react-native";
 
 import {
   QUOTA_POLL_MS,
-  QUOTA_PROVIDERS,
   QUOTA_QUERY_KEY,
   freshnessWords,
+  isKnownQuotaProvider,
   providerName,
   quotaCells,
+  quotaProviders,
   readQuota,
   type QuotaProviderId,
   type QuotaTone,
@@ -32,8 +34,34 @@ const LOGO_SOURCES = {
   codex: { uri: QUOTA_LOGOS.codex },
 };
 
-/** The provider's mark, tinted like the text beside it. Hidden from screen readers: the label names the provider in words. */
+/**
+ * The provider's mark, tinted like the text beside it; a provider without one
+ * gets its initial in a small ring. Hidden from screen readers: the label
+ * names the provider in words.
+ */
 function ProviderIcon({ id, color, size = ICON_SIZE }: { id: QuotaProviderId; color: string; size?: number }) {
+  if (!isKnownQuotaProvider(id)) {
+    return (
+      <View
+        accessible={false}
+        accessibilityElementsHidden
+        importantForAccessibility="no-hide-descendants"
+        style={{
+          width: size,
+          height: size,
+          borderRadius: size / 2,
+          borderWidth: 1,
+          borderColor: color,
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Text style={{ color, fontSize: size * 0.6, fontWeight: "600", lineHeight: size - 2 }}>
+          {providerName(id).charAt(0).toUpperCase()}
+        </Text>
+      </View>
+    );
+  }
   return (
     <Image
       accessible={false}
@@ -138,6 +166,13 @@ export function QuotaPill({ theme }: { theme: PluginTheme }) {
   }
 
   const cells = quotaCells(snapshot, nowMs);
+  if (cells.length === 0) {
+    return (
+      <View style={styles.pill} accessibilityLabel="Quota: no providers in Usage Monitor's readings">
+        <Text style={[styles.text, { color: colors.foregroundMuted }]}>Quota —</Text>
+      </View>
+    );
+  }
   return (
     <>
       <Pressable
@@ -157,20 +192,17 @@ export function QuotaPill({ theme }: { theme: PluginTheme }) {
       </Pressable>
       {open ? (
         <View style={styles.card}>
-          {QUOTA_PROVIDERS.map((id) => {
-            const provider = snapshot.providers.find((entry) => entry.id === id);
-            return (
-              <View key={id}>
-                <View style={styles.titleRow}>
-                  <ProviderIcon id={id} color={colors.foreground} />
-                  <Text style={styles.title}>{providerName(id)}</Text>
-                </View>
-                <Text style={styles.line}>Session: {windowText(provider?.session ?? null)}</Text>
-                <Text style={styles.line}>Weekly: {windowText(provider?.weekly ?? null)}</Text>
-                <Text style={styles.line}>{freshnessWords(id, provider?.fetchedAt ?? null, nowMs)}</Text>
+          {quotaProviders(snapshot).map((provider) => (
+            <View key={provider.id}>
+              <View style={styles.titleRow}>
+                <ProviderIcon id={provider.id} color={colors.foreground} />
+                <Text style={styles.title}>{providerName(provider.id)}</Text>
               </View>
-            );
-          })}
+              <Text style={styles.line}>Session: {windowText(provider.session)}</Text>
+              <Text style={styles.line}>Weekly: {windowText(provider.weekly)}</Text>
+              <Text style={styles.line}>{freshnessWords(provider.id, provider.fetchedAt, nowMs)}</Text>
+            </View>
+          ))}
         </View>
       ) : null}
     </>

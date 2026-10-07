@@ -18,15 +18,105 @@ index 257e618..d07580c 100644
              <MateControls
                theme={theme}
                compact={compact}
+diff --git a/modified/client/quota-pill.test.ts b/modified/client/quota-pill.test.ts
+new file mode 100644
+index 0000000..b67efd9
+--- /dev/null
++++ b/modified/client/quota-pill.test.ts
+@@ -0,0 +1,83 @@
++import { createElement } from "react";
++import { act, create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type { PluginTheme } from "@getpaseo/plugin";
++import type { QuotaSnapshot } from "../shared/quota";
++
++// The daemon read and the native host are boundaries; the pill and its rules are real.
++const host = vi.hoisted(() => ({ snapshot: undefined as unknown, isError: false }));
++
++vi.mock("react-native", () => ({
++  View: "View", Text: "Text", Pressable: "Pressable", Image: "Image",
++  AppState: { addEventListener: () => ({ remove: () => {} }) },
++}));
++vi.mock("@getpaseo/plugin/client", () => ({ useRpc: () => async () => host.snapshot }));
++vi.mock("@tanstack/react-query", () => ({
++  useQuery: () => ({ data: host.snapshot, isError: host.isError, refetch: async () => {}, dataUpdatedAt: 0 }),
++}));
++
++import { QuotaPill } from "./quota-pill";
++
++const theme = {
++  colors: {
++    foreground: "#fff", foregroundMuted: "#999", border: "#333", surface1: "#111",
++    statusWarning: "#fa0", statusDanger: "#f00",
++  },
++} as unknown as PluginTheme;
++
++let renderer: ReactTestRenderer | undefined;
++afterEach(() => {
++  act(() => renderer?.unmount());
++  renderer = undefined;
++  host.snapshot = undefined;
++  host.isError = false;
++});
++
++function render(snapshot: QuotaSnapshot): ReactTestRenderer {
++  host.snapshot = snapshot;
++  act(() => {
++    renderer = create(createElement(QuotaPill, { theme }));
++  });
++  return renderer!;
++}
++
++function texts(root: ReactTestInstance): string[] {
++  return root.findAll((node) => (node.type as unknown) === "Text").map((node) =>
++    node.children.map((child) => (typeof child === "string" ? child : "")).join(""),
++  );
++}
++
++const reading = (id: string, percent: number) => ({
++  id,
++  session: { usedPercent: percent, window: "Session", resetsAt: null },
++  weekly: null,
++  fetchedAt: new Date().toISOString(),
++});
++
++describe("QuotaPill", () => {
++  it("shows every provider in the snapshot, known first, with a fallback icon for unknown ones", () => {
++    const tree = render({ state: "ok", providers: [reading("opencode-go", 12), reading("codex", 76), reading("constructor", 5)] });
++    const pill = tree.root.findByProps({ accessibilityRole: "button" });
++    expect(texts(pill).filter((text) => text !== " · ")).toEqual(["76%", "C", "5%", "O", "12%"]);
++    expect(pill.findAll((node) => (node.type as unknown) === "Image")).toHaveLength(1);
++    expect(pill.props.accessibilityLabel).toContain("Opencode Go: 12 percent used");
++    expect(pill.props.accessibilityLabel).not.toContain("Claude");
++
++    act(() => pill.props.onPress());
++    expect(texts(tree.root)).toEqual(expect.arrayContaining(["Codex", "Constructor", "Opencode Go"]));
++    expect(texts(tree.root)).not.toContain("Claude");
++  });
++
++  it("does not render a provider the snapshot does not have", () => {
++    const tree = render({ state: "ok", providers: [reading("claude", 61)] });
++    const pill = tree.root.findByProps({ accessibilityRole: "button" });
++    expect(texts(pill)).toEqual(["61%"]);
++    expect(pill.props.accessibilityLabel).not.toContain("Codex");
++  });
++
++  it("says unavailable for an unavailable snapshot and a dash for an empty one", () => {
++    expect(texts(render({ state: "unavailable", providers: [] }).root)).toEqual(["Quota unavailable"]);
++    act(() => renderer?.unmount());
++    expect(texts(render({ state: "ok", providers: [] }).root)).toEqual(["Quota —"]);
++  });
++});
 diff --git a/modified/client/quota-pill.tsx b/modified/client/quota-pill.tsx
 new file mode 100644
-index 0000000..b284216
+index 0000000..5490cf2
 --- /dev/null
 +++ b/modified/client/quota-pill.tsx
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,210 @@
 +/**
-+ * Codex and Claude quota USED, beside the chat's Bearings and Ahoy buttons:
-+ * a Codex icon and a Claude icon with their percent, the session (five-hour) window. Pressing it opens a
++ * Quota USED, beside the chat's Bearings and Ahoy buttons: an icon and the
++ * percent of the session (five-hour) window for each provider in Usage
++ * Monitor's readings (Codex, Claude, then any other). Pressing it opens a
 + * small card below with session and weekly use, reset times and freshness.
 + * The numbers come from the daemon's read of Usage Monitor's saved readings
 + * (server/quota.ts); this never calls a vendor.
@@ -39,11 +129,12 @@ index 0000000..b284216
 +
 +import {
 +  QUOTA_POLL_MS,
-+  QUOTA_PROVIDERS,
 +  QUOTA_QUERY_KEY,
 +  freshnessWords,
++  isKnownQuotaProvider,
 +  providerName,
 +  quotaCells,
++  quotaProviders,
 +  readQuota,
 +  type QuotaProviderId,
 +  type QuotaTone,
@@ -58,8 +149,34 @@ index 0000000..b284216
 +  codex: { uri: QUOTA_LOGOS.codex },
 +};
 +
-+/** The provider's mark, tinted like the text beside it. Hidden from screen readers: the label names the provider in words. */
++/**
++ * The provider's mark, tinted like the text beside it; a provider without one
++ * gets its initial in a small ring. Hidden from screen readers: the label
++ * names the provider in words.
++ */
 +function ProviderIcon({ id, color, size = ICON_SIZE }: { id: QuotaProviderId; color: string; size?: number }) {
++  if (!isKnownQuotaProvider(id)) {
++    return (
++      <View
++        accessible={false}
++        accessibilityElementsHidden
++        importantForAccessibility="no-hide-descendants"
++        style={{
++          width: size,
++          height: size,
++          borderRadius: size / 2,
++          borderWidth: 1,
++          borderColor: color,
++          alignItems: "center",
++          justifyContent: "center",
++        }}
++      >
++        <Text style={{ color, fontSize: size * 0.6, fontWeight: "600", lineHeight: size - 2 }}>
++          {providerName(id).charAt(0).toUpperCase()}
++        </Text>
++      </View>
++    );
++  }
 +  return (
 +    <Image
 +      accessible={false}
@@ -164,6 +281,13 @@ index 0000000..b284216
 +  }
 +
 +  const cells = quotaCells(snapshot, nowMs);
++  if (cells.length === 0) {
++    return (
++      <View style={styles.pill} accessibilityLabel="Quota: no providers in Usage Monitor's readings">
++        <Text style={[styles.text, { color: colors.foregroundMuted }]}>Quota —</Text>
++      </View>
++    );
++  }
 +  return (
 +    <>
 +      <Pressable
@@ -183,20 +307,17 @@ index 0000000..b284216
 +      </Pressable>
 +      {open ? (
 +        <View style={styles.card}>
-+          {QUOTA_PROVIDERS.map((id) => {
-+            const provider = snapshot.providers.find((entry) => entry.id === id);
-+            return (
-+              <View key={id}>
-+                <View style={styles.titleRow}>
-+                  <ProviderIcon id={id} color={colors.foreground} />
-+                  <Text style={styles.title}>{providerName(id)}</Text>
-+                </View>
-+                <Text style={styles.line}>Session: {windowText(provider?.session ?? null)}</Text>
-+                <Text style={styles.line}>Weekly: {windowText(provider?.weekly ?? null)}</Text>
-+                <Text style={styles.line}>{freshnessWords(id, provider?.fetchedAt ?? null, nowMs)}</Text>
++          {quotaProviders(snapshot).map((provider) => (
++            <View key={provider.id}>
++              <View style={styles.titleRow}>
++                <ProviderIcon id={provider.id} color={colors.foreground} />
++                <Text style={styles.title}>{providerName(provider.id)}</Text>
 +              </View>
-+            );
-+          })}
++              <Text style={styles.line}>Session: {windowText(provider.session)}</Text>
++              <Text style={styles.line}>Weekly: {windowText(provider.weekly)}</Text>
++              <Text style={styles.line}>{freshnessWords(provider.id, provider.fetchedAt, nowMs)}</Text>
++            </View>
++          ))}
 +        </View>
 +      ) : null}
 +    </>
@@ -227,16 +348,27 @@ index b760d6f..912aab0 100644
    server.handle(releaseMateRpc, async () => ({ config: await releaseMate() }));
 diff --git a/modified/server/quota.test.ts b/modified/server/quota.test.ts
 new file mode 100644
-index 0000000..8c3dacc
+index 0000000..f2f0bae
 --- /dev/null
 +++ b/modified/server/quota.test.ts
-@@ -0,0 +1,125 @@
+@@ -0,0 +1,200 @@
 +import { mkdtemp, writeFile } from "node:fs/promises";
 +import { tmpdir } from "node:os";
 +import { join } from "node:path";
 +import { describe, expect, it } from "vitest";
 +
-+import { formatAge, isStale, quotaCell, quotaCells, type QuotaProvider } from "../shared/quota";
++import {
++  MAX_PROVIDER_ID,
++  QuotaSnapshotSchema,
++  formatAge,
++  isQuotaProviderId,
++  isStale,
++  providerName,
++  quotaCell,
++  quotaCells,
++  sortProviderIds,
++  type QuotaProvider,
++} from "../shared/quota";
 +import { MAX_FILE_BYTES, parseQuotaFile, readQuotaSnapshot } from "./quota";
 +
 +const NOW = Date.parse("2026-01-01T12:00:00.000Z");
@@ -265,14 +397,54 @@ index 0000000..8c3dacc
 +    });
 +  });
 +
-+  it("leaves a missing provider empty without hiding the other", () => {
++  it("does not list a provider the file does not have", () => {
 +    const snapshot = parseQuotaFile(
 +      file({ claude: { fetchedAt: minutesAgo(1), readings: [quota("session", 5)] } }),
 +      NOW,
 +    );
 +    expect(snapshot.state).toBe("ok");
-+    expect(snapshot.providers[0]).toEqual({ id: "codex", session: null, weekly: null, fetchedAt: null });
-+    expect(quotaCells(snapshot, NOW).map((c) => c.text)).toEqual(["—", "5%"]);
++    expect(snapshot.providers.map((p) => p.id)).toEqual(["claude"]);
++    expect(quotaCells(snapshot, NOW).map((c) => c.text)).toEqual(["5%"]);
++  });
++
++  it("shows every provider in the file: known ones first, the rest alphabetically", () => {
++    const snapshot = parseQuotaFile(
++      file({
++        "opencode-go": { fetchedAt: minutesAgo(1), readings: [quota("session", 12)] },
++        zeta: { fetchedAt: minutesAgo(1), readings: [] },
++        codex: { fetchedAt: minutesAgo(2), readings: [quota("session", 76)] },
++        alpha: { fetchedAt: minutesAgo(1), readings: [quota("session", 3)] },
++      }),
++      NOW,
++    );
++    expect(snapshot.state).toBe("ok");
++    expect(snapshot.providers.map((p) => p.id)).toEqual(["codex", "alpha", "opencode-go", "zeta"]);
++    expect(quotaCells(snapshot, NOW).map((c) => [c.id, c.text])).toEqual([
++      ["codex", "76%"],
++      ["alpha", "3%"],
++      ["opencode-go", "12%"],
++      ["zeta", "—"],
++    ]);
++    expect(QuotaSnapshotSchema.parse(snapshot)).toEqual(snapshot);
++  });
++
++  it("skips keys that are not provider ids and keeps the rest", () => {
++    const entry = { fetchedAt: minutesAgo(1), readings: [quota("session", 1)] };
++    const snapshot = parseQuotaFile(
++      file({ "": entry, " codex": entry, ["x".repeat(MAX_PROVIDER_ID + 1)]: entry, "bad\nid": entry, claude: entry }),
++      NOW,
++    );
++    expect(snapshot.providers.map((p) => p.id)).toEqual(["claude"]);
++  });
++
++  it("treats prototype-named keys as plain providers", () => {
++    const text = '{"version":1,"providers":{"__proto__":{"fetchedAt":"' + minutesAgo(1) + '","readings":[]},"constructor":{}}}';
++    const snapshot = parseQuotaFile(text, NOW);
++    expect(snapshot.providers.map((p) => p.id)).toEqual(["__proto__", "constructor"]);
++    expect(quotaCells(snapshot, NOW).map((c) => c.label)).toEqual([
++      "Proto: no quota reading",
++      "Constructor: no quota reading",
++    ]);
 +  });
 +
 +  it.each([
@@ -280,6 +452,8 @@ index 0000000..8c3dacc
 +    ["wrong version", file({}, 2)],
 +    ["array root", "[]"],
 +    ["no providers", JSON.stringify({ version: 1 })],
++    ["providers as an array", JSON.stringify({ version: 1, providers: [{ id: "codex" }] })],
++    ["providers as a string", JSON.stringify({ version: 1, providers: "codex" })],
 +  ])("is unavailable for %s", (_name, text) => {
 +    expect(parseQuotaFile(text, NOW)).toEqual({ state: "unavailable", providers: [] });
 +  });
@@ -332,11 +506,33 @@ index 0000000..8c3dacc
 +    expect(quotaCells(parseQuotaFile(good, NOW), NOW).map((c) => c.text)).toEqual(["32%", "61%"]);
 +  });
 +
-+  it("uses source-aware staleness thresholds", () => {
++  it("uses source-aware staleness thresholds, 10 minutes for providers without their own", () => {
 +    expect(isStale("codex", minutesAgo(11), NOW)).toBe(true);
 +    expect(isStale("codex", minutesAgo(9), NOW)).toBe(false);
 +    expect(isStale("claude", minutesAgo(30), NOW)).toBe(false);
 +    expect(isStale("claude", minutesAgo(46), NOW)).toBe(true);
++    expect(isStale("opencode-go", minutesAgo(9), NOW)).toBe(false);
++    expect(isStale("opencode-go", minutesAgo(11), NOW)).toBe(true);
++    expect(isStale("toString", minutesAgo(11), NOW)).toBe(true);
++  });
++
++  it("names known providers as before and others from their id", () => {
++    expect(["codex", "claude", "opencode-go", "my_tool.v2", "toString"].map(providerName)).toEqual([
++      "Codex",
++      "Claude",
++      "Opencode Go",
++      "My Tool V2",
++      "ToString",
++    ]);
++    const cell = quotaCell({ ...codex(minutesAgo(1), 40), id: "opencode-go" }, "opencode-go", NOW);
++    expect(cell.label).toBe("Opencode Go: 40 percent used, Session window, updated 1m ago");
++  });
++
++  it("validates provider ids and orders them", () => {
++    expect(["codex", "opencode-go", "x".repeat(MAX_PROVIDER_ID)].every(isQuotaProviderId)).toBe(true);
++    expect(["", " a", "a ", "a\u0007b", "x".repeat(MAX_PROVIDER_ID + 1), 3, null].some(isQuotaProviderId)).toBe(false);
++    expect(sortProviderIds(["zed", "claude", "beta", "codex", "beta"])).toEqual(["codex", "claude", "beta", "zed"]);
++    expect(() => QuotaSnapshotSchema.parse({ state: "ok", providers: [{ id: "", session: null, weekly: null, fetchedAt: null }] })).toThrow();
 +  });
 +
 +  it("keeps the last value and shows its age when stale", () => {
@@ -358,22 +554,30 @@ index 0000000..8c3dacc
 +});
 diff --git a/modified/server/quota.ts b/modified/server/quota.ts
 new file mode 100644
-index 0000000..ea302b8
+index 0000000..e85bd36
 --- /dev/null
 +++ b/modified/server/quota.ts
-@@ -0,0 +1,96 @@
+@@ -0,0 +1,104 @@
 +/**
 + * Reads Usage Monitor's saved last-good readings, `$PASEO_HOME/usage-limits/last-readings.json`,
 + * for the chat's quota pill. Read-only and local: no credential file is opened
 + * and no vendor endpoint is called. The file is another plugin's cache, so it
 + * is validated strictly and only the percent, window name, reset time and
 + * read time leave this module. Anything malformed makes the whole snapshot
-+ * `unavailable` rather than showing a guess.
++ * `unavailable` rather than showing a guess. Every provider key in the file
++ * is passed on (Usage Monitor decides which it tracks); a key that is not a
++ * valid provider id is skipped.
 + */
 +import { readFile, stat } from "node:fs/promises";
 +import { join } from "node:path";
 +
-+import { QUOTA_PROVIDERS, type QuotaProvider, type QuotaSnapshot, type QuotaWindow } from "../shared/quota";
++import {
++  isQuotaProviderId,
++  sortProviderIds,
++  type QuotaProvider,
++  type QuotaSnapshot,
++  type QuotaWindow,
++} from "../shared/quota";
 +import { paseoHome } from "./data-dir";
 +
 +const SUPPORTED_VERSION = 1;
@@ -426,7 +630,7 @@ index 0000000..ea302b8
 +  return { id, session: find("session"), weekly: find("weekly"), fetchedAt };
 +}
 +
-+/** Pure: the file's text to the snapshot the chat draws. */
++/** Pure: the file's text to the snapshot the chat draws, providers in pill order. */
 +export function parseQuotaFile(text: string, nowMs: number): QuotaSnapshot {
 +  let document: unknown;
 +  try {
@@ -440,8 +644,8 @@ index 0000000..ea302b8
 +  const providers = document.providers;
 +  return {
 +    state: "ok",
-+    providers: QUOTA_PROVIDERS.map((id) =>
-+      provider(id, Object.hasOwn(providers, id) ? providers[id] : undefined, nowMs),
++    providers: sortProviderIds(Object.keys(providers).filter(isQuotaProviderId)).map((id) =>
++      provider(id, providers[id], nowMs),
 +    ),
 +  };
 +}
@@ -482,10 +686,10 @@ index 0000000..02948cc
 +} as const;
 diff --git a/modified/shared/quota.ts b/modified/shared/quota.ts
 new file mode 100644
-index 0000000..e034c34
+index 0000000..b7579c6
 --- /dev/null
 +++ b/modified/shared/quota.ts
-@@ -0,0 +1,135 @@
+@@ -0,0 +1,179 @@
 +/**
 + * The quota pill beside the chat's buttons: the contract between the daemon,
 + * which reads Usage Monitor's saved readings, and the chat, which draws them,
@@ -496,14 +700,54 @@ index 0000000..e034c34
 +import { defineRpc } from "@getpaseo/plugin";
 +import { z } from "zod";
 +
-+export const QUOTA_PROVIDERS = ["codex", "claude"] as const;
-+export type QuotaProviderId = (typeof QUOTA_PROVIDERS)[number];
++/**
++ * Providers with their own name, icon and stale window, in pill order. Any
++ * other provider in Usage Monitor's readings is shown too, after these and
++ * alphabetically, with a name from its id, a neutral icon and the default
++ * stale window.
++ */
++export const KNOWN_QUOTA_PROVIDERS = ["codex", "claude"] as const;
++export type KnownQuotaProviderId = (typeof KNOWN_QUOTA_PROVIDERS)[number];
++/** A key of Usage Monitor's readings file that passed `isQuotaProviderId`. */
++export type QuotaProviderId = string;
++
++/** The readings file's keys are short slugs; anything past this is not one. */
++export const MAX_PROVIDER_ID = 40;
++
++/** Non-empty, at most `MAX_PROVIDER_ID` long, no surrounding whitespace and no control characters. */
++export function isQuotaProviderId(value: unknown): value is QuotaProviderId {
++  return (
++    typeof value === "string" &&
++    value !== "" &&
++    value.length <= MAX_PROVIDER_ID &&
++    value.trim() === value &&
++    !/[\u0000-\u001f\u007f]/.test(value)
++  );
++}
++
++export function isKnownQuotaProvider(id: QuotaProviderId): id is KnownQuotaProviderId {
++  return (KNOWN_QUOTA_PROVIDERS as readonly string[]).includes(id);
++}
++
++/** Known providers first in their own order, then the rest alphabetically; duplicates dropped. */
++export function sortProviderIds(ids: Iterable<QuotaProviderId>): QuotaProviderId[] {
++  const unique = [...new Set(ids)];
++  const known = KNOWN_QUOTA_PROVIDERS.filter((id) => unique.includes(id));
++  const rest = unique.filter((id) => !isKnownQuotaProvider(id)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
++  return [...known, ...rest];
++}
 +
 +/** Past this age a reading is shown as stale, with its age. Claude's source is polled slowly on purpose. */
-+export const STALE_AFTER_MS: Record<QuotaProviderId, number> = {
++export const STALE_AFTER_MS: Record<KnownQuotaProviderId, number> = {
 +  codex: 10 * 60 * 1000,
 +  claude: 45 * 60 * 1000,
 +};
++/** The stale window of a provider without its own. */
++export const DEFAULT_STALE_AFTER_MS = 10 * 60 * 1000;
++
++export function staleAfterMs(id: QuotaProviderId): number {
++  return isKnownQuotaProvider(id) ? STALE_AFTER_MS[id] : DEFAULT_STALE_AFTER_MS;
++}
 +
 +export const QuotaWindowSchema = z.object({
 +  usedPercent: z.number().min(0).max(100),
@@ -512,14 +756,14 @@ index 0000000..e034c34
 +});
 +
 +export const QuotaProviderSchema = z.object({
-+  id: z.enum(QUOTA_PROVIDERS),
++  id: z.string().min(1).max(MAX_PROVIDER_ID).refine(isQuotaProviderId),
 +  session: QuotaWindowSchema.nullable(),
 +  weekly: QuotaWindowSchema.nullable(),
 +  fetchedAt: z.string().nullable(),
 +});
 +
 +export const QuotaSnapshotSchema = z.object({
-+  /** `unavailable` is a missing, oversized or malformed file; a provider absent from a good file is just empty. */
++  /** `unavailable` is a missing, oversized or malformed file; a good file lists exactly the providers it has, sorted. */
 +  state: z.enum(["ok", "unavailable"]),
 +  providers: z.array(QuotaProviderSchema),
 +});
@@ -537,10 +781,13 @@ index 0000000..e034c34
 +export const QUOTA_QUERY_KEY = ["firstmate", "quota"] as const;
 +export const QUOTA_POLL_MS = 60_000;
 +
-+const FULL: Record<QuotaProviderId, string> = { codex: "Codex", claude: "Claude" };
++const FULL: Record<KnownQuotaProviderId, string> = { codex: "Codex", claude: "Claude" };
 +
++/** `Codex`, `Claude`; any other id title-cased from its words, `opencode-go` to `Opencode Go`. */
 +export function providerName(id: QuotaProviderId): string {
-+  return FULL[id];
++  if (isKnownQuotaProvider(id)) return FULL[id];
++  const words = id.split(/[-_.\s]+/).filter((word) => word !== "");
++  return words.length === 0 ? id : words.map((word) => word[0]!.toUpperCase() + word.slice(1)).join(" ");
 +}
 +
 +/** Milliseconds since the reading, or null when it has none or its time is unreadable. */
@@ -553,7 +800,7 @@ index 0000000..e034c34
 +
 +export function isStale(id: QuotaProviderId, fetchedAt: string | null, nowMs: number): boolean {
 +  const age = ageMs(fetchedAt, nowMs);
-+  return age !== null && age > STALE_AFTER_MS[id];
++  return age !== null && age > staleAfterMs(id);
 +}
 +
 +/** `just now`, `5m`, `2h`, `3d`. */
@@ -593,7 +840,7 @@ index 0000000..e034c34
 +
 +/** One provider's cell. A provider with no session reading shows `—` and never affects the other. */
 +export function quotaCell(provider: QuotaProvider | undefined, id: QuotaProviderId, nowMs: number): QuotaCell {
-+  const name = FULL[id];
++  const name = providerName(id);
 +  const session = provider?.session ?? null;
 +  if (session === null) {
 +    return { id, text: "—", tone: "muted", stale: false, label: `${name}: no quota reading` };
@@ -612,12 +859,13 @@ index 0000000..e034c34
 +  };
 +}
 +
-+export function quotaCells(snapshot: QuotaSnapshot, nowMs: number): QuotaCell[] {
-+  return QUOTA_PROVIDERS.map((id) =>
-+    quotaCell(
-+      snapshot.providers.find((provider) => provider.id === id),
-+      id,
-+      nowMs,
-+    ),
++/** The providers of the snapshot, in pill order. A provider the file does not have is not shown. */
++export function quotaProviders(snapshot: QuotaSnapshot): QuotaProvider[] {
++  return sortProviderIds(snapshot.providers.map((provider) => provider.id)).map(
++    (id) => snapshot.providers.find((provider) => provider.id === id)!,
 +  );
++}
++
++export function quotaCells(snapshot: QuotaSnapshot, nowMs: number): QuotaCell[] {
++  return quotaProviders(snapshot).map((provider) => quotaCell(provider, provider.id, nowMs));
 +}

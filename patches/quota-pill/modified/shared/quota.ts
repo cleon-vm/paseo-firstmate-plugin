@@ -8,14 +8,54 @@
 import { defineRpc } from "@getpaseo/plugin";
 import { z } from "zod";
 
-export const QUOTA_PROVIDERS = ["codex", "claude"] as const;
-export type QuotaProviderId = (typeof QUOTA_PROVIDERS)[number];
+/**
+ * Providers with their own name, icon and stale window, in pill order. Any
+ * other provider in Usage Monitor's readings is shown too, after these and
+ * alphabetically, with a name from its id, a neutral icon and the default
+ * stale window.
+ */
+export const KNOWN_QUOTA_PROVIDERS = ["codex", "claude"] as const;
+export type KnownQuotaProviderId = (typeof KNOWN_QUOTA_PROVIDERS)[number];
+/** A key of Usage Monitor's readings file that passed `isQuotaProviderId`. */
+export type QuotaProviderId = string;
+
+/** The readings file's keys are short slugs; anything past this is not one. */
+export const MAX_PROVIDER_ID = 40;
+
+/** Non-empty, at most `MAX_PROVIDER_ID` long, no surrounding whitespace and no control characters. */
+export function isQuotaProviderId(value: unknown): value is QuotaProviderId {
+  return (
+    typeof value === "string" &&
+    value !== "" &&
+    value.length <= MAX_PROVIDER_ID &&
+    value.trim() === value &&
+    !/[\u0000-\u001f\u007f]/.test(value)
+  );
+}
+
+export function isKnownQuotaProvider(id: QuotaProviderId): id is KnownQuotaProviderId {
+  return (KNOWN_QUOTA_PROVIDERS as readonly string[]).includes(id);
+}
+
+/** Known providers first in their own order, then the rest alphabetically; duplicates dropped. */
+export function sortProviderIds(ids: Iterable<QuotaProviderId>): QuotaProviderId[] {
+  const unique = [...new Set(ids)];
+  const known = KNOWN_QUOTA_PROVIDERS.filter((id) => unique.includes(id));
+  const rest = unique.filter((id) => !isKnownQuotaProvider(id)).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return [...known, ...rest];
+}
 
 /** Past this age a reading is shown as stale, with its age. Claude's source is polled slowly on purpose. */
-export const STALE_AFTER_MS: Record<QuotaProviderId, number> = {
+export const STALE_AFTER_MS: Record<KnownQuotaProviderId, number> = {
   codex: 10 * 60 * 1000,
   claude: 45 * 60 * 1000,
 };
+/** The stale window of a provider without its own. */
+export const DEFAULT_STALE_AFTER_MS = 10 * 60 * 1000;
+
+export function staleAfterMs(id: QuotaProviderId): number {
+  return isKnownQuotaProvider(id) ? STALE_AFTER_MS[id] : DEFAULT_STALE_AFTER_MS;
+}
 
 export const QuotaWindowSchema = z.object({
   usedPercent: z.number().min(0).max(100),
@@ -24,14 +64,14 @@ export const QuotaWindowSchema = z.object({
 });
 
 export const QuotaProviderSchema = z.object({
-  id: z.enum(QUOTA_PROVIDERS),
+  id: z.string().min(1).max(MAX_PROVIDER_ID).refine(isQuotaProviderId),
   session: QuotaWindowSchema.nullable(),
   weekly: QuotaWindowSchema.nullable(),
   fetchedAt: z.string().nullable(),
 });
 
 export const QuotaSnapshotSchema = z.object({
-  /** `unavailable` is a missing, oversized or malformed file; a provider absent from a good file is just empty. */
+  /** `unavailable` is a missing, oversized or malformed file; a good file lists exactly the providers it has, sorted. */
   state: z.enum(["ok", "unavailable"]),
   providers: z.array(QuotaProviderSchema),
 });
@@ -49,10 +89,13 @@ export const readQuota = defineRpc({
 export const QUOTA_QUERY_KEY = ["firstmate", "quota"] as const;
 export const QUOTA_POLL_MS = 60_000;
 
-const FULL: Record<QuotaProviderId, string> = { codex: "Codex", claude: "Claude" };
+const FULL: Record<KnownQuotaProviderId, string> = { codex: "Codex", claude: "Claude" };
 
+/** `Codex`, `Claude`; any other id title-cased from its words, `opencode-go` to `Opencode Go`. */
 export function providerName(id: QuotaProviderId): string {
-  return FULL[id];
+  if (isKnownQuotaProvider(id)) return FULL[id];
+  const words = id.split(/[-_.\s]+/).filter((word) => word !== "");
+  return words.length === 0 ? id : words.map((word) => word[0]!.toUpperCase() + word.slice(1)).join(" ");
 }
 
 /** Milliseconds since the reading, or null when it has none or its time is unreadable. */
@@ -65,7 +108,7 @@ export function ageMs(fetchedAt: string | null, nowMs: number): number | null {
 
 export function isStale(id: QuotaProviderId, fetchedAt: string | null, nowMs: number): boolean {
   const age = ageMs(fetchedAt, nowMs);
-  return age !== null && age > STALE_AFTER_MS[id];
+  return age !== null && age > staleAfterMs(id);
 }
 
 /** `just now`, `5m`, `2h`, `3d`. */
@@ -105,7 +148,7 @@ export function freshnessWords(id: QuotaProviderId, fetchedAt: string | null, no
 
 /** One provider's cell. A provider with no session reading shows `—` and never affects the other. */
 export function quotaCell(provider: QuotaProvider | undefined, id: QuotaProviderId, nowMs: number): QuotaCell {
-  const name = FULL[id];
+  const name = providerName(id);
   const session = provider?.session ?? null;
   if (session === null) {
     return { id, text: "—", tone: "muted", stale: false, label: `${name}: no quota reading` };
@@ -124,12 +167,13 @@ export function quotaCell(provider: QuotaProvider | undefined, id: QuotaProvider
   };
 }
 
-export function quotaCells(snapshot: QuotaSnapshot, nowMs: number): QuotaCell[] {
-  return QUOTA_PROVIDERS.map((id) =>
-    quotaCell(
-      snapshot.providers.find((provider) => provider.id === id),
-      id,
-      nowMs,
-    ),
+/** The providers of the snapshot, in pill order. A provider the file does not have is not shown. */
+export function quotaProviders(snapshot: QuotaSnapshot): QuotaProvider[] {
+  return sortProviderIds(snapshot.providers.map((provider) => provider.id)).map(
+    (id) => snapshot.providers.find((provider) => provider.id === id)!,
   );
+}
+
+export function quotaCells(snapshot: QuotaSnapshot, nowMs: number): QuotaCell[] {
+  return quotaProviders(snapshot).map((provider) => quotaCell(provider, provider.id, nowMs));
 }
