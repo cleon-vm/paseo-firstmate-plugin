@@ -16,6 +16,7 @@ import { formatBytes } from "./attachments";
 import { errorText } from "./format";
 import { fittedSize, stepZoom, zoomLabel, type Zoom } from "./image-zoom";
 import { IconButton } from "./ui";
+import { FONT_SIZE, lineHeightFor } from "./type-scale";
 
 type Size = { width: number; height: number };
 
@@ -101,12 +102,12 @@ export function ImageViewer({
         borderBottomWidth: 1,
         borderBottomColor: colors.border,
       },
-      facts: { flex: 1, minWidth: 120, color: colors.foregroundMuted, fontSize: 11 },
-      zoom: { minWidth: 40, textAlign: "center" as const, color: colors.foreground, fontSize: 12 },
+      facts: { flex: 1, minWidth: 120, color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
+      zoom: { minWidth: 40, textAlign: "center" as const, color: colors.foreground, fontSize: FONT_SIZE.small },
       fitPane: { flex: 1, minHeight: 0, alignItems: "center" as const, justifyContent: "center" as const, padding: 12 },
       scroll: { flex: 1, minHeight: 0 },
       scrollContent: { padding: 12 },
-      muted: { color: colors.foregroundMuted, fontSize: 12, padding: 12, lineHeight: 17 },
+      muted: { color: colors.foregroundMuted, fontSize: FONT_SIZE.small, padding: 12, lineHeight: lineHeightFor(FONT_SIZE.small) },
       image: { backgroundColor: colors.surface1 },
     };
   }, [theme]);

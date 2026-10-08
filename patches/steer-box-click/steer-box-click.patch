@@ -160,7 +160,7 @@ index 0000000..c21f35f
 +  });
 +});
 diff --git a/original/client/card.tsx b/modified/client/card.tsx
-index 6e82a43..9b34b8b 100644
+index 140e843..c107e9a 100644
 --- a/original/client/card.tsx
 +++ b/modified/client/card.tsx
 @@ -1,12 +1,17 @@
@@ -187,15 +187,15 @@ index 6e82a43..9b34b8b 100644
   */
  import type { PluginTheme } from "@getpaseo/plugin";
  import { openExternalUrl, useRpc } from "@getpaseo/plugin/client";
-@@ -115,6 +120,7 @@ export function CrewCard({
+@@ -116,6 +121,7 @@ export function CrewCard({
          padding: compact ? 10 : 12,
          gap: 6,
        },
 +      header: { gap: 6 },
        titleRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 8 },
-       title: { flex: 1, color: colors.foreground, fontSize: 13, fontWeight: "600" as const },
-       meta: { color: colors.foregroundMuted, fontSize: 11 },
-@@ -171,64 +177,72 @@ export function CrewCard({
+       title: { flex: 1, color: colors.foreground, fontSize: FONT_SIZE.body, fontWeight: "600" as const },
+       meta: { color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
+@@ -172,64 +178,72 @@ export function CrewCard({
    ].filter((fact): fact is string => fact !== null && fact !== "");
  
    return (
@@ -323,7 +323,7 @@ index 6e82a43..9b34b8b 100644
  
        {expanded && agent !== null ? (
          <View style={styles.actions}>
-@@ -306,13 +320,6 @@ export function CrewCard({
+@@ -307,13 +321,6 @@ export function CrewCard({
            </View>
          </View>
        ) : null}

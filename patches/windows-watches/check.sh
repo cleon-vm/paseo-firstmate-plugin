@@ -1,25 +1,25 @@
 #!/bin/sh
-# Applies steer-box-click.patch to a scratch copy of original/ with the documented
+# Applies windows-watches.patch to a scratch copy of original/ with the documented
 # command and checks the result is byte-identical to modified/. original/ is
-# stock 0.3.4: no other overlay edits client/card.tsx.
+# stock 0.3.4.
 # Then checks each file in modified/: where a later overlay edits it, against
 # that overlay's original/ (its base); otherwise against the repository root
 # (line endings ignored there, since a Windows checkout may have CRLF).
 # Scratch is retained for inspection. Run from anywhere:
-# sh patches/steer-box-click/check.sh. Exits non-zero on failure.
+# sh patches/windows-watches/check.sh. Exits non-zero on failure.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 # Overlays applied after this one, in order.
-later="status-line-reads steer-notify"
+later="files-images notification-relay reveal-in-explorer chat-input-lag steer-box-click status-line-reads steer-notify"
 scratch=$(mktemp -d)
 cp -R "$here/original/." "$scratch/"
 cd "$scratch"
 # TMPDIR can be inside a checkout. Stop parent repository discovery so apply
 # treats scratch as standalone, rather than silently skipping every patch path.
 ceiling=$(dirname "$scratch")
-GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. --check "$here/steer-box-click.patch"
-GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. "$here/steer-box-click.patch"
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. --check "$here/windows-watches.patch"
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. "$here/windows-watches.patch"
 status=0
 cr=$(printf '\r')
 for file in $(cd "$here/modified" && find . -type f | sort); do

@@ -1,10 +1,12 @@
-# Notification relay (local patch to FirstMate 0.2.1)
+# Notification relay (local patch to FirstMate 0.3.4)
 
 | Files | Patch file |
 | --- | --- |
 | `client/transcript-rows.ts`, `index.server.ts`, `server/templates.ts`, `templates/data/charter.md`, `templates/messages/restart-note.md` modified; `server/crew-relay.ts`, `server/crew-relay.test.ts`, `templates/messages/crew-relay.md`, `crew-relay-dropped.md`, `crew-relay-earlier.md`, `crew-relay-permission.md` new | `notification-relay.patch` |
 
-`original/` holds the five files as they were before this patch (stock 0.2.1 plus the quota pill, Windows watches and files images patches, files images including the read-image fix); `modified/` holds every patched or new file.
+`original/` holds the five files as they were before this patch (stock 0.3.4 plus the quota pill, Windows watches and files images patches, files images including the read-image fix); `modified/` holds every patched or new file.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. Upstream 0.3.4 added durable suggestion dismissal: a `suggestionsDismissed` template name in `server/templates.ts`, and in the charter a row for `data/suggestions-dismissed.md` and a paragraph on reading it. Neither overlaps this patch's edits, so both are kept beside the relay's four template names and its §7 text; only the patch's context changed. The other three files were not changed upstream. On 0.3.4 the relay's tests pass, as extended later by the steer-notify overlay (45 in `server/crew-relay.test.ts`).
 
 **Order matters.** This patch is based on the tree with all three earlier patches applied (`index.server.ts` is touched by the quota pill and files images too). On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay. The relay does not touch the files the read-image fix changes, so it would also apply over the first files images version, but that tree does not load (the daemon refuses the `readImage` RPC name); make sure the fix is in first.
 
@@ -45,3 +47,7 @@ Then `paseo plugin reload firstmate`. If the check fails, compare the new files 
 git -c core.autocrlf=false apply -p2 --directory=. --reverse <repo>/patches/notification-relay/notification-relay.patch
 ```
 Then reload. `crew-relay.json` in the plugin's data folder can be deleted; nothing else reads it.
+
+## Verify the patch
+
+From the repository root (Git Bash on Windows, any POSIX shell elsewhere): `sh patches/notification-relay/check.sh`. It applies the patch to a scratch copy of `original/` with the command above and checks the result is byte-identical to `modified/`. It then checks each file against the repository root (line endings ignored there) or, where a later patch edits that file again, against that patch's `original/`. It prints `ok: ...` and exits 0, or names each differing file and exits 1; the scratch copy is kept for inspection. `.gitattributes` pins this folder to LF, so a CRLF checkout does not break the patch.

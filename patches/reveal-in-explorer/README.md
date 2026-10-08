@@ -1,10 +1,12 @@
-# Reveal in Explorer (local patch to FirstMate 0.2.1)
+# Reveal in Explorer (local patch to FirstMate 0.3.4)
 
 | Files | Patch file |
 | --- | --- |
 | `client/files.tsx`, `client/web.ts`, `index.server.ts`, `shared/files.ts` modified; `client/reveal.ts`, `client/reveal.test.ts`, `server/reveal.ts`, `server/reveal.test.ts` new | `reveal-in-explorer.patch` |
 
-`original/` holds the four files as they were before this patch (stock 0.2.1 plus the quota pill, Windows watches, files images with the read-image fix, and notification relay patches); `modified/` holds every patched or new file.
+`original/` holds the four files as they were before this patch (stock 0.3.4 plus the quota pill, Windows watches, files images with the read-image fix, and notification relay patches); `modified/` holds every patched or new file.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. On 0.3.4 the old patch failed first because files images was not yet re-cut under it; once it was, two hunks of `client/files.tsx` still met upstream's type scale: this patch's `./web` import sits next to upstream's new `./type-scale` import, and its menu styles follow `confirmText`, which upstream moved to `FONT_SIZE.small`. Both were merged by hand keeping both. The menu's text now uses upstream's roles, the way upstream moved its text one step up: its items are `body` (was 13) and its note `caption` with `lineHeightFor` (was 11 on 15). The toolbar's Reveal and Copy path are `IconButton`s, which upstream already sizes. `client/web.ts`, `index.server.ts` and `shared/files.ts` were not changed upstream. On 0.3.4 the 32 tests pass (24 server, 8 client).
 
 **Order matters.** This patch is based on the tree with all four earlier patches applied (`client/files.tsx`, `shared/files.ts` and `index.server.ts` are touched by files images, and `index.server.ts` by the quota pill and the relay too). On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer.
 
@@ -43,3 +45,7 @@ Then `paseo plugin reload firstmate`. If the check fails, compare the new files 
 git -c core.autocrlf=false apply --reverse <repo>/patches/reveal-in-explorer/reveal-in-explorer.patch
 ```
 Or copy `original/*` back into `$P` and delete `client/reveal.ts`, `client/reveal.test.ts`, `server/reveal.ts` and `server/reveal.test.ts`. Then reload. The patch stores nothing.
+
+## Verify the patch
+
+From the repository root (Git Bash on Windows, any POSIX shell elsewhere): `sh patches/reveal-in-explorer/check.sh`. It applies the patch to a scratch copy of `original/` with the command above and checks the result is byte-identical to `modified/`. It then checks each file against the repository root (line endings ignored there) or, where a later patch edits that file again, against that patch's `original/`. It prints `ok: ...` and exits 0, or names each differing file and exits 1; the scratch copy is kept for inspection. `.gitattributes` pins this folder to LF, so a CRLF checkout does not break the patch.

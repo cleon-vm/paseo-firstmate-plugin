@@ -1,10 +1,12 @@
-# Chat input lag (local patch to FirstMate 0.2.1)
+# Chat input lag (local patch to FirstMate 0.3.4)
 
 | Files | Patch file |
 | --- | --- |
 | `client/chat.tsx` modified; `client/chat.test.ts` new | `chat-input-lag.patch` |
 
-`original/` holds the chat before this patch (stock 0.2.1 plus the five earlier local patches); `modified/` holds the patched chat and its regression test. The test snapshot is named `client/chat.test.ts.txt` so Vitest does not collect the incomplete archival tree; remove `.txt` when copying it back. Base commit: `6d5736b`. Apply after reveal in explorer; the quota pill also edits the chat. The package stays at **0.2.1** and upstream's README/CHANGELOG stay unchanged; this document is the local version note.
+`original/` holds the chat before this patch (stock 0.3.4 plus the five earlier local patches, of which only the quota pill edits the chat); `modified/` holds the patched chat and its regression test. The test snapshot is named `client/chat.test.ts.txt` so Vitest does not collect the incomplete archival tree; remove `.txt` when copying it back. First cut on 0.2.1 at base commit `6d5736b`. Apply after reveal in explorer; the quota pill also edits the chat. The package version is upstream's (0.3.4) and upstream's README/CHANGELOG are upstream's text; this document is the local version note.
+
+**Re-cut on 0.3.4.** Upstream 0.3.3 moved the chat's styles to its type scale, away from this patch's hunks, so the old patch still applied to LF 0.3.4 files (it failed only from a CRLF checkout, now prevented by `.gitattributes`). The snapshots are re-cut so `original/` and `modified/` carry upstream's chat. The callback and memo edits are unchanged, and upstream's `FONT_SIZE` styles are kept: they live in `styles`, which `renderGroup` already lists as a dependency, so the memo still invalidates on a theme or compact change. Upstream has not adopted this fix. On 0.3.4 the four chat tests pass.
 
 **Problem.** The composer draft belongs to `MateChat`, alongside the transcript. Every character rebuilt all history Markdown and inline tokens even though the history had not changed. A 150-entry regression fixture renders 75 assistant Markdown rows per keystroke before the fix.
 
@@ -26,7 +28,7 @@ npm test -- --exclude 'patches/**'
 
 Four chat tests cover zero renders/tokenization while typing, new replies and streaming tails, history replacement/order, URL/file links and callback replacement, theme/compact styles, folded-tool expansion and streaming status. The real chat, timeline hook, draft stores and Markdown renderer execute; daemon/query/native-host boundaries use fixtures. The renderer's deprecation warning is nonfatal; timings are not production latency measurements.
 
-All 151 active tests and the focused TypeScript check pass. Unfiltered `npm test` already fails on incomplete historical copies in `patches/`; those are patch records rather than independent modules. `npm run typecheck` already lacks a `tsconfig.json`; `npm run lint` already lacks a script. No CI workflow exists in this copy. No installed plugin was changed or reloaded, and no live performance recording was taken.
+All 151 active tests and the focused TypeScript check passed on the 0.2.1 cut; on the 0.3.4 re-cut all 195 active tests and the focused check pass. Unfiltered `npm test` already fails on incomplete historical copies in `patches/`; those are patch records rather than independent modules. `npm run typecheck` already lacks a `tsconfig.json`; `npm run lint` already lacks a script. No CI workflow exists in this copy. No installed plugin was changed or reloaded, and no live performance recording was taken.
 
 ## Reapply after an npm update
 
@@ -61,3 +63,7 @@ git -c core.autocrlf=false apply --reverse <repo>/patches/chat-input-lag/chat-in
 ```
 
 Or restore `original/client/chat.tsx` and remove `client/chat.test.ts`, then reload. No stored data changes.
+
+## Verify the patch
+
+From the repository root (Git Bash on Windows, any POSIX shell elsewhere): `sh patches/chat-input-lag/check.sh`. It applies the patch to a scratch copy of `original/` with the command above and checks the result is byte-identical to `modified/`. It then checks each file against the repository root (line endings ignored there) or, where a later patch edits that file again, against that patch's `original/`. It prints `ok: ...` and exits 0, or names each differing file and exits 1; the scratch copy is kept for inspection. `.gitattributes` pins this folder to LF, so a CRLF checkout does not break the patch.

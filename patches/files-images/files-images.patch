@@ -95,7 +95,7 @@ index bc9d5d5..b08273e 100644
   * Every path `source` mentions that could be linked, once per mention, in
   * order. Only the text the renderer draws inline is walked, so a path in a
 diff --git a/client/files.tsx b/client/files.tsx
-index 34a091a..918510a 100644
+index 90663a8..05ae50b 100644
 --- a/client/files.tsx
 +++ b/client/files.tsx
 @@ -1,7 +1,9 @@
@@ -124,9 +124,9 @@ index 34a091a..918510a 100644
 -import { isDirty, markSaved, type OpenFile } from "./open-file";
 +import { isDirty, markSaved, openedImage, type OpenFile } from "./open-file";
  import { Banner, IconButton, MONOSPACE, errorText } from "./ui";
+ import { FONT_SIZE, lineHeightFor } from "./type-scale";
  
- interface FilesMemory {
-@@ -78,6 +82,7 @@ export function FilesView({
+@@ -79,6 +83,7 @@ export function FilesView({
  }) {
    const list = useRpc(listHomeFiles);
    const read = useRpc(readHomeFile);
@@ -134,7 +134,7 @@ index 34a091a..918510a 100644
    const write = useRpc(writeHomeFile);
    const toast = useToast();
    const queryClient = useQueryClient();
-@@ -122,9 +127,17 @@ export function FilesView({
+@@ -123,9 +128,17 @@ export function FilesView({
      else action();
    }
  
@@ -153,7 +153,7 @@ index 34a091a..918510a 100644
      read({ path })
        .then((result) => {
          if (result.content === null) {
-@@ -188,9 +201,12 @@ export function FilesView({
+@@ -189,9 +202,12 @@ export function FilesView({
    // The first mate changed the open file on disk. Unedited, it is simply
    // reloaded; edited, the captain is told and chooses.
    const onDisk = listing.data?.entries.find((entry) => open !== null && entry.path === open.path);
@@ -168,7 +168,7 @@ index 34a091a..918510a 100644
      // Keyed on the change alone: `load` and `open` are new every render, and
      // listing them would reload on every keystroke.
    }, [changedOnDisk, dirty]);
-@@ -365,7 +381,15 @@ export function FilesView({
+@@ -366,7 +382,15 @@ export function FilesView({
              }
            >
              <Icon
@@ -185,7 +185,7 @@ index 34a091a..918510a 100644
                size={14}
                color={entry.kind === "dir" ? theme.colors.accent : theme.colors.foregroundMuted}
              />
-@@ -433,10 +457,33 @@ export function FilesView({
+@@ -434,10 +458,33 @@ export function FilesView({
        <Text style={styles.muted}>
          {open.reason === "binary"
            ? `${open.path} is not a text file, so it is not shown here.`
@@ -220,15 +220,15 @@ index 34a091a..918510a 100644
      editorBody = (
        <ScrollView contentContainerStyle={styles.preview}>
          <Markdown
-@@ -444,6 +491,7 @@ export function FilesView({
+@@ -445,6 +492,7 @@ export function FilesView({
            theme={theme}
-           fontSize={14}
+           fontSize={FONT_SIZE.content}
            onOpenLink={(url) => void openExternalUrl(url).catch((caught: unknown) => toast.error(errorText(caught)))}
 +          images={images}
          />
        </ScrollView>
      );
-@@ -492,7 +540,9 @@ export function FilesView({
+@@ -493,7 +541,9 @@ export function FilesView({
                  {open.path}
                </Text>
                <Text style={styles.editorStatus} numberOfLines={1}>
@@ -239,7 +239,7 @@ index 34a091a..918510a 100644
                    ? ""
                    : dirty
                      ? "Unsaved changes"
-@@ -507,12 +557,30 @@ export function FilesView({
+@@ -508,12 +558,30 @@ export function FilesView({
                    onPress={() => setPreview(!preview)}
                  />
                ) : null}
@@ -271,7 +271,7 @@ index 34a091a..918510a 100644
                />
                {open.kind === "text" ? (
                  <IconButton
-@@ -548,7 +616,7 @@ export function FilesView({
+@@ -549,7 +617,7 @@ export function FilesView({
                theme={theme}
                tone="warning"
                text="This file changed on disk while you were editing it — the first mate may have written it."
@@ -282,10 +282,10 @@ index 34a091a..918510a 100644
            {error === null ? null : (
 diff --git a/client/image-view.tsx b/client/image-view.tsx
 new file mode 100644
-index 0000000..07ecb06
+index 0000000..b1184a9
 --- /dev/null
 +++ b/client/image-view.tsx
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,266 @@
 +/**
 + * Images from the first mate's home, drawn: the Files view's viewer for an
 + * open image, and an image a Markdown preview names.
@@ -304,6 +304,7 @@ index 0000000..07ecb06
 +import { errorText } from "./format";
 +import { fittedSize, stepZoom, zoomLabel, type Zoom } from "./image-zoom";
 +import { IconButton } from "./ui";
++import { FONT_SIZE, lineHeightFor } from "./type-scale";
 +
 +type Size = { width: number; height: number };
 +
@@ -389,12 +390,12 @@ index 0000000..07ecb06
 +        borderBottomWidth: 1,
 +        borderBottomColor: colors.border,
 +      },
-+      facts: { flex: 1, minWidth: 120, color: colors.foregroundMuted, fontSize: 11 },
-+      zoom: { minWidth: 40, textAlign: "center" as const, color: colors.foreground, fontSize: 12 },
++      facts: { flex: 1, minWidth: 120, color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
++      zoom: { minWidth: 40, textAlign: "center" as const, color: colors.foreground, fontSize: FONT_SIZE.small },
 +      fitPane: { flex: 1, minHeight: 0, alignItems: "center" as const, justifyContent: "center" as const, padding: 12 },
 +      scroll: { flex: 1, minHeight: 0 },
 +      scrollContent: { padding: 12 },
-+      muted: { color: colors.foregroundMuted, fontSize: 12, padding: 12, lineHeight: 17 },
++      muted: { color: colors.foregroundMuted, fontSize: FONT_SIZE.small, padding: 12, lineHeight: lineHeightFor(FONT_SIZE.small) },
 +      image: { backgroundColor: colors.surface1 },
 +    };
 +  }, [theme]);
@@ -796,7 +797,7 @@ index 0000000..7712bad
 +  });
 +});
 diff --git a/client/markdown.tsx b/client/markdown.tsx
-index b424b2a..3e09af6 100644
+index 99baa9c..53ce9c5 100644
 --- a/client/markdown.tsx
 +++ b/client/markdown.tsx
 @@ -11,6 +11,11 @@
@@ -820,8 +821,8 @@ index b424b2a..3e09af6 100644
 +import { MarkdownImage, type MarkdownImages } from "./image-view";
  import { parseMarkdown, type Block } from "./markdown-parse";
  import { MONOSPACE } from "./ui";
- 
-@@ -84,15 +90,75 @@ interface InlineContext {
+ import { FONT_SIZE, lineHeightFor } from "./type-scale";
+@@ -85,15 +91,75 @@ interface InlineContext {
    lookup: FileLookup;
    onOpenLink: (url: string) => void;
    onOpenFile: ((path: string) => void) | null;
@@ -899,7 +900,7 @@ index b424b2a..3e09af6 100644
      switch (token.kind) {
        case "text":
          return token.text;
-@@ -120,6 +186,9 @@ function renderInline(text: string, styles: MarkdownStyles, context: InlineConte
+@@ -121,6 +187,9 @@ function renderInline(text: string, styles: MarkdownStyles, context: InlineConte
              {token.text}
            </Text>
          );
@@ -909,7 +910,7 @@ index b424b2a..3e09af6 100644
        default:
          return (
            <Text key={index} accessibilityRole="link" style={styles.link} onPress={() => context.onOpenLink(token.url)}>
-@@ -145,7 +214,11 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
+@@ -146,7 +215,11 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
              {block.items.map((item, itemIndex) => (
                <View key={itemIndex} style={[styles.listRow, { paddingLeft: item.depth * 14 }]}>
                  <Text style={styles.listMarker}>{item.marker}</Text>
@@ -922,7 +923,7 @@ index b424b2a..3e09af6 100644
                </View>
              ))}
            </View>
-@@ -173,9 +246,13 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
+@@ -174,9 +247,13 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
                <View key={rowIndex} style={styles.tableRow}>
                  {cells.map((cell, cellIndex) => (
                    <View key={cellIndex} style={styles.tableCell}>
@@ -939,7 +940,7 @@ index b424b2a..3e09af6 100644
                    </View>
                  ))}
                </View>
-@@ -183,6 +260,7 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
+@@ -184,6 +261,7 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
            </View>
          );
        default:
@@ -947,7 +948,7 @@ index b424b2a..3e09af6 100644
          return (
            <Text key={index} selectable style={styles.paragraph}>
              {renderInline(block.text, styles, context)}
-@@ -199,6 +277,7 @@ export function Markdown({
+@@ -200,6 +278,7 @@ export function Markdown({
    onOpenLink,
    files = noFiles,
    onOpenFile = null,
@@ -955,7 +956,7 @@ index b424b2a..3e09af6 100644
  }: {
    source: string;
    theme: PluginTheme;
-@@ -207,8 +286,14 @@ export function Markdown({
+@@ -208,8 +287,14 @@ export function Markdown({
    /** Which paths the text names are files in the home — see `./file-links`; none without `onOpenFile`. */
    files?: FileLookup;
    onOpenFile?: ((path: string) => void) | null;

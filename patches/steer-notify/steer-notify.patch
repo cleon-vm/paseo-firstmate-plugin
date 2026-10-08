@@ -788,10 +788,10 @@ index 54a11b7..0acdbd7 100644
    });
  }
 diff --git a/server/templates.ts b/server/templates.ts
-index 274f32a..3db0faa 100644
+index e11b991..c0fab2a 100644
 --- a/server/templates.ts
 +++ b/server/templates.ts
-@@ -47,11 +47,13 @@ export const TEMPLATES = {
+@@ -48,11 +48,13 @@ export const TEMPLATES = {
    crewRelayDropped: "messages/crew-relay-dropped.md",
    crewRelayEarlier: "messages/crew-relay-earlier.md",
    crewRelayPermission: "messages/crew-relay-permission.md",
@@ -806,10 +806,10 @@ index 274f32a..3db0faa 100644
    watchFailed: "messages/watch-failed.md",
    watchDropped: "messages/watch-dropped.md",
 diff --git a/templates/data/charter.md b/templates/data/charter.md
-index 5b57175..52136d6 100644
+index 6d4be84..c27e2b6 100644
 --- a/templates/data/charter.md
 +++ b/templates/data/charter.md
-@@ -324,12 +324,14 @@ Nothing needs you to poll. What wakes you:
+@@ -332,12 +332,14 @@ Nothing needs you to poll. What wakes you:
    status line — and, for a permission, the request to answer. Paseo sends it once per prompt, and only
    when `notifyOnFinish` was on, so keep it on for every `create_agent` and `send_agent_prompt`.
  - **A `<firstmate-crew>` note from FirstMate** — the same note, for a crewmate whose creator is gone, such
