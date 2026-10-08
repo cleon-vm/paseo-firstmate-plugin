@@ -47,7 +47,6 @@ export const TEMPLATES = {
   crewRelayDropped: "messages/crew-relay-dropped.md",
   crewRelayEarlier: "messages/crew-relay-earlier.md",
   crewRelayPermission: "messages/crew-relay-permission.md",
-  crewRelaySteered: "messages/crew-relay-steered.md",
   relaunch: "messages/relaunch.md",
   restartNote: "messages/restart-note.md",
   steerRelay: "messages/steer-relay.md",

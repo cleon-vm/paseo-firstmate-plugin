@@ -1,12 +1,12 @@
 # Local changes
 
-This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.2.1**, taken from the npm package, with eight local patches applied. It is not a fork and nothing here has been sent upstream.
+This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.2.1**, taken from the npm package, with nine local patches applied. It is not a fork and nothing here has been sent upstream.
 
 - Upstream: https://github.com/gpambrozio/paseo-plugins (monorepo, plugin in `firstmate/`)
 - The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the seven patches below and the status-report overlay are local.
 - `README.md` and `CHANGELOG.md` are upstream's; `README.md` also has install instructions for this repository and a note on the patches.
 
-Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.2.1 plus all eight patches, including the steer-box and status-report overlays. The package version remains 0.2.1; each patch README records its local version note.
+Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.2.1 plus all nine patches, including the steer-box, status-report and steer-notify overlays. The package version remains 0.2.1; each patch README records its local version note.
 
 ## The patches
 
@@ -20,7 +20,7 @@ Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattribu
 | Chat input lag | Keeps composer keystrokes from rebuilding the history Markdown and inline tokens by stabilizing history callbacks and memoizing the history JSX. Includes a render-count regression and history/link/streaming invalidation checks. | modified `client/chat.tsx`; new `client/chat.test.ts` | [patches/chat-input-lag/README.md](patches/chat-input-lag/README.md) |
 | Steer box click | Only a card's header (title and summary) toggles it open and closed; the action buttons and the steer box sit outside that pressable, so a click in the box no longer folds the card and hides the box. | modified `client/card.tsx`; new `client/card.test.ts` | [patches/steer-box-click/README.md](patches/steer-box-click/README.md) |
 
-The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it) and `modified/` (every patched or new file).
+The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay, steer-notify overlay. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it) and `modified/` (every patched or new file).
 
 ## Status-report fix after the seven patches
 
@@ -38,6 +38,23 @@ The quota pill check also bounds parent repository discovery for its scratch
 apply commands. This fixes silent patch skipping when TMPDIR is inside a
 checkout; its patch snapshots and root-comparison exclusions are unchanged.
 
+## Steer notify after the status-report fix
+
+The [steer-notify overlay](patches/steer-notify/README.md) is local too. It tells
+the first mate about a steer from the board at once, with the captain's words.
+From then on it relays that crewmate's turn ends, errors and permission requests
+through the notification relay, deduplicated against what Paseo already tells the
+first mate. It records changes to `index.server.ts`, `server/crew.ts`,
+`server/crew-relay.ts` and its test, `server/templates.ts`, the charter, and the
+steer-relay templates. It also adds `templates/messages/crew-relay-steered.md`.
+Its `original/` captures those files after the status-report overlay. Apply it
+after that overlay and undo it before. The status-report check no longer compares
+`index.server.ts` with the root, because this overlay changes that file.
+
+The steered crewmates are kept with the relay's queue in
+`plugin-data/firstmate/crew-relay.json`. It adds no package dependency and leaves
+the Paseo requirement at `>=0.9.0`.
+
 ## Where the plugin lives
 
 The installed copy (`$P`) is under the Paseo plugins folder:
@@ -50,7 +67,7 @@ The `<install-id>` folder can change on reinstall; use the current one.
 
 ## Reapply after an upstream / npm update
 
-An npm update of the plugin overwrites `$P` and drops all eight patches. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
+An npm update of the plugin overwrites `$P` and drops all nine patches. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
 
 ```
 git -c core.autocrlf=false apply -p2 --directory=. --check <repo>/patches/quota-pill/quota-pill.patch
@@ -99,6 +116,13 @@ git -c core.autocrlf=false apply --check <repo>/patches/status-line-reads/status
 git -c core.autocrlf=false apply <repo>/patches/status-line-reads/status-line-reads.patch
 ```
 
+Then the steer-notify overlay (plain paths), checking first:
+
+```
+git -c core.autocrlf=false apply --check <repo>/patches/steer-notify/steer-notify.patch
+git -c core.autocrlf=false apply <repo>/patches/steer-notify/steer-notify.patch
+```
+
 Then `paseo plugin reload firstmate`. To install this repository over the npm source instead, from a clone at `<plugin-dir>`, remove FirstMate, then install the directory with its existing ID and reload:
 
 ```
@@ -124,6 +148,7 @@ paseo plugin reload firstmate
 Or undo the patches in place from `$P`, newest first:
 
 ```
+git -c core.autocrlf=false apply --reverse <repo>/patches/steer-notify/steer-notify.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/status-line-reads/status-line-reads.patch
 git -c core.autocrlf=false apply -p2 --directory=. --reverse <repo>/patches/steer-box-click/steer-box-click.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/chat-input-lag/chat-input-lag.patch
