@@ -40,15 +40,23 @@ Now:
 A crewmate the captain types into in its own Paseo tab is not covered. The plugin's
 `agent.turn_started` hook does not say who started a turn.
 
-`original/` holds the ten files it changes as they were before this overlay (`index.server.ts` is the
+`original/` holds the nine files it changes as they were before this overlay (`index.server.ts` is the
 status-report overlay's result; `crew-relay*`, `templates.ts` and `charter.md` are the notification
-relay's; the rest are stock 0.2.1). `modified/` holds all eleven after it, including the new
+relay's; the rest are stock 0.3.4). `modified/` holds all eleven after it, including the new
 `templates/messages/crew-relay-steered.md` and `templates/messages/steer-relay-unsaved.md`. `steer-notify.patch` reproduces that snapshot.
 
-Run `sh patches/steer-notify/check.sh` to check reproduction, the base, and all eleven root files. Set
+Run `sh patches/steer-notify/check.sh` to check reproduction and all eleven root files. Set
 TMPDIR to an allowed temporary directory; the check keeps its scratch copy for inspection. Because
-this overlay edits `index.server.ts` later, the status-report check no longer compares that file
-with the root. This check compares its `original/index.server.ts` with that overlay's `modified/`.
+this overlay edits `index.server.ts` later, the status-report check compares that file with this
+overlay's `original/` instead of the root.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. Upstream 0.3.4's durable suggestion dismissal adds a
+`suggestionsDismissed` template name to `server/templates.ts` and a file row and a paragraph to the
+charter, away from this overlay's edits. They are in `original/` and kept in `modified/`; only the
+patch's context changed. `index.server.ts`, `server/crew.ts`, the relay and the steer-relay templates
+were not changed upstream. Upstream's `server/send.ts` now passes `activeTurnBehavior: "steer"`
+through the released typed SDK; it does not tell the first mate about a steer, so this overlay is still needed.
+On 0.3.4 the 45 tests in `server/crew-relay.test.ts` pass.
 
 Check and apply from the plugin directory:
 
@@ -84,5 +92,5 @@ nine pass. They cover:
 - the steer saved before the worker gets the words, and the queue saved without a note before the
   first mate gets it. These two fail if either save is moved after its send.
 
-No version bump and no dependency change. After merge, deploy with
-`paseo plugin update firstmate`.
+No dependency change of its own. After merge, deploy with `paseo plugin update firstmate`, on Paseo
+0.11.0 or newer.
