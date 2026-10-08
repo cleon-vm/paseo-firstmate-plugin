@@ -10,7 +10,7 @@ the captain.
 
 A **FirstMate** panel in the sidebar puts the conversation with the first mate beside a board of its
 crew — Queued, Working, Blocked, Parked, Done, Failed and Idle — with each worker's last word on what
-it is doing and a link to its pull request.
+it is doing and a link to its pull request. The sidebar row shows how many workers are working or idle.
 
 This is a Paseo-native take on [firstmate](https://github.com/kunchenguid/firstmate) by Kun Chen, by
 way of [ABorakati/paseo-firstmate](https://github.com/ABorakati/paseo-firstmate). Where those run the
@@ -34,7 +34,7 @@ hook. See [the status-report fix](patches/status-line-reads/README.md).
 
 ## What you need
 
-- Paseo **0.9.0 or newer**, on the daemon and on the device running the app.
+- Paseo **0.11 or newer**, on the daemon and on the device running the app.
 - **Paseo's agent tools turned on.** They are how the first mate starts its workers and hears back from
   them, and Paseo ships with them off. The panel says so and turns them on with one press; it is the
   *Agent tools* switch in the FirstMate settings too.
@@ -112,8 +112,12 @@ writes into the first mate's home — its charter, the records it starts with, t
   loop on web#42"), it shows as a button: on a wide screen in a card before the board's columns, on a
   phone in a Suggestions tab after First mate. Pressing one sends that request to the first mate right
   away, just as if you had typed it and pressed Send, and brings the chat into view so you see it go
-  out; anything you were typing stays in the message box. The trash button beside a suggestion takes it
-  off the list without sending it. With no suggestions there is no card and no tab.
+  out; anything you were typing stays in the message box. A suggestion too long to show whole gets a
+  chevron that opens the full request below it, to read or copy, without sending it. The trash button
+  beside a suggestion takes it off the list without sending it, and FirstMate remembers that: the first
+  mate will not suggest it again, and the board hides it if it does. When something about it changes —
+  a new pull request, say — the first mate can suggest it again in new words, and that shows. With no
+  suggestions there is no card and no tab.
 
 ## The board
 
@@ -186,6 +190,9 @@ settings, and your choice is kept.
 - `data/backlog.md` — every task, in flight, queued and done. The board reads it.
 - `data/suggestions.md` — what the first mate thinks you will want next, one per line as
   `- <label> :: <what to send>`. The first mate keeps it up to date; the board turns it into buttons.
+- `data/suggestions-dismissed.md` — the suggestions you removed from the board, the newest 50. The
+  board hides any suggestion with the same words, and the first mate reads it before writing new ones.
+  Delete a line to let that suggestion show again.
 - `data/<task>/brief.md`, `data/<task>/report.md` — each worker's instructions, and an investigation's
   findings.
 - `watches/` — scripts FirstMate runs on a schedule; see below.

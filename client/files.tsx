@@ -35,6 +35,7 @@ import { Markdown } from "./markdown";
 import { isDirty, markSaved, openedImage, type OpenFile } from "./open-file";
 import { absolutePath, menuPosition, revealLabel } from "./reveal";
 import { Banner, IconButton, MONOSPACE, errorText } from "./ui";
+import { FONT_SIZE, lineHeightFor } from "./type-scale";
 import { contextMenuProps, type MenuPoint } from "./web";
 
 interface FilesMemory {
@@ -285,14 +286,14 @@ export function FilesView({
       },
       listHeader: { padding: 10, gap: 8, borderBottomWidth: 1, borderBottomColor: colors.border },
       crumbs: { flexDirection: "row" as const, flexWrap: "wrap" as const, alignItems: "center" as const, gap: 2 },
-      crumb: { color: colors.accent, fontSize: 12 },
-      crumbCurrent: { color: colors.foreground, fontSize: 12, fontWeight: "600" as const },
-      crumbSeparator: { color: colors.foregroundMuted, fontSize: 12 },
+      crumb: { color: colors.accent, fontSize: FONT_SIZE.small },
+      crumbCurrent: { color: colors.foreground, fontSize: FONT_SIZE.small, fontWeight: "600" as const },
+      crumbSeparator: { color: colors.foregroundMuted, fontSize: FONT_SIZE.small },
       headerRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
       newInput: {
         flex: 1,
         color: colors.foreground,
-        fontSize: 12,
+        fontSize: FONT_SIZE.small,
         borderWidth: 1,
         borderColor: colors.border,
         borderRadius: 6,
@@ -308,9 +309,9 @@ export function FilesView({
         paddingVertical: 7,
       },
       entryOpen: { backgroundColor: colors.surface2 },
-      entryName: { flex: 1, color: colors.foreground, fontSize: 13 },
-      entryMeta: { color: colors.foregroundMuted, fontSize: 11 },
-      muted: { color: colors.foregroundMuted, fontSize: 12, padding: 12, lineHeight: 17 },
+      entryName: { flex: 1, color: colors.foreground, fontSize: FONT_SIZE.body },
+      entryMeta: { color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
+      muted: { color: colors.foregroundMuted, fontSize: FONT_SIZE.small, padding: 12, lineHeight: lineHeightFor(FONT_SIZE.small) },
       editorPane: { flex: 1, minWidth: 0, minHeight: 0, backgroundColor: colors.surface0 },
       editorHeader: {
         flexDirection: "row" as const,
@@ -321,15 +322,15 @@ export function FilesView({
         borderBottomWidth: 1,
         borderBottomColor: colors.border,
       },
-      editorTitle: { flexShrink: 1, color: colors.foreground, fontSize: 13, fontFamily: MONOSPACE },
-      editorStatus: { flex: 1, color: colors.foregroundMuted, fontSize: 11 },
+      editorTitle: { flexShrink: 1, color: colors.foreground, fontSize: FONT_SIZE.code, fontFamily: MONOSPACE },
+      editorStatus: { flex: 1, color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
       notices: { paddingHorizontal: 10, paddingTop: 8, gap: 6 },
       editor: {
         flex: 1,
         color: colors.foreground,
         fontFamily: MONOSPACE,
-        fontSize: 13,
-        lineHeight: 19,
+        fontSize: FONT_SIZE.code,
+        lineHeight: lineHeightFor(FONT_SIZE.code),
         padding: 12,
         textAlignVertical: "top" as const,
         backgroundColor: colors.surface0,
@@ -347,7 +348,7 @@ export function FilesView({
         borderRadius: 8,
         backgroundColor: colors.surface1,
       },
-      confirmText: { flex: 1, minWidth: 160, color: colors.foreground, fontSize: 12 },
+      confirmText: { flex: 1, minWidth: 160, color: colors.foreground, fontSize: FONT_SIZE.small },
       menuBackdrop: { position: "absolute" as const, left: 0, right: 0, top: 0, bottom: 0 },
       menu: {
         position: "absolute" as const,
@@ -581,7 +582,7 @@ export function FilesView({
         <Markdown
           source={open.draft}
           theme={theme}
-          fontSize={14}
+          fontSize={FONT_SIZE.content}
           onOpenLink={(url) => void openExternalUrl(url).catch((caught: unknown) => toast.error(errorText(caught)))}
           images={images}
         />

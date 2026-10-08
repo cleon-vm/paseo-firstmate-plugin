@@ -16,7 +16,7 @@
  * fleet, the compact tab and the crewmate being watched live in module scope
  * and the board comes back drawn rather than empty.
  */
-import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc, useSettings } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -46,6 +46,7 @@ import { useMateSender } from "./mate-send";
 import { ResizeHandle, clampShare } from "./resize-handle";
 import { SuggestionList } from "./suggestions";
 import { Banner, Chip, IconButton, Segmented, errorText } from "./ui";
+import { FONT_SIZE } from "./type-scale";
 
 export const FLEET_QUERY_KEY = ["firstmate", "fleet"] as const;
 
@@ -70,7 +71,10 @@ export function bindSettingsOpener(opener: ((id: string) => void) | null): void 
 const DEFAULT_DISPLAY: DisplaySettings = displaySettings.schema.parse({});
 const SAVE_DELAY_MS = 400;
 
-/** The fleet query, shared by the surface and the workspace panels so they poll once between them. */
+/**
+ * The fleet query, shared by the screen, the workspace panels and the sidebar item so they poll once
+ * between them.
+ */
 export function useFleet(pollSeconds: number) {
   const load = useRpc(loadFleet);
   return useQuery({
@@ -86,7 +90,7 @@ export function useFleet(pollSeconds: number) {
   });
 }
 
-export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) {
+export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
   const compact = layout.compact;
   const enable = useRpc(enableAgentTools);
   const compareCharters = useRpc(compareCharter);
@@ -219,9 +223,9 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
         borderBottomColor: colors.border,
       },
       headerRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8, flexWrap: "wrap" as const },
-      title: { color: colors.foreground, fontSize: compact ? 17 : 20, fontWeight: "600" as const },
+      title: { color: colors.foreground, fontSize: compact ? FONT_SIZE.heading : FONT_SIZE.display, fontWeight: "600" as const },
       spacer: { flex: 1 },
-      meta: { color: colors.foregroundMuted, fontSize: 12 },
+      meta: { color: colors.foregroundMuted, fontSize: FONT_SIZE.small },
       banners: { paddingHorizontal: compact ? 12 : 16, paddingTop: 8, gap: 6 },
       split: { flex: 1, minHeight: 0, flexDirection: "row" as const },
       rail: {
@@ -241,10 +245,10 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
       },
       tab: { flex: 1, paddingVertical: 7, alignItems: "center" as const },
       tabActive: { backgroundColor: colors.accent },
-      tabText: { color: colors.foreground, fontSize: 13 },
+      tabText: { color: colors.foreground, fontSize: FONT_SIZE.body },
       tabTextActive: { color: colors.accentForeground, fontWeight: "600" as const },
       suggestions: { padding: 10, paddingBottom: 24 },
-      loading: { color: colors.foregroundMuted, fontSize: 13, padding: 20 },
+      loading: { color: colors.foregroundMuted, fontSize: FONT_SIZE.body, padding: 20 },
     };
   }, [theme, compact]);
 
@@ -291,8 +295,9 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
   }
 
   /**
-   * A suggestion's trash: its line leaves the first mate's file, and the board takes the list the
-   * daemon answers with at once rather than waiting for the next load.
+   * A suggestion's trash: the daemon records it as dismissed and its line leaves the first mate's file,
+   * and the board takes the list the daemon answers with at once rather than waiting for the next load.
+   * Pressing a suggestion (`suggest`) never comes here, so sending one never dismisses it.
    */
   function dismissSuggestion(suggestion: Suggestion): Promise<void> {
     return removeSuggestions(suggestion)
