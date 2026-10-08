@@ -19,12 +19,18 @@ workers are ordinary Paseo agents you can open, read and type into like any othe
 manages, and Paseo itself tells the first mate when a worker finishes, fails or asks for permission.
 There is nothing else to install.
 
-This repository is a patched copy of FirstMate 0.2.1 from
+This repository is a patched copy of FirstMate 0.3.4 from
 [gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with nine local patches on
 top: a quota pill, Windows watches, images in the Files view, a notification relay after a restart,
 Reveal in explorer, fixes for chat typing lag and steer-box clicks, responsive
 status-report reads, and telling the first mate about a steer at once. [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
 describes each one and how to reapply or undo it.
+
+Moving from 0.2.1 to 0.3.4 brings upstream's sidebar crew count, folding long suggestions, its type
+scale (text a size up, at Paseo's default sizes) and suggestions that stay dismissed. It also **raises
+the Paseo requirement from 0.9.0 to 0.11.0**: 0.3.4 uses Paseo 0.11's plugin API and does not load on
+0.10 or older. On an older Paseo, install tag `v1.0.0` (`--ref v1.0.0`), which is 0.2.1 with the
+same patches.
 
 The board also keeps status reports in plugin storage, returns the last known
 report immediately, and refreshes stale reports in the background. Four timeline
