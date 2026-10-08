@@ -1,5 +1,5 @@
 diff --git a/original/client/chat.tsx b/modified/client/chat.tsx
-index 257e618..d07580c 100644
+index 348c0b1..365a428 100644
 --- a/original/client/chat.tsx
 +++ b/modified/client/chat.tsx
 @@ -30,6 +30,7 @@ import { MateControls } from "./mate-controls";
@@ -10,7 +10,7 @@ index 257e618..d07580c 100644
  import { transcriptRows, type TranscriptRow } from "./transcript-rows";
  import { IconButton, JumpToEnd, MONOSPACE, Spinner, errorText } from "./ui";
  import { useKeyboardOverlap } from "./keyboard";
-@@ -434,6 +435,7 @@ export function MateChat({
+@@ -435,6 +436,7 @@ export function MateChat({
                disabled={sending}
                onPress={() => sendCommand("ahoy")}
              />
@@ -109,10 +109,10 @@ index 0000000..b67efd9
 +});
 diff --git a/modified/client/quota-pill.tsx b/modified/client/quota-pill.tsx
 new file mode 100644
-index 0000000..5490cf2
+index 0000000..1130017
 --- /dev/null
 +++ b/modified/client/quota-pill.tsx
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,211 @@
 +/**
 + * Quota USED, beside the chat's Bearings and Ahoy buttons: an icon and the
 + * percent of the session (five-hour) window for each provider in Usage
@@ -141,6 +141,7 @@ index 0000000..5490cf2
 +  type QuotaWindow,
 +} from "../shared/quota";
 +import { QUOTA_LOGOS } from "../shared/quota-logos";
++import { FONT_SIZE } from "./type-scale";
 +
 +const ICON_SIZE = 14;
 +// One source object per provider: a new one each render makes the image reload.
@@ -240,7 +241,7 @@ index 0000000..5490cf2
 +        borderColor: colors.border,
 +        backgroundColor: colors.surface1,
 +      },
-+      text: { fontSize: 12, fontWeight: "500" as const },
++      text: { fontSize: FONT_SIZE.small, fontWeight: "500" as const },
 +      cell: { flexDirection: "row" as const, alignItems: "center" as const, gap: 4 },
 +      titleRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
 +      card: {
@@ -252,8 +253,8 @@ index 0000000..5490cf2
 +        borderColor: colors.border,
 +        backgroundColor: colors.surface1,
 +      },
-+      title: { color: colors.foreground, fontSize: 12, fontWeight: "600" as const },
-+      line: { color: colors.foregroundMuted, fontSize: 11 },
++      title: { color: colors.foreground, fontSize: FONT_SIZE.small, fontWeight: "600" as const },
++      line: { color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
 +    }),
 +    [colors],
 +  );

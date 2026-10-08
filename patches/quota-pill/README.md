@@ -1,4 +1,4 @@
-# Quota pill (local patch to FirstMate 0.2.1)
+# Quota pill (local patch to FirstMate 0.3.4)
 
 Adds an icon and percent for each provider Usage Monitor tracks, e.g. `[Codex] 32% · [Claude] 61%` (percent USED, session window) beside Bearings and Ahoy in the FirstMate chat. Tap it for a card with session and weekly use, reset times and freshness. Data is read from Usage Monitor's `~/.paseo/usage-limits/last-readings.json` by a new FirstMate daemon handler; no credentials are read and no vendor is called. Missing/invalid file: `Quota unavailable`.
 
@@ -8,7 +8,11 @@ Providers are the keys present in that file, not a fixed list, and Usage Monitor
 - Modified: `index.server.ts` (registers handler), `client/chat.tsx` (mounts pill after Ahoy)
 - New: `shared/quota-logos.ts` (Usage Monitor's Claude/Codex PNG marks, tinted from theme via `tintColor`; no react-native-svg or host provider-icon component exists for plugins), `shared/quota.ts`, `server/quota.ts`, `server/quota.test.ts`, `client/quota-pill.tsx`, `client/quota-pill.test.ts`
 
-`original/` holds the two stock files as shipped in 0.2.1; `modified/` holds every patched or new file.
+`original/` holds the two stock files as shipped in 0.3.4; `modified/` holds every patched or new file.
+
+**Type scale.** The pill and its card use upstream's `FONT_SIZE` roles (`client/type-scale.ts`, new in 0.3.3), the way upstream moved its own text one step up: the pill's text and the card's title are `small` (13, like the Bearings and Ahoy labels beside it and the context meter's title), the card's lines `caption` (12, like the context meter's detail). They were 12 and 11. The fallback icon's initial stays sized from the icon.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. Upstream 0.3.3 changed only `client/chat.tsx`'s font sizes, away from this patch's two lines, so the patch carried over unchanged apart from its context; the type-scale change above is the only new edit.
 
 ## Reapply after an npm update overwrites the plugin
 From a shell in the installed plugin directory (`$P`, see `LOCAL-CHANGES.md`):
@@ -25,7 +29,7 @@ From the repository root (Git Bash on Windows, any POSIX shell elsewhere):
 ```
 sh patches/quota-pill/check.sh
 ```
-It copies `original/` (stock 0.2.1, byte-identical to the npm package's `client/chat.tsx` and `index.server.ts`) to a scratch folder and runs the preflight above, then the apply. It then checks that every resulting file is byte-identical to `modified/`, and that the files this patch adds match the repository root, ignoring line endings there. `chat.tsx` and `index.server.ts` are not compared with the root, because later patches also edit them. It prints `ok: ...` and exits 0, or names each differing file and exits 1. To check against a real npm install instead, run the preflight above in a copy of `npm pack @gpambrozio/paseo-firstmate@0.2.1`'s `package/` folder.
+It copies `original/` (stock 0.3.4, byte-identical to the npm package's `client/chat.tsx` and `index.server.ts`) to a scratch folder and runs the preflight above, then the apply. It then checks that every resulting file is byte-identical to `modified/`, and that the files this patch adds match the repository root, ignoring line endings there. `chat.tsx` and `index.server.ts` are edited again by later patches, so they are compared with the `original/` of the next patch that edits them instead of the root. It prints `ok: ...` and exits 0, or names each differing file and exits 1. The scratch copy is kept for inspection. To check against a real npm install instead, run the preflight above in a copy of `npm pack @gpambrozio/paseo-firstmate@0.3.4`'s `package/` folder.
 
 ## Checks
-The installed copy has no dev dependencies, so `npm run typecheck`/`npm test` were not run there. In this repository `npm test -- --exclude 'patches/**'` runs `server/quota.test.ts` (21, synthetic fixtures) and `client/quota-pill.test.ts` (3, renders the pill); the client test needs the test-only `react-test-renderer`, installed without saving as in `patches/chat-input-lag/README.md`. Full typecheck is not possible without the host SDK types; only unresolved-module errors remain. Icon rendering not visually verified in the UI; a11y labels name each provider in words.
+The installed copy has no dev dependencies, so `npm run typecheck`/`npm test` were not run there. In this repository `npm test -- --exclude 'patches/**'` runs `server/quota.test.ts` (21, synthetic fixtures) and `client/quota-pill.test.ts` (3, renders the pill); the client test needs the test-only `react-test-renderer`, installed without saving as in `patches/chat-input-lag/README.md`. On the 0.3.4 re-cut both pass (21 and 3), and a focused `tsc --noEmit` over the sources, with the 0.11.0 SDK installed as dev dependencies, reports nothing in these files. Icon rendering not visually verified in the UI; a11y labels name each provider in words.
