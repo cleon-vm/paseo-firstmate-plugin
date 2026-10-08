@@ -1611,10 +1611,10 @@ index 0000000..2373b55
 +  };
 +}
 diff --git a/original/server/templates.ts b/modified/server/templates.ts
-index f35f5a4..274f32a 100644
+index b4abbba..e11b991 100644
 --- a/original/server/templates.ts
 +++ b/modified/server/templates.ts
-@@ -43,6 +43,10 @@ export const TEMPLATES = {
+@@ -44,6 +44,10 @@ export const TEMPLATES = {
    ahoyArgs: "messages/ahoy-args.md",
    bearings: "messages/bearings.md",
    bearingsArgs: "messages/bearings-args.md",
@@ -1626,10 +1626,10 @@ index f35f5a4..274f32a 100644
    restartNote: "messages/restart-note.md",
    steerRelay: "messages/steer-relay.md",
 diff --git a/original/templates/data/charter.md b/modified/templates/data/charter.md
-index 28827df..5b57175 100644
+index cd70ccd..6d4be84 100644
 --- a/original/templates/data/charter.md
 +++ b/modified/templates/data/charter.md
-@@ -323,6 +323,10 @@ Nothing needs you to poll. What wakes you:
+@@ -331,6 +331,10 @@ Nothing needs you to poll. What wakes you:
    is closed, or asks for a permission. It carries the crewmate's last message — whose last line is its
    status line — and, for a permission, the request to answer. Paseo sends it once per prompt, and only
    when `notifyOnFinish` was on, so keep it on for every `create_agent` and `send_agent_prompt`.
@@ -1640,7 +1640,7 @@ index 28827df..5b57175 100644
  - **A `<firstmate-board>` note** when the captain spoke to a crewmate directly from the FirstMate board.
    It carries what they said and what the crewmate answered. The captain's words are authoritative:
    reconcile the brief and the backlog with them.
-@@ -341,9 +345,10 @@ Nothing needs you to poll. What wakes you:
+@@ -349,9 +353,10 @@ Nothing needs you to poll. What wakes you:
    from something.
  - **The captain**, from the board, from `/fm` anywhere in Paseo, or here in this chat.
  - **Your heartbeat.** While work is under way, keep one `create_heartbeat` (every 30 minutes is plenty)
