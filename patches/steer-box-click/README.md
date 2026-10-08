@@ -1,6 +1,6 @@
-# Steer box click (local patch to FirstMate 0.2.1)
+# Steer box click (local patch to FirstMate 0.3.4)
 
-Fixes the steer box on a board card disappearing. The whole card was one pressable that toggled open and closed, and the steer box sat inside it, so a click in the box (to place the cursor, refocus or select text) bubbled up to the card and folded it, taking the box with it. The typed text survived and came back on reopening, which made it look random. Upstream FirstMate 0.3.2 has the same card code.
+Fixes the steer box on a board card disappearing. The whole card was one pressable that toggled open and closed, and the steer box sat inside it, so a click in the box (to place the cursor, refocus or select text) bubbled up to the card and folded it, taking the box with it. The typed text survived and came back on reopening, which made it look random. Upstream FirstMate 0.3.4 still has the same card structure.
 
 Now only the card's header (title, chips, summary, report, timing line) is pressable. The action buttons and the steer, relaunch and end box are siblings of it inside a plain `View` that carries the card's border and padding, so a press in them never reaches the toggle. Layout, spacing, the `cardMemory` behaviour and every other press are unchanged.
 
@@ -8,7 +8,9 @@ Now only the card's header (title, chips, summary, report, timing line) is press
 - Modified: `client/card.tsx` (outer `View`, header `Pressable`, one new `header` style)
 - New: `client/card.test.ts` (6 tests)
 
-`original/` holds stock `client/card.tsx` as shipped in 0.2.1; `modified/` holds both files.
+`original/` holds stock `client/card.tsx` as shipped in 0.3.4; `modified/` holds both files.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. Upstream 0.3.3 moved the card's styles to its type scale (`FONT_SIZE.body` for the title, `caption` for meta lines, `small` for the report, link and prompt), and the hunk that adds the `header` style had the old numeric sizes as context, so the old patch failed at `card.tsx:115`. The edit was redone on upstream's card, keeping upstream's sizes: the header wrapper and the outer `View` are unchanged from the 0.2.1 cut, and the new `header` style (`gap: 6`) has no text size of its own.
 
 ## Reapply after an npm update overwrites the plugin
 From a shell in the installed plugin directory (`$P`, see `LOCAL-CHANGES.md`), checking first:
@@ -22,7 +24,7 @@ No other patch touches `client/card.tsx`, so this applies in any order. `.gitatt
 Copy `original/client/card.tsx` back into `$P`, delete `client/card.test.ts` if present, reload.
 
 ## Verify the patch
-From the repository root: `sh patches/steer-box-click/check.sh`. It applies the patch to a copy of `original/`, checks the result is byte-identical to `modified/`, and that both files match the repository root (line endings ignored). Prints `ok: ...` and exits 0, or names each differing file and exits 1.
+From the repository root: `sh patches/steer-box-click/check.sh`. It applies the patch to a copy of `original/`, checks the result is byte-identical to `modified/`, and that both files match the repository root (line endings ignored). Prints `ok: ...` and exits 0, or names each differing file and exits 1. The scratch copy is kept for inspection.
 
 ## Checks
-`npm test -- --exclude 'patches/**'` runs `client/card.test.ts`, which renders the real `CrewCard` with `react-test-renderer` (installed without saving, as in `patches/chat-input-lag/README.md`). It models a click as reaching the nearest pressable at or above the target, as react-native-web does. Against stock `card.tsx`, the "press inside the box and its buttons" and "nothing above the box handles presses or keys" tests fail; with the patch all six pass. The tests cover: header toggles, box and buttons are outside the header, a press in the box keeps it open, a refresh with the same or newer data keeps the box, its node and its text, and Send posts the text. Real DOM bubbling was reproduced separately with react-dom and react-native-web; the card was not driven inside the Paseo window.
+`npm test -- --exclude 'patches/**'` runs `client/card.test.ts`, which renders the real `CrewCard` with `react-test-renderer` (installed without saving, as in `patches/chat-input-lag/README.md`). It models a click as reaching the nearest pressable at or above the target, as react-native-web does. Against stock `card.tsx` (0.2.1, and again 0.3.4), the "press inside the box and its buttons" and "nothing above the box handles presses or keys" tests fail; with the patch all six pass. The tests cover: header toggles, box and buttons are outside the header, a press in the box keeps it open, a refresh with the same or newer data keeps the box, its node and its text, and Send posts the text. Real DOM bubbling was reproduced separately with react-dom and react-native-web; the card was not driven inside the Paseo window.

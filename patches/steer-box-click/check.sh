@@ -1,38 +1,53 @@
 #!/bin/sh
-# Applies steer-box-click.patch to a scratch copy of original/ (stock 0.2.1) with the
-# documented command and checks the result is byte-identical to modified/.
-# Then checks that every file it changes or adds matches the repository root
-# (line endings ignored there, since a Windows checkout may have CRLF). No
-# other patch edits client/card.tsx, so the root copy is the patched one.
-# Run from anywhere: sh patches/steer-box-click/check.sh. Exits non-zero on failure.
+# Applies steer-box-click.patch to a scratch copy of original/ with the documented
+# command and checks the result is byte-identical to modified/. original/ is
+# stock 0.3.4: no other overlay edits client/card.tsx.
+# Then checks each file in modified/: where a later overlay edits it, against
+# that overlay's original/ (its base); otherwise against the repository root
+# (line endings ignored there, since a Windows checkout may have CRLF).
+# Scratch is retained for inspection. Run from anywhere:
+# sh patches/steer-box-click/check.sh. Exits non-zero on failure.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
+# Overlays applied after this one, in order.
+later="status-line-reads steer-notify"
 scratch=$(mktemp -d)
-trap 'rm -rf "$scratch"' EXIT
 cp -R "$here/original/." "$scratch/"
 cd "$scratch"
-git -c core.autocrlf=false apply -p2 --directory=. --check "$here/steer-box-click.patch"
-git -c core.autocrlf=false apply -p2 --directory=. "$here/steer-box-click.patch"
+# TMPDIR can be inside a checkout. Stop parent repository discovery so apply
+# treats scratch as standalone, rather than silently skipping every patch path.
+ceiling=$(dirname "$scratch")
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. --check "$here/steer-box-click.patch"
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply -p2 --directory=. "$here/steer-box-click.patch"
 status=0
+cr=$(printf '\r')
 for file in $(cd "$here/modified" && find . -type f | sort); do
-  if cmp -s "$here/modified/$file" "$scratch/$file"; then
-    echo "same     $file"
+  applied=$file
+  if ! cmp -s "$here/modified/$file" "$scratch/$applied"; then
+    echo "DIFFERS  $applied"
+    status=1
+    continue
+  fi
+  next=""
+  for overlay in $later; do
+    if [ -f "$here/../$overlay/original/$applied" ]; then next=$overlay; break; fi
+  done
+  if [ -n "$next" ]; then
+    if cmp -s "$here/modified/$file" "$here/../$next/original/$applied"; then
+      echo "same, base ok  $applied (next edited by $next)"
+    else
+      echo "BASE     $applied differs from $next's original/"
+      status=1
+    fi
+  elif tr -d "$cr" < "$root/$applied" | cmp -s "$here/modified/$file" -; then
+    echo "same, repo ok  $applied"
   else
-    echo "DIFFERS  $file"
+    echo "STALE    $applied at the repository root differs from modified/"
     status=1
   fi
 done
 extra=$(find . -type f | sort | while read -r file; do [ -f "$here/modified/$file" ] || echo "$file"; done)
 [ -z "$extra" ] || { echo "not in modified/: $extra"; status=1; }
-cr=$(printf '\r')
-for file in $(cd "$here/modified" && find . -type f | sort); do
-  if tr -d "$cr" < "$root/$file" | cmp -s "$here/modified/$file" -; then
-    echo "repo ok  $file"
-  else
-    echo "STALE    $file at the repository root differs from modified/"
-    status=1
-  fi
-done
-[ "$status" -eq 0 ] && echo "ok: the patch on original/ reproduces modified/ exactly; the files match the repository"
+[ "$status" -eq 0 ] && echo "ok: the patch on original/ reproduces modified/ exactly; each file matches the repository or the next overlay's base"
 exit "$status"
