@@ -2,7 +2,14 @@ import type { PluginServerContext } from "@getpaseo/plugin/server";
 
 import { migrateLegacyFiles, readFirstmateConfig, resolveHome, updateFirstmateConfig } from "./server/config";
 import { nameHomeOnce } from "./server/home-name";
-import { exitCrew, interruptCrew, relaunchCrew, steerCrew } from "./server/crew";
+import {
+  CaptainSteers,
+  exitCrew,
+  interruptCrew,
+  registerSteerRelay,
+  relaunchCrew,
+  steerCrew,
+} from "./server/crew";
 import { registerCrewRelay } from "./server/crew-relay";
 import { registerCrewSeen } from "./server/crew-seen";
 import { loadFleet, readAgentTools } from "./server/fleet";
@@ -55,9 +62,10 @@ import { displaySettings } from "./shared/settings";
 export default function contribute(server: PluginServerContext) {
   migrateLegacyFiles();
   const reports = registerReportCache(server);
+  const steers = new CaptainSteers();
   // The scripts in the home's watches/ folder, run on their schedules; see server/watches.ts.
   const watches = startWatches(server, readFirstmateConfig);
-  // A crewmate whose own first mate is gone — after a restart — or that the captain steered has its news relayed to the current one; see server/crew-relay.ts.
+  // A crewmate whose own first mate is gone — after a restart — has its news relayed to the current one; see server/crew-relay.ts.
   const crewRelay = registerCrewRelay(server, readFirstmateConfig);
 
   server.handle(readConfig, async () => {
@@ -108,9 +116,7 @@ export default function contribute(server: PluginServerContext) {
   });
 
   server.handle(steerCrewRpc, async ({ agentId, text }, { paseo }) => {
-    crewRelay.remember(paseo);
-    // The first mate is told at once, and the crew relay passes on what the crewmate does next.
-    await steerCrew(paseo, crewRelay.relay, readFirstmateConfig, agentId, text);
+    await steerCrew(paseo, steers, agentId, text);
     return {};
   });
   server.handle(interruptCrewRpc, async ({ agentId }, { paseo }) => {
@@ -161,6 +167,7 @@ export default function contribute(server: PluginServerContext) {
   // board's `useSettings` reads and writes valid for this installation.
   server.registerSettings(displaySettings);
 
+  const unregisterRelay = registerSteerRelay(server, steers, readFirstmateConfig);
   // A crewmate whose finish the first mate has been told about leaves Paseo's "Ready to review"; see server/crew-seen.ts.
   const unregisterCrewSeen = registerCrewSeen(server, readFirstmateConfig);
 
@@ -173,6 +180,7 @@ export default function contribute(server: PluginServerContext) {
 
   return () => {
     reports.stop();
+    unregisterRelay();
     unregisterCrewSeen();
     crewRelay.stop();
     watches.stop();

@@ -324,14 +324,12 @@ Nothing needs you to poll. What wakes you:
   status line — and, for a permission, the request to answer. Paseo sends it once per prompt, and only
   when `notifyOnFinish` was on, so keep it on for every `create_agent` and `send_agent_prompt`.
 - **A `<firstmate-crew>` note from FirstMate** — the same note, for a crewmate whose creator is gone, such
-  as one a previous first mate started, or one the captain steered from the board. Paseo tells only the
-  agent that created or prompted a crewmate, so FirstMate relays it to you instead; read it exactly as
-  the `<paseo-system>` note it stands for. Once you have prompted that crewmate yourself, Paseo's own
-  note comes to you and the relay stays quiet.
-- **A `<firstmate-board>` note** the moment the captain speaks to a crewmate directly from the FirstMate
-  board. It carries what they said; the crewmate's answer, and any permission it asks for after, follow
-  as `<firstmate-crew>` notes. The captain's words are authoritative: reconcile the brief and the backlog
-  with them.
+  as one a previous first mate started. Paseo tells only the agent that created or prompted a crewmate,
+  so FirstMate relays it to you instead; read it exactly as the `<paseo-system>` note it stands for. Once
+  you have prompted that crewmate yourself, Paseo's own note comes to you and the relay stays quiet.
+- **A `<firstmate-board>` note** when the captain spoke to a crewmate directly from the FirstMate board.
+  It carries what they said and what the crewmate answered. The captain's words are authoritative:
+  reconcile the brief and the backlog with them.
 - **`<firstmate-watch>` blocks** when scripts in `watches/` printed something: one per run, oldest first,
   one after another, led by `<firstmate-watch-dropped count="N"/>` when N older ones were dropped before
   you could take them. FirstMate's own, `pr-watch`, says when a pull request on the backlog is merged or

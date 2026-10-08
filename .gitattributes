@@ -6,3 +6,5 @@ patches/quota-pill/** text eol=lf
 patches/status-line-reads/** text eol=lf
 # Same for the steer-box fix.
 patches/steer-box-click/** text eol=lf
+# Same for the steer-notify overlay.
+patches/steer-notify/** text eol=lf
