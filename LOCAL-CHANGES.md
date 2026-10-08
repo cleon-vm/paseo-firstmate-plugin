@@ -46,7 +46,7 @@ From then on it relays that crewmate's turn ends, errors and permission requests
 through the notification relay, deduplicated against what Paseo already tells the
 first mate. It records changes to `index.server.ts`, `server/crew.ts`,
 `server/crew-relay.ts` and its test, `server/templates.ts`, the charter, and the
-steer-relay templates. It also adds `templates/messages/crew-relay-steered.md`.
+steer-relay templates. It also adds `templates/messages/crew-relay-steered.md` and `steer-relay-unsaved.md`.
 Its `original/` captures those files after the status-report overlay. Apply it
 after that overlay and undo it before. The status-report check no longer compares
 `index.server.ts` with the root, because this overlay changes that file.

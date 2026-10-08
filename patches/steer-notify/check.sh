@@ -21,4 +21,4 @@ extra=$(find . -type f | sort | while read -r file; do [ -f "$here/modified/$fil
 # The base is the tree after the status-report overlay: the file both edit must be its result.
 cmp "$here/original/index.server.ts" "$here/../status-line-reads/modified/index.server.ts"
 echo "base ok           ./index.server.ts is the status-report overlay's result"
-echo "ok: overlay reproduces modified/ exactly; all ten files match the repository"
+echo "ok: overlay reproduces modified/ exactly; all eleven files match the repository"

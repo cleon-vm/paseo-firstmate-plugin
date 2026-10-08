@@ -288,6 +288,14 @@ export function prune(state: RelayState, now: number): void {
   state.sent = state.sent.filter((at) => Date.parse(at) > now - HOUR_MS);
 }
 
+/** A permission request, quoted and then cut to the relay's cap; the ids to answer it come first in the JSON. */
+function clipRequest(request: string): string {
+  const escaped = quoted(request);
+  if (escaped.length <= MAX_RESPONSE_CHARS) return escaped;
+  const omitted = escaped.length - MAX_RESPONSE_CHARS;
+  return `${escaped.slice(0, MAX_RESPONSE_CHARS)}\n[truncated ${omitted} chars; use get_agent_status for the full request]`;
+}
+
 function clipResponse(text: string): string {
   const trimmed = text.trim();
   if (trimmed.length <= MAX_RESPONSE_CHARS) return trimmed;
@@ -303,7 +311,7 @@ export async function relayBlock(note: RelayNote): Promise<string> {
   const sections: string[] = [];
   if (note.event === "needs permission" && note.requestId !== undefined) {
     const request = JSON.stringify({ agentId: note.agentId, requestId: note.requestId, request: note.request ?? null }, null, 2);
-    sections.push(await message(TEMPLATES.crewRelayPermission, { request: quoted(request) }));
+    sections.push(await message(TEMPLATES.crewRelayPermission, { request: clipRequest(request) }));
   }
   if (note.error !== undefined && note.error.trim() !== "") {
     sections.push(`<agent-error>\n${quoted(note.error.trim())}\n</agent-error>`);
@@ -400,14 +408,22 @@ export class CrewRelay {
 
   /**
    * The captain steered the crewmate from the board: relay its news from now on. Saved before the
-   * steer is sent, so a turn that ends at once is still covered and a reload forgets nothing.
+   * steer is sent, so a turn that ends at once is still covered and a reload forgets nothing. False
+   * when the save failed: the steer is then remembered only until the plugin reloads, and the caller
+   * says so rather than letting it pass for a saved one.
    */
-  async touch(agentId: string): Promise<void> {
+  async touch(agentId: string): Promise<boolean> {
     const state = await this.load();
     const now = this.now();
     state.touched[agentId] = new Date(now).toISOString();
     prune(state, now);
-    await this.persist();
+    try {
+      await this.store.save(state);
+      return true;
+    } catch (error) {
+      console.error(`[firstmate] could not save the steer of ${agentId}; it is not durable:`, error);
+      return false;
+    }
   }
 
   async onTurnEnded(event: PluginLifecycleEvents["agent.turn_ended"]): Promise<void> {

@@ -14,8 +14,13 @@ Now:
 
 - **At once.** `steerCrew` sends the crewmate the words, then sends the live first mate a
   `<firstmate-board>` note (`templates/messages/steer-relay.md`). The note has the captain's words,
-  quoted and clipped at 4000 characters, and the crewmate's id and title. If that note fails, the error
-  is logged and the steer still counts as sent.
+  quoted and then clipped at 4000 characters, and the crewmate's id and title. The title is quoted,
+  clipped at 200 characters and marked as the crewmate's own text, data and not instructions, so the
+  whole note stays within `MAX_STEER_NOTE_CHARS` (6000). The captain's words keep the board note's
+  existing contract: they are authoritative (charter section 7). If that note fails, the error is
+  logged and the steer still counts as sent. If the steer could not be saved to `crew-relay.json`,
+  that is logged too, and the note begins its last part with "Warning: steer sent, relay state NOT
+  saved" (`templates/messages/steer-relay-unsaved.md`).
 - **From then on.** Before the send, the crewmate is added to `touched` in the notification relay's
   `plugin-data/firstmate/crew-relay.json`. The relay then treats its finishes, errors, permission
   requests and close as it treats an orphan's, even though its creator is live. They use the same
@@ -25,7 +30,8 @@ Now:
   `since`. If the first mate sends a notifying `send_agent_prompt` after that, Paseo tells it itself,
   and the existing timeline check drops the relay's copy. If the first mate prompted the crewmate
   before the steer and that turn is still running, both may report the turn's end once.
-- **Bounded.** `touched` is pruned like `finished` (14 days, 500 crewmates) and cleared when the
+- **Bounded.** A permission request in a relayed note is quoted, then cut to the relay's 4000-character
+  cap with a visible `[truncated N chars; ...]` line; the agent and request ids come first. `touched` is pruned like `finished` (14 days, 500 crewmates) and cleared when the
   crewmate is archived. Agents without the crew label are never relayed.
 - The old turn-end steer relay (`CaptainSteers`, `registerSteerRelay`) is removed. Otherwise the
   steered turn's answer would reach the first mate twice. The charter's descriptions of
@@ -34,12 +40,12 @@ Now:
 A crewmate the captain types into in its own Paseo tab is not covered. The plugin's
 `agent.turn_started` hook does not say who started a turn.
 
-`original/` holds the ten files as they were before this overlay (`index.server.ts` is the
+`original/` holds the ten files it changes as they were before this overlay (`index.server.ts` is the
 status-report overlay's result; `crew-relay*`, `templates.ts` and `charter.md` are the notification
-relay's; the rest are stock 0.2.1). `modified/` holds all ten after it, including the new
-`templates/messages/crew-relay-steered.md`. `steer-notify.patch` reproduces that snapshot.
+relay's; the rest are stock 0.2.1). `modified/` holds all eleven after it, including the new
+`templates/messages/crew-relay-steered.md` and `templates/messages/steer-relay-unsaved.md`. `steer-notify.patch` reproduces that snapshot.
 
-Run `sh patches/steer-notify/check.sh` to check reproduction, the base, and all ten root files. Set
+Run `sh patches/steer-notify/check.sh` to check reproduction, the base, and all eleven root files. Set
 TMPDIR to an allowed temporary directory; the check keeps its scratch copy for inspection. Because
 this overlay edits `index.server.ts` later, the status-report check no longer compares that file
 with the root. This check compares its `original/index.server.ts` with that overlay's `modified/`.
@@ -71,7 +77,12 @@ nine pass. They cover:
 - nothing for an agent without the crew label or for crew nobody steered;
 - `touched` cleared on archive;
 - the steered wording, quoted as before;
-- `touched` round-tripping through the file.
+- `touched` round-tripping through the file;
+- the whole immediate note bounded, a long title and escaping included, with the title marked as data;
+- a large permission request clipped to the relay cap with a `[truncated` marker;
+- a failed save of the steer: the steer still goes, the failure is logged, and the first mate is warned;
+- the steer saved before the worker gets the words, and the queue saved without a note before the
+  first mate gets it. These two fail if either save is moved after its send.
 
 No version bump and no dependency change. After merge, deploy with
 `paseo plugin update firstmate`.
