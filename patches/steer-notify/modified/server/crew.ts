@@ -23,6 +23,10 @@ import { quoted } from "./watches";
 
 /** The most of the captain's words relayed to the first mate; the same cap Paseo's own notification uses. */
 const MAX_RELAYED_CHARS = 4000;
+/** The most of the crewmate's title in that note. */
+const MAX_TITLE_CHARS = 200;
+/** The most the whole note can be: the template, a capped title, capped words, and the warning. */
+export const MAX_STEER_NOTE_CHARS = 6000;
 
 /** Refuses anything that is not a live crewmate, so the board cannot be pointed at an arbitrary agent. */
 async function requireCrew(paseo: PaseoApi, agentId: string): Promise<PaseoAgent> {
@@ -37,21 +41,23 @@ async function requireCrew(paseo: PaseoApi, agentId: string): Promise<PaseoAgent
 /**
  * The crewmate is marked as steered before the send, so a turn that ends the
  * instant the message lands is still relayed. The first mate is told once the
- * crewmate has the words; a failure to tell it does not fail the steer.
+ * crewmate has the words; a failure to tell it does not fail the steer. A mark
+ * that could not be saved still lets the steer go, but is logged and the note
+ * says so: the relay would forget the crewmate at the next reload.
  */
 export async function steerCrew(
   paseo: PaseoApi,
-  relay: { touch(agentId: string): Promise<void> },
+  relay: { touch(agentId: string): Promise<boolean> },
   readConfig: () => Promise<FirstmateConfig>,
   agentId: string,
   text: string,
 ): Promise<void> {
   const agent = await requireCrew(paseo, agentId);
-  await relay.touch(agentId);
+  const saved = await relay.touch(agentId);
   await sendWithoutInterrupting(paseo, agentId, text);
   try {
     const mate = await resolveMate(paseo, await readConfig());
-    if (mate.agent !== null) await sendWithoutInterrupting(paseo, mate.agent.id, await steerNote(agent, text));
+    if (mate.agent !== null) await sendWithoutInterrupting(paseo, mate.agent.id, await steerNote(agent, text, saved));
   } catch (error) {
     console.error(`[firstmate] could not tell the first mate about the captain's words to ${agentId}:`, error);
   }
@@ -85,18 +91,21 @@ export async function relaunchCrew(paseo: PaseoApi, agentId: string, note: strin
 /**
  * What the first mate is told the moment the captain steers a crewmate from the board
  * (`templates/messages/steer-relay.md`). Quoted as the crew relay quotes, so nothing in the words
- * or the title can close the note or open another.
+ * or the title can close the note or open another, and cut after quoting, so the note stays within
+ * `MAX_STEER_NOTE_CHARS` however much escaping adds. `saved` false adds steer-relay-unsaved.md.
  */
-export async function steerNote(agent: { id: string; title: string | null }, text: string): Promise<string> {
-  const trimmed = text.trim();
+export async function steerNote(agent: { id: string; title: string | null }, text: string, saved = true): Promise<string> {
+  const words = quoted(text.trim());
   const captain =
-    trimmed.length <= MAX_RELAYED_CHARS
-      ? trimmed
-      : await message(TEMPLATES.steerRelayClipped, { text: trimmed.slice(0, MAX_RELAYED_CHARS) });
+    words.length <= MAX_RELAYED_CHARS
+      ? words
+      : await message(TEMPLATES.steerRelayClipped, { text: words.slice(0, MAX_RELAYED_CHARS) });
+  const title = quoted((agent.title ?? agent.id).replace(/\s+/g, " ").trim());
+  const followup = await message(TEMPLATES.steerRelayNoAnswer);
   return message(TEMPLATES.steerRelay, {
     agentId: agent.id,
-    title: quoted((agent.title ?? agent.id).replace(/\s+/g, " ").trim()),
-    captain: quoted(captain),
-    followup: await message(TEMPLATES.steerRelayNoAnswer),
+    title: title.length <= MAX_TITLE_CHARS ? title : `${title.slice(0, MAX_TITLE_CHARS)}… [truncated]`,
+    captain,
+    followup: saved ? followup : `${await message(TEMPLATES.steerRelayUnsaved)}\n${followup}`,
   });
 }
