@@ -1,10 +1,12 @@
-# Files images (local patch to FirstMate 0.2.1)
+# Files images (local patch to FirstMate 0.3.4)
 
 | Files | Patch file |
 | --- | --- |
-| `client/file-links.ts`, `client/files.tsx`, `client/markdown.tsx`, `client/open-file.ts`, `index.server.ts`, `shared/files.ts` modified; `client/image-view.tsx`, `client/image-zoom.ts`, `client/images.test.ts`, `server/images.ts`, `server/images.test.ts`, `shared/images.ts`, `shared/rpc-names.test.ts` new | `files-images.patch` (whole patch, fix included); `read-image-rename.patch` (the fix alone, for a tree that has the first version) |
+| `client/file-links.ts`, `client/files.tsx`, `client/markdown.tsx`, `client/open-file.ts`, `index.server.ts`, `shared/files.ts` modified; `client/image-view.tsx`, `client/image-zoom.ts`, `client/images.test.ts`, `server/images.ts`, `server/images.test.ts`, `shared/images.ts`, `shared/rpc-names.test.ts` new | `files-images.patch` (whole patch, fix included); `read-image-rename.patch` (the fix alone, for a 0.2.1 tree that has the first version) |
 
-`original/` holds the six files as they were before this patch (stock 0.2.1 plus the quota pill and Windows watches patches, so `original/index.server.ts` already has the quota pill's line); `modified/` holds every patched or new file.
+`original/` holds the six files as they were before this patch (stock 0.3.4 plus the quota pill and Windows watches patches, so `original/index.server.ts` already has the quota pill's line); `modified/` holds every patched or new file.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. Upstream 0.3.3 moved `client/files.tsx` and `client/markdown.tsx` to its type scale (`FONT_SIZE` and `lineHeightFor` from `client/type-scale.ts`), and the import lines it added sit next to this patch's, so the 0.2.1 patch no longer applied (`files.tsx:19`, `markdown.tsx:18`). The edits were merged by hand keeping both: upstream's type-scale imports and sizes, including the Markdown preview's `FONT_SIZE.content`, and this patch's image imports, loading and rendering, unchanged. The image viewer's own text now uses the same roles, the way upstream moved its text one step up: its facts line is `caption` (was 11), its zoom percent `small` (was 12), and its messages `small` with `lineHeightFor` (were 12 on 17, like the Files view's own messages). The other four files were not changed upstream.
 
 **Order matters.** This patch is based on the tree with both earlier patches applied (`index.server.ts` is touched by the quota pill too). After an npm update, apply the quota pill and Windows watches first, then this one.
 
@@ -14,7 +16,7 @@
 - **Markdown preview:** `![alt](path)` draws an image in the home, looked up beside the Markdown file, then from the home root, then as an absolute path that lands inside the home. Remote `http(s)` images are never fetched (shown as a link with the alt text); other URL schemes show the alt text only; HTML is still not rendered. Clicking an image opens it in the Files view. The chat's rendering is unchanged.
 - **SVG safety:** SVG is only drawn by `Image` from a `data:image/svg+xml;base64,...` URI (restricted image mode: no scripts, no external loads). It is never inlined as markup. On native iOS/Android, where `Image` can't decode SVG, the message with Edit source appears instead.
 
-**Tests** (`server/images.test.ts` 25, `client/images.test.ts` 21, `shared/rpc-names.test.ts` 4; kept out of the npm package by `package.json`'s `!**/*.test.ts`). Run with an external vitest install, since the installed copy has no dev dependencies: 83 passed (50 new, 14 quota, 19 watch-launch).
+**Tests** (`server/images.test.ts` 25, `client/images.test.ts` 21, `shared/rpc-names.test.ts` 4; kept out of the npm package by `package.json`'s `!**/*.test.ts`). Run with an external vitest install, since the installed copy has no dev dependencies: 83 passed (50 new, 14 quota, 19 watch-launch). On the 0.3.4 re-cut all 50 pass in the repository.
 
 **The RPC name fix.** The first version named the RPC `firstmate.files.readImage`. The daemon refuses that: `server.handle` checks every name against `^[a-z][a-z0-9._-]*$` (Paseo's `server/plugins/plugin-process.js`, `validateMethod`), so the capital `I` threw `Invalid plugin RPC method: firstmate.files.readImage` and `paseo plugin reload firstmate` failed for the whole plugin. It is now `firstmate.files.read-image`; only the name and two comments changed. `shared/rpc-names.test.ts` checks every `defineRpc` name in the source against that pattern, and that no name is used twice. `files-images.patch` includes the fix.
 
@@ -29,12 +31,12 @@ git -c core.autocrlf=false apply <this-repo>/patches/files-images/files-images.p
 ```
 This patch uses plain `a/`/`b/` paths, so no `-p2 --directory=.` (unlike the other two). It already has the RPC name fix. If the check fails, compare `original/*` with the new files; if upstream didn't otherwise change them copy `modified/*` over `$P`, else redo the edits by hand. Check upstream's CHANGELOG first in case it added image viewing itself. Then `paseo plugin reload firstmate`.
 
-**A tree that has the first version** (`readImage`, reload fails with `Invalid plugin RPC method`) needs only the fix. From `$P`:
+**A 0.2.1 tree that has the first version** (`readImage`, reload fails with `Invalid plugin RPC method`) needs only the fix. From `$P`:
 ```
 git -c core.autocrlf=false apply --check <this-repo>/patches/files-images/read-image-rename.patch
 git -c core.autocrlf=false apply <this-repo>/patches/files-images/read-image-rename.patch
 ```
-Don't also apply `files-images.patch` there; it would fail as already applied. Then reload.
+Don't also apply `files-images.patch` there; it would fail as already applied. Then reload. No 0.3.4 tree ever had the first version, so this is a record of the 0.2.1 fix.
 
 ## Restore
 
@@ -43,3 +45,7 @@ From `$P`:
 git -c core.autocrlf=false apply --reverse <this-repo>/patches/files-images/files-images.patch
 ```
 or copy the six files in `original/` back into `$P` and delete the seven new files listed above. Then reload.
+
+## Verify the patch
+
+From the repository root (Git Bash on Windows, any POSIX shell elsewhere): `sh patches/files-images/check.sh`. It applies the patch to a scratch copy of `original/` with the command above and checks the result is byte-identical to `modified/`. It then checks each file against the repository root (line endings ignored there) or, where a later patch edits that file again, against that patch's `original/`. It prints `ok: ...` and exits 0, or names each differing file and exits 1; the scratch copy is kept for inspection. `.gitattributes` pins this folder to LF, so a CRLF checkout does not break the patch.
