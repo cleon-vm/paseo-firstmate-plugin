@@ -14,7 +14,7 @@ import {
 import { MAX_ALLOWS_PER_HOUR, NEVER_AUTO, type NeverAutoCase } from "./permit-rules";
 
 // A synthetic machine: every path, name and repository here is made up.
-const USER = "C:\\Users\\example";
+const USER = "C:\\Home\\example";
 const HOME = `${USER}\\.paseo\\plugin-data\\firstmate\\home`;
 const TASK = "demo-01-example";
 const WORKTREE = `${USER}\\.paseo\\worktrees\\abc123\\demo-01-example`;
@@ -45,7 +45,7 @@ function fill(text: string): string {
 const DIRS = new Set(
   [
     "C:\\",
-    "C:\\Users",
+    "C:\\Home",
     USER,
     `${USER}\\.paseo`,
     `${USER}\\.paseo\\plugin-data`,

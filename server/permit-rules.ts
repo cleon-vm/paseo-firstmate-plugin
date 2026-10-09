@@ -230,7 +230,7 @@ export const NEVER_AUTO: readonly NeverAutoEntry[] = [
       { script: "New-Item -ItemType Directory -Path '<home>\\data\\tools\\x'" },
       { script: "Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<home>\\data\\permissions\\permits\\x.json'" },
       { script: "Copy-Item -LiteralPath 'C:\\Windows\\win.ini' -Destination '<notes>\\win.ini'" },
-      { script: "New-Item -ItemType Directory -Path '<notes>\\a'", cwd: "C:\\Users\\example\\Desktop" },
+      { script: "New-Item -ItemType Directory -Path '<notes>\\a'", cwd: "C:\\Home\\example\\Desktop" },
       { script: "& 'C:\\Tools\\thing.exe' run" },
       { script: "New-Item -ItemType Directory -Path '<user>\\.codex\\x'" },
     ],

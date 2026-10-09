@@ -14,7 +14,7 @@ import { describe, expect, it } from "vitest";
 
 import { LOCAL_READ_FORMS, match, parseNeverAutoExtra, parseScript, type MatchContext, type Permits } from "./permit-match";
 
-const USER = String.raw`C:\Users\example`;
+const USER = String.raw`C:\Home\example`;
 const HOME = `${USER}\\.paseo\\plugin-data\\firstmate\\home`;
 const WORKTREE = String.raw`C:\Work\demo`;
 const SCRATCH = String.raw`C:\Scratch\demo`;

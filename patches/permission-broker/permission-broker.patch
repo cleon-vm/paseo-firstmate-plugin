@@ -58,7 +58,7 @@ index 9899407..92f72c9 100644
      console.error(`[firstmate] ${configPath()} is invalid, using defaults: ${parsed.error.message}`);
 diff --git a/server/permission-broker.test.ts b/server/permission-broker.test.ts
 new file mode 100644
-index 0000000..e0c939a
+index 0000000..ca2b37d
 --- /dev/null
 +++ b/server/permission-broker.test.ts
 @@ -0,0 +1,520 @@
@@ -539,7 +539,7 @@ index 0000000..e0c939a
 +    expect(redact("x xoxb-1234567890-abcdef y")).toBe("x [redacted] y");
 +    expect(redact(`x ${"QUJD".repeat(16)} y`)).toBe("x [redacted] y");
 +    expect(redact("$env:GH_TOKEN='abc123'; gh api x")).not.toContain("abc123");
-+    expect(redact("Get-Content C:\\Users\\example\\notes\\authority.md")).toBe("Get-Content C:\\Users\\example\\notes\\authority.md");
++    expect(redact("Get-Content C:\\Home\\example\\notes\\authority.md")).toBe("Get-Content C:\\Home\\example\\notes\\authority.md");
 +  });
 +
 +  it("keeps the verdict when a write fails, and says so on stderr once an hour", async () => {
@@ -1057,7 +1057,7 @@ index 0000000..c31ad47
 +}
 diff --git a/server/permit-bypass.test.ts b/server/permit-bypass.test.ts
 new file mode 100644
-index 0000000..1a85851
+index 0000000..ef3b12e
 --- /dev/null
 +++ b/server/permit-bypass.test.ts
 @@ -0,0 +1,264 @@
@@ -1077,7 +1077,7 @@ index 0000000..1a85851
 +
 +import { LOCAL_READ_FORMS, match, parseNeverAutoExtra, parseScript, type MatchContext, type Permits } from "./permit-match";
 +
-+const USER = String.raw`C:\Users\example`;
++const USER = String.raw`C:\Home\example`;
 +const HOME = `${USER}\\.paseo\\plugin-data\\firstmate\\home`;
 +const WORKTREE = String.raw`C:\Work\demo`;
 +const SCRATCH = String.raw`C:\Scratch\demo`;
@@ -1341,7 +1341,7 @@ index 0000000..6138386
 +}
 diff --git a/server/permit-match.test.ts b/server/permit-match.test.ts
 new file mode 100644
-index 0000000..354f583
+index 0000000..0263cd3
 --- /dev/null
 +++ b/server/permit-match.test.ts
 @@ -0,0 +1,935 @@
@@ -1361,7 +1361,7 @@ index 0000000..354f583
 +import { MAX_ALLOWS_PER_HOUR, NEVER_AUTO, type NeverAutoCase } from "./permit-rules";
 +
 +// A synthetic machine: every path, name and repository here is made up.
-+const USER = "C:\\Users\\example";
++const USER = "C:\\Home\\example";
 +const HOME = `${USER}\\.paseo\\plugin-data\\firstmate\\home`;
 +const TASK = "demo-01-example";
 +const WORKTREE = `${USER}\\.paseo\\worktrees\\abc123\\demo-01-example`;
@@ -1392,7 +1392,7 @@ index 0000000..354f583
 +const DIRS = new Set(
 +  [
 +    "C:\\",
-+    "C:\\Users",
++    "C:\\Home",
 +    USER,
 +    `${USER}\\.paseo`,
 +    `${USER}\\.paseo\\plugin-data`,
@@ -3900,7 +3900,7 @@ index 0000000..80ece20
 +});
 diff --git a/server/permit-rules.ts b/server/permit-rules.ts
 new file mode 100644
-index 0000000..f21dc5e
+index 0000000..4f1563b
 --- /dev/null
 +++ b/server/permit-rules.ts
 @@ -0,0 +1,418 @@
@@ -4136,7 +4136,7 @@ index 0000000..f21dc5e
 +      { script: "New-Item -ItemType Directory -Path '<home>\\data\\tools\\x'" },
 +      { script: "Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<home>\\data\\permissions\\permits\\x.json'" },
 +      { script: "Copy-Item -LiteralPath 'C:\\Windows\\win.ini' -Destination '<notes>\\win.ini'" },
-+      { script: "New-Item -ItemType Directory -Path '<notes>\\a'", cwd: "C:\\Users\\example\\Desktop" },
++      { script: "New-Item -ItemType Directory -Path '<notes>\\a'", cwd: "C:\\Home\\example\\Desktop" },
 +      { script: "& 'C:\\Tools\\thing.exe' run" },
 +      { script: "New-Item -ItemType Directory -Path '<user>\\.codex\\x'" },
 +    ],

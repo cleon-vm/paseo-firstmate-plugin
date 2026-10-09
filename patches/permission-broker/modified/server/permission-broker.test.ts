@@ -475,7 +475,7 @@ describe("the log", () => {
     expect(redact("x xoxb-1234567890-abcdef y")).toBe("x [redacted] y");
     expect(redact(`x ${"QUJD".repeat(16)} y`)).toBe("x [redacted] y");
     expect(redact("$env:GH_TOKEN='abc123'; gh api x")).not.toContain("abc123");
-    expect(redact("Get-Content C:\\Users\\example\\notes\\authority.md")).toBe("Get-Content C:\\Users\\example\\notes\\authority.md");
+    expect(redact("Get-Content C:\\Home\\example\\notes\\authority.md")).toBe("Get-Content C:\\Home\\example\\notes\\authority.md");
   });
 
   it("keeps the verdict when a write fails, and says so on stderr once an hour", async () => {
