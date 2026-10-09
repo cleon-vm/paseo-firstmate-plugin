@@ -888,6 +888,7 @@ function valueOf(params: Map<string, Word | true>, name: string): Word | null {
 }
 
 interface RuleContext {
+  mode: MatchContext["mode"];
   roots: Roots;
   permits: Permits;
   extraHardware: readonly string[] | null;
@@ -1176,6 +1177,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
     return checked.ok ? allow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
   }
   if (git.sub === "commit") {
+    if (rc.mode === "live") return noRule("git commit may execute crew-controlled hooks; requires a person in live mode");
     const rest = args[0] === "--dry-run" ? args.slice(1) : args;
     if (rest.length !== 2 || rest[0] !== "-m") return noRule("git commit other than [--dry-run] -m '<message>'");
     return allow("git-local", "git commit");
@@ -1224,6 +1226,11 @@ function prefixToken(token: string, word: string | undefined): boolean {
 
 function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
   const words = statement.words;
+  // A prefix naming an interpreter flag does not name the program it will run. Keep these visible in
+  // shadow, but require a person for inline code (including bundled short flags) in live mode.
+  if (rc.mode === "live" && words.some((word) => /^-[bBdiIOqsSuUvVxXp]*[ce][bBdiIOqsSuUvVxXp]*$|^--(?:eval|print|command)(?:=|$)/.test(word.value))) {
+    return noRule("inline interpreter code requires a person in live mode");
+  }
   const roots = rc.roots;
   const toolPaths = [roots.homeTools.fmpy, roots.homeTools.privacyCheck];
   if (rc.extraHardware === null) return refuse("hardware", "the never-auto supplement is missing or invalid, so no exec statement is allowed");
@@ -1349,6 +1356,13 @@ export function match(request: PermitRequest, permitsRaw: unknown, context: Matc
   if (!context.crew) return never("not-crew", "the agent has no crew label");
   if (context.task === null) return never("not-crew", "the agent has no task label");
   if (!taskIdOk(context.task)) return never("not-crew", `the task id ${JSON.stringify(context.task.slice(0, 80))} is reserved or not a slug`);
+  // Live answering must gate permits before any never-auto or allow rule (spec 3.8).
+  if (context.mode === "live") {
+    const livePermits = parsePermits(permitsRaw);
+    if (livePermits === null || livePermits.task !== context.task || !livePermits.live) {
+      return never("no-permits", "valid live permits for this task are required");
+    }
+  }
   if (request.provider !== "codex" || request.name !== "CodexBash" || request.kind !== "tool") {
     return never("not-v1", `${request.provider} ${request.name} ${request.kind}`);
   }
@@ -1380,7 +1394,7 @@ export function match(request: PermitRequest, permitsRaw: unknown, context: Matc
   const roots = new Roots(context, permits);
   const cwd = roots.cwd(cwdRaw);
   if (!cwd.ok) return never(cwd.id, cwd.reason);
-  const rc: RuleContext = { roots, permits, extraHardware: context.extraHardware, cwd: cwd.path, cwdRaw };
+  const rc: RuleContext = { roots, permits, mode: context.mode, extraHardware: context.extraHardware, cwd: cwd.path, cwdRaw };
   const results = parsed.statements.map((statement) => ruleFor(rc, statement));
   const refused = results.find((result) => !result.ok && result.rule.startsWith("never:")) ?? results.find((result) => !result.ok);
   if (refused !== undefined && !refused.ok) {

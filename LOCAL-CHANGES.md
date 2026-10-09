@@ -35,7 +35,7 @@ The re-cut, for the next upstream version: starting from the new stock files, fo
 | Notification relay | After a Restart, relays the Paseo notes (finished, errored, needs permission, was closed) of crewmates whose creator is gone — such as the previous first mate — to the current first mate as `<firstmate-crew>` notes worded like Paseo's own, from the plugin's lifecycle hooks with no model turn spent on looking. Skips crewmates whose creator is live and notes Paseo already delivered; dedupes, rate-limits and persists its queue in `plugin-data/firstmate/crew-relay.json`. | modified `client/transcript-rows.ts`, `index.server.ts`, `server/templates.ts`, `templates/data/charter.md`, `templates/messages/restart-note.md`; new `server/crew-relay.ts`, `server/crew-relay.test.ts`, `templates/messages/crew-relay*.md` (4) | [patches/notification-relay/README.md](patches/notification-relay/README.md) |
 | Reveal in explorer | Reveals a file (selected) or a folder of the home in the file manager of the machine running Paseo — Explorer, Finder or `xdg-open` — through a new `firstmate.files.reveal` RPC, confined like a read and started from an argument list. The Files view gets Reveal and Copy path on the open file's toolbar, Reveal for the current folder, and a right-click menu (long press on native) on rows and the open file's header, with a note that it opens on the machine running Paseo. | modified `client/files.tsx`, `client/web.ts`, `index.server.ts`, `shared/files.ts`; new `client/reveal.ts`, `client/reveal.test.ts`, `server/reveal.ts`, `server/reveal.test.ts` | [patches/reveal-in-explorer/README.md](patches/reveal-in-explorer/README.md) |
 | Chat input lag | Keeps composer keystrokes from rebuilding the history Markdown and inline tokens by stabilizing history callbacks and memoizing the history JSX. Includes a render-count regression and history/link/streaming invalidation checks. | modified `client/chat.tsx`; new `client/chat.test.ts` | [patches/chat-input-lag/README.md](patches/chat-input-lag/README.md) |
-| Permission broker | Checks every crew permission request against the task's permits file (`data/permissions/permits/<task>.json` in the home) and a fixed never-auto list, and logs the answer it would give and the one a person gave to `data/permissions/log-YYYY-MM.jsonl`. **Shadow only: it never answers.** Off unless `permissionBroker` in the config is `"shadow"` (or `"live"`, which in this build also answers nothing). | modified `index.server.ts`, `server/config.ts`, `shared/fleet.ts`; new `server/permission-broker.ts`, `server/permit-match.ts`, `server/permit-rules.ts`, their tests (4) and a synthetic test fixture | [patches/permission-broker/README.md](patches/permission-broker/README.md) |
+| Permission broker | Checks crew requests against task permits and a fixed never-auto list, and logs requests and resolutions. Shadow answers nothing; live with task `live: true` reserves each matching request durably, repeats all checks and sends one allow with a ten-second deadline. Never denies or messages anyone. Off by default; switching to shadow or off stops answering without a reload. | modified `index.server.ts`, `server/config.ts`, `shared/fleet.ts`, `templates/data/charter.md`; new `server/permission-broker.ts`, `server/permit-match.ts`, `server/permit-rules.ts`, their tests (4) and a synthetic test fixture | [patches/permission-broker/README.md](patches/permission-broker/README.md) |
 | Steer box click | Only a card's header (title and summary) toggles it open and closed; the action buttons and the steer box sit outside that pressable, so a click in the box no longer folds the card and hides the box. | modified `client/card.tsx`; new `client/card.test.ts` | [patches/steer-box-click/README.md](patches/steer-box-click/README.md) |
 
 The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay, steer-notify overlay, permission-broker overlay. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it), `modified/` (every patched or new file), a README and `check.sh`. `.gitattributes` pins every patch folder to LF, so a CRLF checkout keeps them byte-identical to the LF files npm installs.
@@ -76,16 +76,20 @@ the Paseo requirement is upstream's `>=0.11.0`.
 
 The [permission-broker overlay](patches/permission-broker/README.md) is local too. It
 checks each crew permission request against the task's permits and the never-auto list
-and logs the answer it would give, beside the answer a person gave. In this build it
-never answers, in any mode; `"live"` logs as live mode will judge and answers nothing.
-It is off by default (`permissionBroker: "off"`). It records changes to
-`index.server.ts`, `server/config.ts` and `shared/fleet.ts`, and adds the broker, the
+and logs the verdict beside the answer a person or the broker gave. Shadow never answers;
+live answers only with task `live: true`, once per request, with a ten-second deadline and no retry.
+It is off by default (`permissionBroker: "off"`). The kill switch is setting it to `"shadow"` or
+`"off"`, effective without a reload. D2(a) and D3(a) keep opt-in tier 2 and literal read-repo git
+enabled; live relays git commits with uncontrolled hooks and inline interpreter code. Path identities
+are rechecked immediately before answering, but the SDK cannot lock them until command execution.
+It records changes to `index.server.ts`, `server/config.ts`, `shared/fleet.ts` and
+`templates/data/charter.md` (say nothing about a permission request that is no longer pending), and adds the broker, the
 matcher, the never-auto list and their tests. Its `original/` captures those files after
 the steer-notify overlay. Apply it after that overlay and undo it before. The
-steer-notify check compares `index.server.ts` with this overlay's `original/` instead of
+steer-notify check compares `index.server.ts` and the charter with this overlay's `original/` instead of
 the root, because this overlay changes that file.
 
-Its state (sticky crewmates, the last hour's allows) is kept in
+Its state (sticky crewmates, the last hour's allows, and requests reserved for a live answer) is kept in
 `plugin-data/firstmate/permission-broker.json`; its log is in the home's
 `data/permissions/`. It adds no package dependency of its own; the Paseo requirement is
 upstream's `>=0.11.0`.

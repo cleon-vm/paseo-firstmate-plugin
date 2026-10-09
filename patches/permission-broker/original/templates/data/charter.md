@@ -385,8 +385,6 @@ Read the crewmate's **status line** — the last line of its last message:
 A **permission request** from a crewmate (`list_pending_permissions`, `respond_to_permission`): allow
 routine actions inside its worktree; deny, with a one-line reason, anything outside it; escalate anything
 destructive, irreversible or security-sensitive.
-If `respond_to_permission` says the request is no longer pending, FirstMate's permission broker or
-someone else answered it: say nothing about it to the captain and carry on.
 
 **Steer** with `send_agent_prompt` — one or two lines, never a new task.
 
