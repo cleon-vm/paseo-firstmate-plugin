@@ -1,0 +1,3876 @@
+diff --git a/index.server.ts b/index.server.ts
+index 78ae989..05207c0 100644
+--- a/index.server.ts
++++ b/index.server.ts
+@@ -5,6 +5,7 @@ import { nameHomeOnce } from "./server/home-name";
+ import { exitCrew, interruptCrew, relaunchCrew, steerCrew } from "./server/crew";
+ import { registerCrewRelay } from "./server/crew-relay";
+ import { registerCrewSeen } from "./server/crew-seen";
++import { registerPermissionBroker } from "./server/permission-broker";
+ import { loadFleet, readAgentTools } from "./server/fleet";
+ import { registerReportCache } from "./server/report-cache";
+ import { findFiles, listDirectory, readTextFile, requireHome, writeTextFile } from "./server/files";
+@@ -59,6 +60,8 @@ export default function contribute(server: PluginServerContext) {
+   const watches = startWatches(server, readFirstmateConfig);
+   // A crewmate whose own first mate is gone — after a restart — or that the captain steered has its news relayed to the current one; see server/crew-relay.ts.
+   const crewRelay = registerCrewRelay(server, readFirstmateConfig);
++  // Crew permission requests checked against their task's permits and logged; this build never answers one. See server/permission-broker.ts.
++  const permissionBroker = registerPermissionBroker(server, readFirstmateConfig);
+ 
+   server.handle(readConfig, async () => {
+     const config = await readFirstmateConfig();
+@@ -175,6 +178,7 @@ export default function contribute(server: PluginServerContext) {
+     reports.stop();
+     unregisterCrewSeen();
+     crewRelay.stop();
++    permissionBroker.stop();
+     watches.stop();
+   };
+ }
+diff --git a/server/config.ts b/server/config.ts
+index 9899407..92f72c9 100644
+--- a/server/config.ts
++++ b/server/config.ts
+@@ -12,7 +12,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+ import { homedir } from "node:os";
+ import { dirname, isAbsolute, join, resolve } from "node:path";
+ 
+-import { FirstmateConfigSchema, type FirstmateConfig } from "../shared/fleet";
++import { FirstmateConfigSchema, PermissionBrokerModeSchema, type FirstmateConfig } from "../shared/fleet";
+ import { dataPath, legacyPluginDir, migrateLegacyData } from "./data-dir";
+ import { serialized } from "./serialize";
+ 
+@@ -107,6 +107,15 @@ function parseConfig(raw: string): FirstmateConfig {
+     console.error(`[firstmate] ${configPath()} is not JSON, using defaults:`, error);
+     return FirstmateConfigSchema.parse({});
+   }
++  // A mistyped permissionBroker turns the broker off, rather than resetting the whole config (and the
++  // first mate with it) to the defaults.
++  if (typeof json === "object" && json !== null && "permissionBroker" in json) {
++    const mode = (json as { permissionBroker: unknown }).permissionBroker;
++    if (!PermissionBrokerModeSchema.safeParse(mode).success) {
++      console.error(`[firstmate] ${configPath()} has permissionBroker ${JSON.stringify(mode)}; the broker is off.`);
++      json = { ...json, permissionBroker: "off" };
++    }
++  }
+   const parsed = FirstmateConfigSchema.safeParse(json);
+   if (!parsed.success) {
+     console.error(`[firstmate] ${configPath()} is invalid, using defaults: ${parsed.error.message}`);
+diff --git a/server/permission-broker.test.ts b/server/permission-broker.test.ts
+new file mode 100644
+index 0000000..9f5d79f
+--- /dev/null
++++ b/server/permission-broker.test.ts
+@@ -0,0 +1,480 @@
++import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
++import { realpathSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import type { FirstmateConfig } from "../shared/fleet";
++import { MAX_LOGGED_COMMAND, readBrokerState, redact, registerPermissionBroker } from "./permission-broker";
++import { NEVER_AUTO } from "./permit-rules";
++
++// A synthetic machine inside a temporary folder: every name and repository here is made up.
++const TASK = "demo-01-example";
++const T0 = Date.parse("2026-10-12T09:14:03.120Z");
++
++interface Machine {
++  root: string;
++  user: string;
++  home: string;
++  worktree: string;
++  notes: string;
++  scratch: string;
++  stateFile: string;
++}
++
++async function machine(): Promise<Machine> {
++  const root = realpathSync.native(await mkdtemp(join(tmpdir(), "permission-broker-")));
++  const user = join(root, "Users", "example");
++  const home = join(user, ".paseo", "plugin-data", "firstmate", "home");
++  const worktree = join(user, ".paseo", "worktrees", "abc123", TASK);
++  const notes = join(home, "data", TASK);
++  const scratch = join(user, "AppData", "Local", "Temp", "fm-demo-01");
++  for (const dir of [notes, worktree, scratch, join(home, "data", "permissions", "permits")]) await mkdir(dir, { recursive: true });
++  return { root, user, home, worktree, notes, scratch, stateFile: join(root, "plugin-data", "permission-broker.json") };
++}
++
++async function writePermits(m: Machine, overrides: Record<string, unknown> = {}, task = TASK): Promise<void> {
++  const permits = {
++    version: 1,
++    task,
++    live: false,
++    writeDirs: [`data/${TASK}`],
++    scratchDirs: [m.scratch],
++    readRepos: [],
++    netRead: { githubRepos: ["octo/example"], hosts: [] },
++    gitLocal: true,
++    exec: [{ in: "scratch", prefix: ["npm.cmd", "test"] }],
++    envNames: ["PYTHONUTF8"],
++    ...overrides,
++  };
++  await writeFile(join(m.home, "data", "permissions", "permits", `${task}.json`), JSON.stringify(permits));
++}
++
++/** The command line Codex sends, from the Program Files pwsh. */
++function wrap(script: string): string {
++  return `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '${script.replace(/'/g, "''")}'`;
++}
++
++type Handler = (event: unknown, context: { paseo: unknown; signal: AbortSignal }) => unknown;
++
++class FakeServer {
++  handlers = new Map<string, Set<Handler>>();
++  on(name: string, handler: Handler) {
++    const set = this.handlers.get(name) ?? new Set();
++    set.add(handler);
++    this.handlers.set(name, set);
++    return () => set.delete(handler);
++  }
++  async emit(name: string, event: unknown, paseo: unknown) {
++    for (const handler of this.handlers.get(name) ?? []) await handler(structuredClone(event), { paseo, signal: new AbortController().signal });
++  }
++  count(): number {
++    return [...this.handlers.values()].reduce((sum, set) => sum + set.size, 0);
++  }
++}
++
++/** A daemon whose every write to an agent is recorded: the broker must make none. */
++class FakeDaemon {
++  labels = new Map<string, Record<string, string>>();
++  writes: string[] = [];
++  lookups = 0;
++
++  api() {
++    const record = (what: string) => async () => {
++      this.writes.push(what);
++    };
++    return {
++      agents: {
++        ref: (id: string) => ({
++          refresh: async () => {
++            this.lookups += 1;
++            const labels = this.labels.get(id);
++            if (labels === undefined) throw new Error(`Agent not found: ${id}`);
++            return { agent: { id, labels, archivedAt: null, pendingPermissions: [] } };
++          },
++          respondToPermission: record(`respondToPermission ${id}`),
++          send: record(`send ${id}`),
++          interrupt: record(`interrupt ${id}`),
++          archive: record(`archive ${id}`),
++        }),
++      },
++    };
++  }
++}
++
++function agent(m: Machine, id = "crew-1") {
++  return { id, workspaceId: null, parentAgentId: "mate-1", provider: "codex", cwd: m.worktree, title: "Demo" };
++}
++
++function permissionRequested(m: Machine, script: string, options: { id?: string; requestId?: string; cwd?: string; request?: Record<string, unknown> } = {}) {
++  return {
++    agent: agent(m, options.id),
++    request: {
++      id: options.requestId ?? "permission-exec-1",
++      provider: "codex",
++      name: "CodexBash",
++      kind: "tool",
++      title: "Run command",
++      description: "the crewmate's own reason, not to be logged",
++      input: { command: wrap(script), cwd: options.cwd ?? m.worktree },
++      ...options.request,
++    },
++  };
++}
++
++interface Setup {
++  m: Machine;
++  daemon: FakeDaemon;
++  server: FakeServer;
++  config: { current: FirstmateConfig };
++  wired: ReturnType<typeof registerPermissionBroker>;
++  paseo: unknown;
++  lines: () => Promise<Array<Record<string, unknown>>>;
++}
++
++async function setup(mode: FirstmateConfig["permissionBroker"] = "shadow", options: { append?: (path: string, text: string) => Promise<void> } = {}): Promise<Setup> {
++  const m = await machine();
++  const daemon = new FakeDaemon();
++  daemon.labels.set("crew-1", { "firstmate.role": "crew", "firstmate.task": TASK, "firstmate.plan": "demo-plan" });
++  daemon.labels.set("crew-2", { "firstmate.role": "crew", "firstmate.task": TASK });
++  daemon.labels.set("mate-1", { "firstmate.role": "first-mate", "firstmate.task": TASK });
++  daemon.labels.set("other-1", { "some.label": "x", "firstmate.task": TASK });
++  daemon.labels.set("crew-reserved", { "firstmate.role": "crew", "firstmate.task": "permissions" });
++  daemon.labels.set("crew-notask", { "firstmate.role": "crew" });
++  const server = new FakeServer();
++  const config = { current: { home: m.home, mateAgentId: "mate-1", permissionBroker: mode } as FirstmateConfig };
++  const wired = registerPermissionBroker(server as never, async () => config.current, {
++    stateFile: m.stateFile,
++    userHome: m.user,
++    now: () => T0,
++    ...(options.append === undefined ? {} : { append: options.append }),
++  });
++  await wired.ready;
++  const lines = async () => {
++    const dir = join(m.home, "data", "permissions");
++    const files = (await readdir(dir)).filter((name) => name.endsWith(".jsonl"));
++    const text = (await Promise.all(files.map((name) => readFile(join(dir, name), "utf8")))).join("");
++    return text
++      .split("\n")
++      .filter((line) => line !== "")
++      .map((line) => JSON.parse(line) as Record<string, unknown>);
++  };
++  return { m, daemon, server, config, wired, paseo: daemon.api(), lines };
++}
++
++const ALLOWED_SCRIPT = (m: Machine) => `New-Item -ItemType Directory -Path '${m.notes}\\review-scratch-1'`;
++
++let errors: ReturnType<typeof vi.spyOn>;
++beforeEach(() => {
++  errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
++});
++afterEach(() => {
++  errors.mockRestore();
++});
++
++// ---------------------------------------------------------------------------
++// 4. Shadow never answers
++// ---------------------------------------------------------------------------
++
++describe("shadow never answers", () => {
++  it("makes no write to any agent across every fixture, in shadow and in live", async () => {
++    for (const mode of ["shadow", "live"] as const) {
++      const s = await setup(mode);
++      await writePermits(s.m, { live: true, exec: [{ in: "worktree", prefix: ["node"] }] });
++      const scripts = [
++        ALLOWED_SCRIPT(s.m),
++        "npm.cmd test",
++        "git --no-optional-locks status",
++        ...NEVER_AUTO.flatMap((entry) => entry.cases.map((testCase) => testCase.script ?? "Get-Date")),
++      ];
++      let index = 0;
++      for (const script of scripts) {
++        index += 1;
++        await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: `permission-exec-${index}`, id: "crew-2" }), s.paseo);
++        await s.server.emit("agent.permission_resolved", { agent: agent(s.m, "crew-2"), requestId: `permission-exec-${index}`, resolution: { behavior: "allow" } }, s.paseo);
++      }
++      const lines = await s.lines();
++      expect(s.daemon.writes).toEqual([]);
++      expect(lines.filter((line) => line.event === "request")).toHaveLength(scripts.length);
++      expect(lines.every((line) => line.event !== "request" || line.answered === false)).toBe(true);
++      expect(lines.some((line) => line.verdict === "allow")).toBe(true);
++    }
++  });
++
++  it("has no code path to an answer: no module of the broker names respondToPermission", async () => {
++    for (const file of ["permission-broker.ts", "permit-match.ts", "permit-rules.ts"]) {
++      const source = await readFile(join(import.meta.dirname, file), "utf8");
++      expect(source, file).not.toMatch(/respondToPermission|\.send\(|sendWithoutInterrupting/);
++    }
++  });
++});
++
++// ---------------------------------------------------------------------------
++// 5. Sticky
++// ---------------------------------------------------------------------------
++
++describe("after a refusal", () => {
++  async function stickyAfter(trigger: (s: Setup) => Promise<void>) {
++    const s = await setup();
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "before" }), s.paseo);
++    await trigger(s);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "after" }), s.paseo);
++    // A reload: a new broker on the same state file.
++    s.wired.stop();
++    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 1000 });
++    await reloaded.ready;
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "after-reload" }), s.paseo);
++    const verdicts = Object.fromEntries((await s.lines()).filter((line) => line.event === "request").map((line) => [line.requestId, line.rule]));
++    return { s, verdicts };
++  }
++
++  const triggers: Array<[string, (s: Setup) => Promise<void>]> = [
++    ["a deny", (s) => s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "x", resolution: { behavior: "deny", message: "no" } }, s.paseo)],
++    [
++      "a turn ending blocked",
++      (s) =>
++        s.server.emit(
++          "agent.turn_ended",
++          { agent: agent(s.m), turnId: "t1", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "Cannot go on.\n\nblocked: tests need a database" }] },
++          s.paseo,
++        ),
++    ],
++    [
++      "a turn ending needs-decision",
++      (s) =>
++        s.server.emit(
++          "agent.turn_ended",
++          { agent: agent(s.m), turnId: "t1", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "needs-decision: keep the old API?" }] },
++          s.paseo,
++        ),
++    ],
++    ["a destructive hit", (s) => s.server.emit("agent.permission_requested", permissionRequested(s.m, "Remove-Item -LiteralPath x", { requestId: "bad" }), s.paseo)],
++    ["an outward hit", (s) => s.server.emit("agent.permission_requested", permissionRequested(s.m, "git push origin topic", { requestId: "bad" }), s.paseo)],
++  ];
++
++  it.each(triggers)("relays every later request after %s, also after a reload", async (_name, trigger) => {
++    const { s, verdicts } = await stickyAfter(trigger);
++    expect(verdicts.before).toBe("notes-write");
++    expect(verdicts.after).toBe("never:after-refusal");
++    expect(verdicts["after-reload"]).toBe("never:after-refusal");
++    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]).toBeDefined();
++    expect(s.daemon.writes).toEqual([]);
++  });
++
++  it("is not set by a turn that ends done, or by an allow", async () => {
++    const { verdicts } = await stickyAfter(async (s) => {
++      await s.server.emit(
++        "agent.turn_ended",
++        { agent: agent(s.m), turnId: "t1", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "done: PR https://github.com/octo/example/pull/1" }] },
++        s.paseo,
++      );
++      await s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "x", resolution: { behavior: "allow" } }, s.paseo);
++    });
++    expect(verdicts.after).toBe("notes-write");
++    expect(verdicts["after-reload"]).toBe("notes-write");
++  });
++
++  it("is kept per agent: another crewmate is not sticky", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_resolved", { agent: agent(s.m, "crew-1"), requestId: "x", resolution: { behavior: "deny" } }, s.paseo);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2" }), s.paseo);
++    expect((await s.lines()).find((line) => line.event === "request")?.rule).toBe("notes-write");
++  });
++});
++
++// ---------------------------------------------------------------------------
++// 6. Gates
++// ---------------------------------------------------------------------------
++
++describe("gates", () => {
++  it("registers nothing when the config says off", async () => {
++    const s = await setup("off");
++    expect(s.server.count()).toBe(0);
++  });
++
++  it("stops at once when switched off after it started", async () => {
++    const s = await setup("shadow");
++    await writePermits(s.m);
++    s.config.current = { ...s.config.current, permissionBroker: "off" };
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
++    await expect(readdir(join(s.m.home, "data", "permissions"))).resolves.toEqual(["permits"]);
++    expect(s.daemon.writes).toEqual([]);
++  });
++
++  it("does not look at an agent without the crew label, or at the first mate", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "other-1" }), s.paseo);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "mate-1" }), s.paseo);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "unknown-1" }), s.paseo);
++    await expect(readdir(join(s.m.home, "data", "permissions"))).resolves.toEqual(["permits"]);
++    expect(s.daemon.writes).toEqual([]);
++  });
++
++  it("looks a crewmate's labels up once", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    for (const requestId of ["a", "b", "c"]) {
++      await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId }), s.paseo);
++    }
++    expect(s.daemon.lookups).toBe(1);
++  });
++
++  const relays: Array<[string, (s: Setup) => Promise<void>, string, FirstmateConfig["permissionBroker"]?, string?]> = [
++    ["a crewmate whose task is reserved", (s) => writePermits(s.m), "never:not-crew", "shadow", "crew-reserved"],
++    ["a crewmate with no task label", (s) => writePermits(s.m), "never:not-crew", "shadow", "crew-notask"],
++    ["no permits file", async () => undefined, "never:no-permits"],
++    ["a permits file that is not JSON", (s) => writeFile(join(s.m.home, "data", "permissions", "permits", `${TASK}.json`), "{ not json"), "never:no-permits"],
++    ["an invalid permits file", (s) => writePermits(s.m, { writeDirs: ["data/../tools"] }), "never:no-permits"],
++    [
++      "another task's permits",
++      async (s) => {
++        await writePermits(s.m, {}, "demo-03-other");
++        await writeFile(
++          join(s.m.home, "data", "permissions", "permits", `${TASK}.json`),
++          await readFile(join(s.m.home, "data", "permissions", "permits", "demo-03-other.json")),
++        );
++      },
++      "never:no-permits",
++    ],
++    ["live: false in live mode", (s) => writePermits(s.m, { live: false }), "never:no-permits", "live"],
++  ];
++
++  it.each(relays)("relays %s and answers nothing", async (_name, prepare, rule, mode = "shadow", id = "crew-1") => {
++    const s = await setup(mode);
++    await prepare(s);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id }), s.paseo);
++    expect((await s.lines()).map((line) => [line.verdict, line.rule])).toEqual([["relay", rule]]);
++    expect(s.daemon.writes).toEqual([]);
++  });
++
++  it("reads the permits on every request, so an edit counts at once", async () => {
++    const s = await setup();
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "a" }), s.paseo);
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "b" }), s.paseo);
++    expect((await s.lines()).map((line) => line.rule)).toEqual(["never:no-permits", "notes-write"]);
++  });
++});
++
++// ---------------------------------------------------------------------------
++// 7. The log
++// ---------------------------------------------------------------------------
++
++describe("the log", () => {
++  it("writes one line per request and per resolution, in the spec's shape", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "permission-exec-a" }), s.paseo);
++    await s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "permission-exec-a", resolution: { behavior: "allow" } }, s.paseo);
++    const [request, resolved, ...rest] = await s.lines();
++    expect(rest).toEqual([]);
++    expect(Object.keys(request ?? {})).toEqual([
++      "v",
++      "ts",
++      "event",
++      "mode",
++      "agentId",
++      "task",
++      "plan",
++      "provider",
++      "name",
++      "kind",
++      "requestId",
++      "cwd",
++      "command",
++      "verdict",
++      "rule",
++      "tier",
++      "detail",
++      "permitsSha256",
++      "answered",
++    ]);
++    expect(request).toMatchObject({
++      v: 1,
++      ts: "2026-10-12T09:14:03.120Z",
++      event: "request",
++      mode: "shadow",
++      agentId: "crew-1",
++      task: TASK,
++      plan: "demo-plan",
++      provider: "codex",
++      name: "CodexBash",
++      kind: "tool",
++      requestId: "permission-exec-a",
++      verdict: "allow",
++      rule: "notes-write",
++      tier: 1,
++      answered: false,
++    });
++    expect(request?.permitsSha256).toMatch(/^[0-9a-f]{64}$/);
++    expect(JSON.stringify(request)).not.toContain("not to be logged");
++    expect(resolved).toEqual({ v: 1, ts: "2026-10-12T09:14:03.120Z", event: "resolved", agentId: "crew-1", requestId: "permission-exec-a", behavior: "allow", byBroker: false });
++    expect(await readdir(join(s.m.home, "data", "permissions"))).toContain("log-2026-10.jsonl");
++  });
++
++  it("redacts credentials and cuts the command", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    const secret = `ghp_${"A1b2".repeat(9)}`;
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, `gh api repos/octo/example -H 'Authorization: ${secret}' --password hunter2 ${"x".repeat(5000)}`), s.paseo);
++    const [line] = await s.lines();
++    const command = String(line?.command);
++    expect(command).not.toContain(secret);
++    expect(command).not.toContain("hunter2");
++    expect(command).toContain("[redacted]");
++    expect(command.length).toBeLessThanOrEqual(MAX_LOGGED_COMMAND + 30);
++    expect(line?.verdict).toBe("relay");
++  });
++
++  it("redacts the forms of spec 3.9", () => {
++    expect(redact(`x github_pat_${"a".repeat(30)} y`)).toBe("x [redacted] y");
++    expect(redact("x xoxb-1234567890-abcdef y")).toBe("x [redacted] y");
++    expect(redact(`x ${"QUJD".repeat(16)} y`)).toBe("x [redacted] y");
++    expect(redact("$env:GH_TOKEN='abc123'; gh api x")).not.toContain("abc123");
++    expect(redact("Get-Content C:\\Users\\example\\notes\\authority.md")).toBe("Get-Content C:\\Users\\example\\notes\\authority.md");
++  });
++
++  it("keeps the verdict when a write fails, and says so on stderr once an hour", async () => {
++    let calls = 0;
++    const s = await setup("shadow", {
++      append: async () => {
++        calls += 1;
++        throw new Error("disk full");
++      },
++    });
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "a" }), s.paseo);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, "Remove-Item x", { requestId: "b" }), s.paseo);
++    expect(calls).toBe(2);
++    const logged = errors.mock.calls.filter((call: unknown[]) => String(call[0]).includes("could not write"));
++    expect(logged).toHaveLength(1);
++    // The destructive hit still made the agent sticky, and the allow still counted for the rate limit.
++    const state = await readBrokerState(s.m.stateFile);
++    expect(state.sticky["crew-1"]?.reason).toBe("never:destructive");
++    expect(state.allows["crew-1"]).toHaveLength(1);
++    expect(s.daemon.writes).toEqual([]);
++  });
++
++  it("costs only a log line when a hook fails", async () => {
++    const s = await setup();
++    s.daemon.labels.delete("crew-1");
++    const failing = { ...s.paseo as object, agents: { ref: () => ({ refresh: async () => { throw new Error("daemon gone"); } }) } };
++    await expect(s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), failing)).resolves.toBeUndefined();
++    expect(errors.mock.calls.some((call: unknown[]) => String(call[0]).includes("permission broker could not handle"))).toBe(true);
++  });
++
++  it("counts allows for the rate limit across requests", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    for (let index = 0; index < 121; index += 1) {
++      await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: `r${index}` }), s.paseo);
++    }
++    const rules = (await s.lines()).map((line) => line.rule);
++    expect(rules.filter((rule) => rule === "notes-write")).toHaveLength(120);
++    expect(rules.at(-1)).toBe("never:rate");
++  });
++});
+diff --git a/server/permission-broker.ts b/server/permission-broker.ts
+new file mode 100644
+index 0000000..86d3957
+--- /dev/null
++++ b/server/permission-broker.ts
+@@ -0,0 +1,455 @@
++/**
++ * The permission broker, shadow mode: checks every crew permission request against its task's permits
++ * and the never-auto list, and logs the answer it would give and the answer people gave. It never
++ * answers. Nothing here calls the SDK's permission answer or sends anything to an agent, in any mode; `live`
++ * logs as live mode will judge (a permits file with `"live": false` relays) and answers nothing either.
++ *
++ * - **Which requests.** Only an agent labelled `firstmate.role=crew`, not the first mate itself. A
++ *   crewmate's labels are looked up once, through the crew relay's lookup, and kept for its life. An agent
++ *   without the crew label is not looked at further and gets no log line.
++ * - **Permits.** `data/permissions/permits/<task>.json` in the home, read on every request, so an edit
++ *   takes effect at once. Missing, unreadable or invalid means nothing is allowed.
++ * - **After a refusal (spec 3.7).** A crewmate becomes sticky for the rest of its life when a person denies
++ *   one of its requests, when a turn of it ends on a `blocked:`, `needs-decision:` or `failed:` status
++ *   line, or when a request of it hits `destructive`, `outward`, `credential` or `system`. From then on
++ *   its requests relay as `never:after-refusal`. Kept in `permission-broker.json` in the plugin's data
++ *   folder, with the allows of the last hour for the rate limit, so a reload forgets neither.
++ * - **The log (spec 3.9).** `data/permissions/log-YYYY-MM.jsonl` in the home, appended one JSON line per
++ *   request and per resolution, never edited. Commands are redacted and cut to 2000 characters; the
++ *   crewmate's own description of the request is not logged. A failed write goes to stderr at most once
++ *   an hour and changes nothing else.
++ * - **Off is off.** With `permissionBroker` `"off"` when the plugin loads, no hook is registered. Each event
++ *   reads the config again, so switching to `"off"` later stops the broker at once.
++ *
++ * Every hook is guarded: an error goes to stderr and costs at most that event's log line.
++ */
++import { createHash, randomUUID } from "node:crypto";
++import { realpathSync } from "node:fs";
++import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
++import { homedir } from "node:os";
++import { dirname, join } from "node:path";
++
++import type { PluginLifecycleEvents, PluginLifecycleRegistration } from "@getpaseo/plugin/server";
++
++import { CREW_LABELS, type FirstmateConfig } from "../shared/fleet";
++import { resolveHome } from "./config";
++import { isCrew, paseoRelayHost } from "./crew-relay";
++import { parseCrewReport } from "./crew-report";
++import { pluginDir } from "./data-dir";
++import type { PaseoApi } from "./host-types";
++import { match, neverId, taskIdOk, type MatchResult } from "./permit-match";
++import { neverAuto, STICKY_IDS } from "./permit-rules";
++import { closingText } from "./report-cache";
++import { serialized } from "./serialize";
++
++/** The label a crewmate's plan is named by, when the first mate sets one. */
++export const PLAN_LABEL = "firstmate.plan";
++/** The most of a command a log line keeps. */
++export const MAX_LOGGED_COMMAND = 2000;
++/** How many crewmates' labels are kept, and how long a sticky mark or an allow time is. */
++const MAX_AGENTS = 2000;
++const STICKY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
++const HOUR_MS = 60 * 60 * 1000;
++const STUCK_TURN_STATES: ReadonlySet<string> = new Set(["blocked", "needs-decision", "failed"]);
++
++export interface BrokerState {
++  /** Crewmates that may not be answered any more, with when and why. */
++  sticky: Record<string, { at: string; reason: string }>;
++  /** When each crewmate's requests were judged `allow` in the last hour (ISO). */
++  allows: Record<string, string[]>;
++}
++
++export function emptyBrokerState(): BrokerState {
++  return { sticky: {}, allows: {} };
++}
++
++export interface BrokerStore {
++  load(): Promise<BrokerState>;
++  save(state: BrokerState): Promise<void>;
++}
++
++/** What the broker needs of Paseo: an agent's labels, null when Paseo has no such agent. */
++export interface BrokerHost {
++  labels(agentId: string): Promise<Readonly<Record<string, string>> | null>;
++}
++
++interface CrewFacts {
++  task: string | null;
++  plan: string | null;
++}
++
++export interface PermissionBrokerOptions {
++  host: BrokerHost;
++  store: BrokerStore;
++  readConfig: () => Promise<FirstmateConfig>;
++  /** Appends text to a file, creating its folder. */
++  append?: (path: string, text: string) => Promise<void>;
++  now?: () => number;
++  realpath?: (path: string) => string | null;
++  userHome?: string;
++}
++
++// ---------------------------------------------------------------------------
++// Redaction
++// ---------------------------------------------------------------------------
++
++const VALUE = String.raw`(?:\s*[=:]\s*|\s+)(?:'[^']*'|"[^"]*"|[^\s'";|,]+)`;
++const SECRETS: readonly RegExp[] = [
++  /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
++  /\bgithub_pat_[A-Za-z0-9_]{20,}/g,
++  /\bxox[abposr]-[A-Za-z0-9-]{10,}/g,
++  /[A-Za-z0-9+/=_-]{48,}/g,
++  ...neverAuto("credential").patterns.map((pattern) => new RegExp(`(?:${pattern.source})(?:${VALUE})?`, "gi")),
++];
++
++/** Anything that looks like a credential, with the value after it, replaced by `[redacted]`. */
++export function redact(text: string): string {
++  return SECRETS.reduce((current, pattern) => current.replace(pattern, "[redacted]"), text);
++}
++
++function clip(text: string, max: number): string {
++  return text.length <= max ? text : `${text.slice(0, max)}[cut ${text.length - max} chars]`;
++}
++
++// ---------------------------------------------------------------------------
++// The broker
++// ---------------------------------------------------------------------------
++
++function defaultRealpath(path: string): string | null {
++  try {
++    return realpathSync.native(path);
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code;
++    if (code === "ENOENT" || code === "ENOTDIR") return null;
++    // Unsure where it leads: the request fails to match and is relayed.
++    throw error;
++  }
++}
++
++async function defaultAppend(path: string, text: string): Promise<void> {
++  await mkdir(dirname(path), { recursive: true });
++  await appendFile(path, text, "utf8");
++}
++
++export class PermissionBroker {
++  private state: BrokerState | null = null;
++  private loading: Promise<BrokerState> | null = null;
++  private readonly crew = new Map<string, CrewFacts | null>();
++  private lastLogError = Number.NEGATIVE_INFINITY;
++  private readonly host: BrokerHost;
++  private readonly store: BrokerStore;
++  private readonly readConfig: () => Promise<FirstmateConfig>;
++  private readonly append: (path: string, text: string) => Promise<void>;
++  private readonly now: () => number;
++  private readonly realpath: (path: string) => string | null;
++  private readonly userHome: string;
++
++  constructor(options: PermissionBrokerOptions) {
++    this.host = options.host;
++    this.store = options.store;
++    this.readConfig = options.readConfig;
++    this.append = options.append ?? defaultAppend;
++    this.now = options.now ?? Date.now;
++    this.realpath = options.realpath ?? defaultRealpath;
++    this.userHome = options.userHome ?? homedir();
++  }
++
++  /** The config when the broker is on and the agent is a crewmate other than the first mate; else null. */
++  private async crewmate(agentId: string): Promise<{ config: FirstmateConfig; facts: CrewFacts } | null> {
++    const config = await this.readConfig();
++    if (config.permissionBroker === "off") return null;
++    const mateId = config.mateAgentId.trim();
++    if (agentId === mateId) return null;
++    let facts = this.crew.get(agentId);
++    if (facts === undefined) {
++      const labels = await this.host.labels(agentId);
++      if (labels === null) return null;
++      facts = isCrew(agentId, labels, mateId)
++        ? { task: labels[CREW_LABELS.task] ?? null, plan: labels[PLAN_LABEL] ?? null }
++        : null;
++      this.crew.set(agentId, facts);
++      if (this.crew.size > MAX_AGENTS) this.crew.delete(this.crew.keys().next().value as string);
++    }
++    return facts === null ? null : { config, facts };
++  }
++
++  async onPermissionRequested(event: PluginLifecycleEvents["agent.permission_requested"]): Promise<void> {
++    const found = await this.crewmate(event.agent.id);
++    if (found === null) return;
++    const { config, facts } = found;
++    const mode = config.permissionBroker === "live" ? "live" : "shadow";
++    const home = resolveHome(config);
++    const permits = facts.task !== null && taskIdOk(facts.task) ? await this.readPermits(home, facts.task) : { raw: undefined, sha: null };
++    const state = await this.load();
++    const now = this.now();
++    const agentId = event.agent.id;
++    const recent = (state.allows[agentId] ?? []).filter((at) => Date.parse(at) > now - HOUR_MS);
++    let result: MatchResult;
++    try {
++      result = match(event.request, permits.raw, {
++        crew: true,
++        task: facts.task,
++        mode,
++        home,
++        userHome: this.userHome,
++        worktree: event.agent.cwd,
++        sticky: state.sticky[agentId] !== undefined,
++        allowsLastHour: recent.length,
++        realpath: this.realpath,
++      });
++    } catch (error) {
++      result = { verdict: "relay", rule: "error", tier: null, detail: error instanceof Error ? error.message : String(error) };
++    }
++
++    const at = new Date(now).toISOString();
++    if (result.verdict === "allow") state.allows[agentId] = [...recent, at];
++    else if (recent.length !== (state.allows[agentId] ?? []).length) state.allows[agentId] = recent;
++    const id = neverId(result);
++    if (id !== null && STICKY_IDS.has(id) && state.sticky[agentId] === undefined) {
++      state.sticky[agentId] = { at, reason: result.rule };
++    }
++    await this.persist(now);
++
++    const input = (typeof event.request.input === "object" && event.request.input !== null ? event.request.input : {}) as Record<string, unknown>;
++    const command = typeof input.command === "string" ? clip(redact(input.command), MAX_LOGGED_COMMAND) : null;
++    const cwd = typeof input.cwd === "string" ? redact(input.cwd) : null;
++    await this.log(home, now, {
++      v: 1,
++      ts: at,
++      event: "request",
++      mode,
++      agentId,
++      task: facts.task,
++      plan: facts.plan,
++      provider: event.request.provider,
++      name: event.request.name,
++      kind: event.request.kind,
++      requestId: event.request.id,
++      cwd,
++      command,
++      verdict: result.verdict,
++      rule: result.rule,
++      tier: result.tier,
++      detail: clip(redact(result.detail), 500),
++      permitsSha256: permits.sha,
++      // Shadow: nothing is ever answered.
++      answered: false,
++    });
++  }
++
++  async onPermissionResolved(event: PluginLifecycleEvents["agent.permission_resolved"]): Promise<void> {
++    const found = await this.crewmate(event.agent.id);
++    if (found === null) return;
++    const now = this.now();
++    const at = new Date(now).toISOString();
++    if (event.resolution.behavior === "deny") await this.makeSticky(event.agent.id, at, "deny", now);
++    await this.log(resolveHome(found.config), now, {
++      v: 1,
++      ts: at,
++      event: "resolved",
++      agentId: event.agent.id,
++      requestId: event.requestId,
++      behavior: event.resolution.behavior,
++      // The broker sent no answer, so none of these is its own.
++      byBroker: false,
++    });
++  }
++
++  async onTurnEnded(event: PluginLifecycleEvents["agent.turn_ended"]): Promise<void> {
++    const found = await this.crewmate(event.agent.id);
++    if (found === null) return;
++    const report = parseCrewReport(closingText(event.timeline));
++    if (report === null || !STUCK_TURN_STATES.has(report.state)) return;
++    const now = this.now();
++    await this.makeSticky(event.agent.id, new Date(now).toISOString(), `turn:${report.state}`, now);
++  }
++
++  /** The saved state, for tests. */
++  snapshot(): Promise<BrokerState> {
++    return this.load();
++  }
++
++  private async makeSticky(agentId: string, at: string, reason: string, now: number): Promise<void> {
++    const state = await this.load();
++    if (state.sticky[agentId] !== undefined) return;
++    state.sticky[agentId] = { at, reason };
++    await this.persist(now);
++  }
++
++  private async readPermits(home: string, task: string): Promise<{ raw: unknown; sha: string | null }> {
++    let bytes: Buffer;
++    try {
++      bytes = await readFile(join(home, "data", "permissions", "permits", `${task}.json`));
++    } catch (error) {
++      if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`[firstmate] permission broker could not read the permits of ${task}:`, error);
++      return { raw: undefined, sha: null };
++    }
++    const sha = createHash("sha256").update(bytes).digest("hex");
++    try {
++      return { raw: JSON.parse(bytes.toString("utf8")), sha };
++    } catch {
++      // Not JSON: invalid, which relays everything.
++      return { raw: null, sha };
++    }
++  }
++
++  private async log(home: string, now: number, line: Record<string, unknown>): Promise<void> {
++    const month = new Date(now).toISOString().slice(0, 7);
++    const path = join(home, "data", "permissions", `log-${month}.jsonl`);
++    try {
++      await this.append(path, `${JSON.stringify(line)}\n`);
++    } catch (error) {
++      if (now - this.lastLogError >= HOUR_MS) {
++        this.lastLogError = now;
++        console.error(`[firstmate] permission broker could not write ${path}:`, error);
++      }
++    }
++  }
++
++  private load(): Promise<BrokerState> {
++    if (this.state !== null) return Promise.resolve(this.state);
++    this.loading ??= this.store.load().then((state) => {
++      this.state = state;
++      return state;
++    });
++    return this.loading;
++  }
++
++  private async persist(now: number): Promise<void> {
++    const state = this.state;
++    if (state === null) return;
++    for (const [agentId, mark] of Object.entries(state.sticky)) {
++      if (Date.parse(mark.at) <= now - STICKY_TTL_MS) delete state.sticky[agentId];
++    }
++    for (const [agentId, times] of Object.entries(state.allows)) {
++      const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
++      if (recent.length === 0) delete state.allows[agentId];
++      else state.allows[agentId] = recent;
++    }
++    await this.store.save(state).catch((error: unknown) => {
++      console.error("[firstmate] could not save the permission broker's state:", error);
++    });
++  }
++}
++
++// ---------------------------------------------------------------------------
++// The file, and Paseo
++// ---------------------------------------------------------------------------
++
++/** The saved state, leniently: anything it cannot read starts afresh. */
++export async function readBrokerState(path: string): Promise<BrokerState> {
++  let raw: unknown;
++  try {
++    raw = JSON.parse(await readFile(path, "utf8"));
++  } catch (error) {
++    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`[firstmate] ${path} could not be read, starting afresh:`, error);
++    return emptyBrokerState();
++  }
++  const object = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
++  const state = emptyBrokerState();
++  if (typeof object.sticky === "object" && object.sticky !== null) {
++    for (const [agentId, mark] of Object.entries(object.sticky)) {
++      const { at, reason } = (mark ?? {}) as { at?: unknown; reason?: unknown };
++      if (typeof at === "string" && typeof reason === "string") state.sticky[agentId] = { at, reason };
++    }
++  }
++  if (typeof object.allows === "object" && object.allows !== null) {
++    for (const [agentId, times] of Object.entries(object.allows)) {
++      if (Array.isArray(times)) state.allows[agentId] = times.filter((at): at is string => typeof at === "string");
++    }
++  }
++  return state;
++}
++
++/** `permission-broker.json`, written whole to a temporary file and renamed into place. */
++export function brokerFileStore(path: string): BrokerStore {
++  return {
++    load: () => readBrokerState(path),
++    save: (state) =>
++      serialized(path, async () => {
++        await mkdir(dirname(path), { recursive: true });
++        const temporary = `${path}.${randomUUID()}.tmp`;
++        await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
++        await rename(temporary, path);
++      }),
++  };
++}
++
++/** Paseo for the broker: the crew relay's lookup of an agent's labels. */
++export function paseoBrokerHost(handle: () => PaseoApi | null, readConfig: () => Promise<FirstmateConfig>): BrokerHost {
++  const relayHost = paseoRelayHost(handle, readConfig);
++  return {
++    async labels(agentId) {
++      return (await relayHost.crewFacts(agentId))?.labels ?? null;
++    },
++  };
++}
++
++export interface RegisterPermissionBrokerOptions {
++  stateFile?: string;
++  append?: PermissionBrokerOptions["append"];
++  now?: PermissionBrokerOptions["now"];
++  realpath?: PermissionBrokerOptions["realpath"];
++  userHome?: string;
++  host?: BrokerHost;
++}
++
++/**
++ * Wires the broker to Paseo's hooks, unless the config says `"off"` when it loads. `ready` settles once
++ * that is decided. Returns what stops it.
++ */
++export function registerPermissionBroker(
++  server: PluginLifecycleRegistration,
++  readConfig: () => Promise<FirstmateConfig>,
++  options: RegisterPermissionBrokerOptions = {},
++): { broker: PermissionBroker; ready: Promise<void>; stop: () => void } {
++  let paseo: PaseoApi | null = null;
++  let stopped = false;
++  let offs: Array<() => void> = [];
++  const broker = new PermissionBroker({
++    host: options.host ?? paseoBrokerHost(() => paseo, readConfig),
++    store: brokerFileStore(options.stateFile ?? join(pluginDir(), "permission-broker.json")),
++    readConfig,
++    ...(options.append === undefined ? {} : { append: options.append }),
++    ...(options.now === undefined ? {} : { now: options.now }),
++    ...(options.realpath === undefined ? {} : { realpath: options.realpath }),
++    ...(options.userHome === undefined ? {} : { userHome: options.userHome }),
++  });
++  const guard =
++    <E>(name: string, run: (event: E) => Promise<void>) =>
++    async (event: E, context: { paseo: PaseoApi }) => {
++      try {
++        paseo = context.paseo;
++        await run(event);
++      } catch (error) {
++        console.error(`[firstmate] permission broker could not handle ${name}:`, error);
++      }
++    };
++  const ready = readConfig()
++    .then((config) => {
++      if (stopped || config.permissionBroker === "off") return;
++      offs = [
++        server.on(
++          "agent.permission_requested",
++          guard<PluginLifecycleEvents["agent.permission_requested"]>("a permission request", (event) => broker.onPermissionRequested(event)),
++        ),
++        server.on(
++          "agent.permission_resolved",
++          guard<PluginLifecycleEvents["agent.permission_resolved"]>("a resolved permission", (event) => broker.onPermissionResolved(event)),
++        ),
++        server.on("agent.turn_ended", guard<PluginLifecycleEvents["agent.turn_ended"]>("a turn's end", (event) => broker.onTurnEnded(event))),
++      ];
++    })
++    .catch((error: unknown) => {
++      console.error("[firstmate] permission broker could not read the config; it stays off:", error);
++    });
++  return {
++    broker,
++    ready,
++    stop() {
++      stopped = true;
++      offs.forEach((off) => off());
++      offs = [];
++    },
++  };
++}
+diff --git a/server/permit-match.test.ts b/server/permit-match.test.ts
+new file mode 100644
+index 0000000..98ba2a8
+--- /dev/null
++++ b/server/permit-match.test.ts
+@@ -0,0 +1,924 @@
++import { describe, expect, it } from "vitest";
++
++import {
++  match,
++  normalizePath,
++  parsePermits,
++  parseScript,
++  unwrapCommand,
++  type MatchContext,
++  type MatchResult,
++  type Permits,
++  type PermitRequest,
++} from "./permit-match";
++import { MAX_ALLOWS_PER_HOUR, NEVER_AUTO, type NeverAutoCase } from "./permit-rules";
++
++// A synthetic machine: every path, name and repository here is made up.
++const USER = "C:\\Users\\example";
++const HOME = `${USER}\\.paseo\\plugin-data\\firstmate\\home`;
++const TASK = "demo-01-example";
++const WORKTREE = `${USER}\\.paseo\\worktrees\\abc123\\demo-01-example`;
++const NOTES = `${HOME}\\data\\demo-01-example`;
++const REVIEW = `${HOME}\\data\\demo-02-reviewed`;
++const SCRATCH = `${USER}\\AppData\\Local\\Temp\\fm-demo-01`;
++const REPO = `${USER}\\.paseo\\worktrees\\def456\\demo-02-reviewed`;
++const SHIM = `${USER}\\.codex\\tmp\\arg0\\codex-arg0Ab12\\apply_patch.bat`;
++const PWSH = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
++const OUTSIDE = "C:\\Outside\\place";
++
++const PLACES: Record<string, string> = {
++  "<worktree>": WORKTREE,
++  "<home>": HOME,
++  "<notes>": NOTES,
++  "<review>": REVIEW,
++  "<scratch>": SCRATCH,
++  "<repo>": REPO,
++  "<user>": USER,
++  "<shim>": SHIM,
++};
++
++function fill(text: string): string {
++  return text.replace(/<(?:worktree|home|notes|review|scratch|repo|user|shim)>/g, (place) => PLACES[place] ?? place);
++}
++
++/** Folders that exist, and junctions: `<root>\jx` in every root leads to a folder outside. */
++const DIRS = new Set(
++  [
++    "C:\\",
++    "C:\\Users",
++    USER,
++    `${USER}\\.paseo`,
++    `${USER}\\.paseo\\plugin-data`,
++    `${USER}\\.paseo\\plugin-data\\firstmate`,
++    HOME,
++    `${HOME}\\data`,
++    `${HOME}\\data\\tools`,
++    `${HOME}\\data\\permissions`,
++    NOTES,
++    REVIEW,
++    `${USER}\\.paseo\\worktrees`,
++    `${USER}\\.paseo\\worktrees\\abc123`,
++    WORKTREE,
++    `${USER}\\.paseo\\worktrees\\def456`,
++    REPO,
++    `${USER}\\AppData`,
++    `${USER}\\AppData\\Local`,
++    `${USER}\\AppData\\Local\\Temp`,
++    SCRATCH,
++    `${USER}\\.codex`,
++    "C:\\Windows",
++    "C:\\Outside",
++    OUTSIDE,
++  ].map((dir) => dir.toLowerCase()),
++);
++const JUNCTIONS = new Map([NOTES, REVIEW, SCRATCH, WORKTREE, REPO].map((root) => [`${root}\\jx`.toLowerCase(), OUTSIDE]));
++
++function realpath(path: string): string | null {
++  const lower = path.toLowerCase();
++  for (const [link, target] of JUNCTIONS) {
++    if (lower === link || lower.startsWith(`${link}\\`)) {
++      const rest = path.slice(link.length);
++      return DIRS.has(`${target}${rest}`.toLowerCase()) ? `${target}${rest}` : null;
++    }
++  }
++  return DIRS.has(lower) || /^[a-z]:\\?$/.test(lower) ? path : null;
++}
++
++const BASE_EXEC: Permits["exec"] = [
++  { in: "scratch", prefix: ["uv", "run", "--offline", "--no-project", "python"] },
++  { in: "scratch", prefix: ["npm.cmd", "test"] },
++  { in: "notes", prefix: ["node"] },
++  { in: "worktree", prefix: ["uv", "run", "--offline", "--project", "tools/check", "python", "-X", "utf8", "-B", "-m", "unittest"] },
++  { in: "notes", prefix: ["pwsh", "-NoProfile", "-File", `${HOME}\\data\\tools\\fmpy.ps1`] },
++];
++
++function permits(overrides: Partial<Permits> = {}): Permits {
++  return {
++    version: 1,
++    task: TASK,
++    live: true,
++    writeDirs: ["data/demo-01-example", "data/demo-02-reviewed"],
++    scratchDirs: [SCRATCH],
++    readRepos: [REPO],
++    netRead: { githubRepos: ["octo/example"], hosts: ["registry.npmjs.org", "registry.example.org"] },
++    gitLocal: true,
++    exec: BASE_EXEC,
++    envNames: ["PYTHONUTF8", "PYTHONDONTWRITEBYTECODE", "UV_OFFLINE", "UV_CACHE_DIR"],
++    ...overrides,
++  };
++}
++
++/** Every root, every exec prefix the base has, and an exec entry in every place for the first word of each statement of `script`. */
++function maximal(script = ""): Permits {
++  const firsts = script
++    .split(/[;\n]/)
++    .map((statement) => statement.trim().replace(/^& /, "").split(/\s+/)[0]?.replace(/^'|'$/g, "") ?? "")
++    .filter((word) => word !== "" && !word.startsWith("$"));
++  const extra = firsts.flatMap((word) => (["scratch", "worktree", "notes"] as const).map((place) => ({ in: place, prefix: [word] })));
++  return permits({ live: true, exec: [...BASE_EXEC, ...extra] });
++}
++
++function wrap(script: string): string {
++  return `"${PWSH}" -Command '${script.replace(/'/g, "''")}'`;
++}
++
++function request(script: string, cwd = WORKTREE, overrides: Partial<PermitRequest> = {}): PermitRequest {
++  return { provider: "codex", name: "CodexBash", kind: "tool", input: { command: wrap(fill(script)), cwd: fill(cwd) }, ...overrides };
++}
++
++function context(overrides: Partial<MatchContext> = {}): MatchContext {
++  return {
++    crew: true,
++    task: TASK,
++    mode: "shadow",
++    home: HOME,
++    userHome: USER,
++    worktree: WORKTREE,
++    sticky: false,
++    allowsLastHour: 0,
++    realpath,
++    ...overrides,
++  };
++}
++
++function run(script: string, cwd = WORKTREE, file: unknown = permits(), ctx: Partial<MatchContext> = {}): MatchResult {
++  return match(request(script, cwd), file, context(ctx));
++}
++
++// ---------------------------------------------------------------------------
++// Allowed fixtures: at least one per answerable class of evidence.md
++// ---------------------------------------------------------------------------
++
++interface Fixture {
++  name: string;
++  cls: string;
++  script: string;
++  cwd?: string;
++  rule: string;
++  tier: 1 | 2;
++  /** A target path in the script, and the root it lies in, for the path mutations. */
++  target?: string;
++  root?: string;
++  /** A host or repository pair in the script, for the host mutation. */
++  host?: string;
++}
++
++const PATCH = (header: string) => `$reviewPatch = @'
++*** Begin Patch
++${header}
+++# Review round 1
+++No blocking findings.
++*** End Patch
++'@
++& '<shim>' $reviewPatch`;
++
++const ALLOWED: Fixture[] = [
++  {
++    name: "New-Item a folder in the notes",
++    cls: "notes write",
++    script: "New-Item -ItemType Directory -Force -Path '<notes>\\review-scratch-1'",
++    rule: "notes-write",
++    tier: 1,
++    target: "<notes>\\review-scratch-1",
++    root: "<notes>",
++  },
++  {
++    name: "Copy-Item a report into the reviewed ticket's folder",
++    cls: "notes write",
++    script: "Copy-Item -LiteralPath '<worktree>\\report.md' -Destination '<review>\\review-1.md'",
++    rule: "notes-write",
++    tier: 1,
++    target: "<review>\\review-1.md",
++    root: "<review>",
++  },
++  {
++    name: "Expand-Archive from scratch into the notes",
++    cls: "notes write",
++    script: "Expand-Archive -LiteralPath '<scratch>\\head.zip' -DestinationPath '<notes>\\head'",
++    rule: "notes-write",
++    tier: 1,
++    target: "<notes>\\head",
++    root: "<notes>",
++  },
++  {
++    name: "apply_patch adds a review file",
++    cls: "notes write",
++    script: PATCH("*** Add File: <notes>/review-1.md"),
++    rule: "notes-write",
++    tier: 1,
++    target: "<notes>/review-1.md",
++    root: "<notes>",
++  },
++  {
++    name: "apply_patch updates a scratch file",
++    cls: "notes write",
++    script: PATCH("*** Update File: <scratch>/plan.md\n@@\n-old line"),
++    rule: "notes-write",
++    tier: 1,
++    target: "<scratch>/plan.md",
++    root: "<scratch>",
++  },
++  {
++    name: "New-Item with -WhatIf",
++    cls: "dry run",
++    script: "New-Item -ItemType Directory -Path '<notes>\\a','<notes>\\b' -WhatIf",
++    rule: "notes-write",
++    tier: 1,
++    target: "<notes>\\b",
++    root: "<notes>",
++  },
++  {
++    name: "Get-Content of the brief, piped into Select-Object",
++    cls: "local read",
++    script: "Get-Content -LiteralPath '<notes>\\authority.md' -Raw | Select-Object -First 20",
++    rule: "local-read",
++    tier: 1,
++    target: "<notes>\\authority.md",
++    root: "<notes>",
++  },
++  {
++    name: "Test-Path in the read repo",
++    cls: "local read",
++    script: "Test-Path -LiteralPath '<repo>\\README.md'",
++    rule: "local-read",
++    tier: 1,
++    target: "<repo>\\README.md",
++    root: "<repo>",
++  },
++  {
++    name: "gh api GET on a listed repo",
++    cls: "public read-only network",
++    script: "gh api repos/octo/example/pulls/7 --jq '.head.sha'",
++    rule: "net-read",
++    tier: 1,
++    host: "octo/example",
++  },
++  {
++    name: "gh pr view on a listed repo",
++    cls: "public read-only network",
++    script: "gh pr view https://github.com/octo/example/pull/7 --json 'title,state'",
++    rule: "net-read",
++    tier: 1,
++    host: "octo/example",
++  },
++  {
++    name: "curl from a listed host into scratch",
++    cls: "public read-only network",
++    script: "curl.exe -fLsS https://registry.npmjs.org/left-pad -o '<scratch>\\left-pad.json'",
++    rule: "net-read",
++    tier: 1,
++    target: "<scratch>\\left-pad.json",
++    root: "<scratch>",
++    host: "registry.npmjs.org",
++  },
++  {
++    name: "Invoke-RestMethod from a listed host",
++    cls: "public read-only network",
++    script: "Invoke-RestMethod -Uri 'https://registry.example.org/v1/info'",
++    rule: "net-read",
++    tier: 1,
++    host: "registry.example.org",
++  },
++  {
++    name: "a shallow public clone into scratch",
++    cls: "public read-only network",
++    script: "git clone --depth 1 https://github.com/octo/example.git '<scratch>\\example'",
++    cwd: "<scratch>",
++    rule: "net-read",
++    tier: 1,
++    target: "<scratch>\\example",
++    root: "<scratch>",
++    host: "octo/example",
++  },
++  {
++    name: "git add in the own worktree",
++    cls: "git in own worktree",
++    script: "git add -- '<worktree>\\server\\parser.ts'",
++    rule: "git-local",
++    tier: 1,
++    target: "<worktree>\\server\\parser.ts",
++    root: "<worktree>",
++  },
++  { name: "git commit", cls: "git in own worktree", script: "git commit -m 'Add the parser'", rule: "git-local", tier: 1 },
++  { name: "git branch", cls: "git in own worktree", script: "git branch demo-topic HEAD", rule: "git-local", tier: 1 },
++  {
++    name: "git status in the own worktree",
++    cls: "git in own worktree",
++    script: "git --no-optional-locks status --short",
++    rule: "git-local",
++    tier: 1,
++  },
++  {
++    name: "a scratch run with env names",
++    cls: "scratch runs",
++    script:
++      "$env:PYTHONUTF8='1'; $env:UV_CACHE_DIR='<scratch>\\uv-cache'; uv run --offline --no-project python '<scratch>\\probe.py' --out '<scratch>\\out.json'",
++    cwd: "<scratch>",
++    rule: "exec",
++    tier: 2,
++    target: "<scratch>\\out.json",
++    root: "<scratch>",
++  },
++  { name: "npm test in scratch", cls: "scratch runs", script: "npm.cmd test", cwd: "<scratch>", rule: "exec", tier: 2 },
++  {
++    name: "node in a notes scratch folder",
++    cls: "scratch runs",
++    script: "node '<notes>\\review-scratch-1\\check.js'",
++    cwd: "<notes>\\review-scratch-1",
++    rule: "exec",
++    tier: 2,
++    target: "<notes>\\review-scratch-1\\check.js",
++    root: "<notes>",
++  },
++  {
++    name: "unit tests in the own worktree",
++    cls: "tests in own worktree",
++    script: "uv run --offline --project tools/check python -X utf8 -B -m unittest discover",
++    rule: "exec",
++    tier: 2,
++  },
++  {
++    name: "privacy-check through pwsh -File",
++    cls: "home tools",
++    script: "pwsh -NoProfile -File '<home>\\data\\tools\\privacy-check.ps1' '<repo>' origin/main",
++    rule: "home-tool",
++    tier: 1,
++    target: "<repo>",
++    root: "<repo>",
++  },
++  {
++    name: "privacy-check through the call operator",
++    cls: "home tools",
++    script: "& '<home>\\data\\tools\\privacy-check.ps1' '<worktree>' origin/main",
++    rule: "home-tool",
++    tier: 1,
++    target: "<worktree>",
++    root: "<worktree>",
++  },
++  {
++    name: "fmpy as an exec prefix",
++    cls: "home tools",
++    script: "pwsh -NoProfile -File '<home>\\data\\tools\\fmpy.ps1' '<notes>\\calc.py'",
++    cwd: "<notes>",
++    rule: "exec",
++    tier: 2,
++    target: "<notes>\\calc.py",
++    root: "<notes>",
++  },
++  {
++    name: "a pinned npm install into scratch",
++    cls: "package installs",
++    script: "npm.cmd install left-pad@1.3.0 --no-save --package-lock=false --ignore-scripts --cache '<scratch>\\npm-cache'",
++    cwd: "<scratch>",
++    rule: "package",
++    tier: 2,
++    target: "<scratch>\\npm-cache",
++    root: "<scratch>",
++  },
++  {
++    name: "git log in the reviewed worktree",
++    cls: "git reads on another worktree",
++    script: "git --no-optional-locks -C '<repo>' log --oneline -5",
++    rule: "git-read",
++    tier: 1,
++    target: "<repo>",
++    root: "<repo>",
++  },
++  {
++    name: "git archive of the reviewed worktree into the notes",
++    cls: "git archive",
++    script: "git --no-optional-locks -C '<repo>' archive --format=zip HEAD -o '<notes>\\head.zip'",
++    rule: "git-read",
++    tier: 1,
++    target: "<notes>\\head.zip",
++    root: "<notes>",
++  },
++  {
++    name: "two notes writes chained",
++    cls: "notes write",
++    script: "New-Item -ItemType Directory -Path '<notes>\\r2'; Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<notes>\\r2\\a.md'",
++    rule: "notes-write",
++    tier: 1,
++    target: "<notes>\\r2\\a.md",
++    root: "<notes>",
++  },
++];
++
++/** The classes evidence.md never answers, each with a synthetic case. */
++const FORBIDDEN_CLASSES: Array<{ cls: string; script: string; cwd?: string; rule: string }> = [
++  { cls: "hardware", script: "& '<scratch>\\STM32_Programmer_CLI.exe' -c port=SWD -w '<scratch>\\fw.bin'", rule: "never:hardware" },
++  { cls: "WSL builds and tests", script: "wsl.exe -d Ubuntu --exec cmake --build build", rule: "never:hardware" },
++  { cls: "destructive", script: "git reset --hard origin/main", rule: "never:destructive" },
++  { cls: "other", script: "1..6 | ForEach-Object { Get-Date }", rule: "never:unparsed" },
++];
++
++const EVIDENCE_CLASSES = [
++  "notes write",
++  "dry run",
++  "local read",
++  "public read-only network",
++  "git in own worktree",
++  "scratch runs",
++  "tests in own worktree",
++  "home tools",
++  "package installs",
++  "git reads on another worktree",
++  "git archive",
++  "hardware",
++  "WSL builds and tests",
++  "destructive",
++  "other",
++];
++
++describe("fixtures", () => {
++  it("cover every class of evidence.md", () => {
++    const covered = new Set([...ALLOWED.map((fixture) => fixture.cls), ...FORBIDDEN_CLASSES.map((fixture) => fixture.cls)]);
++    expect(EVIDENCE_CLASSES.filter((cls) => !covered.has(cls))).toEqual([]);
++  });
++
++  it.each(ALLOWED.map((fixture) => [fixture.name, fixture] as const))("allows: %s", (_name, fixture) => {
++    const result = run(fixture.script, fixture.cwd ?? "<worktree>");
++    expect(result).toMatchObject({ verdict: "allow", rule: fixture.rule, tier: fixture.tier });
++  });
++
++  it.each(FORBIDDEN_CLASSES.map((fixture) => [fixture.cls, fixture] as const))("relays the %s class under maximal permits", (_cls, fixture) => {
++    const result = run(fixture.script, fixture.cwd ?? "<worktree>", maximal(fill(fixture.script)));
++    expect(result).toMatchObject({ verdict: "relay", rule: fixture.rule });
++  });
++});
++
++// ---------------------------------------------------------------------------
++// 1. The never-auto table
++// ---------------------------------------------------------------------------
++
++const DEFAULT_SCRIPT = "New-Item -ItemType Directory -Path '<notes>\\x'";
++
++function runCase(entry: (typeof NEVER_AUTO)[number], testCase: NeverAutoCase): MatchResult {
++  const script = fill(testCase.script ?? DEFAULT_SCRIPT);
++  let req = request(script, testCase.cwd ?? "<worktree>");
++  let file: unknown = maximal(script);
++  const ctx: Partial<MatchContext> = {};
++  switch (testCase.context) {
++    case "no-crew-label":
++      ctx.crew = false;
++      break;
++    case "no-task-label":
++      ctx.task = null;
++      break;
++    case "reserved-task":
++      ctx.task = "permissions";
++      file = { ...maximal(script), task: "permissions" };
++      break;
++    case "unsafe-task":
++      ctx.task = "..\\tools";
++      file = { ...maximal(script), task: "..\\tools" };
++      break;
++    case "no-permits-file":
++      file = undefined;
++      break;
++    case "invalid-permits":
++      file = { ...maximal(script), writeDirs: ["data/../tools"] };
++      break;
++    case "other-task-permits":
++      file = { ...maximal(script), task: "demo-03-sibling" };
++      break;
++    case "live-false-in-live":
++      ctx.mode = "live";
++      file = { ...maximal(script), live: false };
++      break;
++    case "provider-claude":
++      req = { ...req, provider: "claude", name: "Bash" };
++      break;
++    case "file-change":
++      req = { ...req, name: "CodexFileChange", input: { reason: "edit a file" } };
++      break;
++    case "question":
++      req = { ...req, name: "request_user_input", kind: "question" };
++      break;
++    case "sticky":
++      ctx.sticky = true;
++      break;
++    case "rate-limit":
++      ctx.allowsLastHour = MAX_ALLOWS_PER_HOUR;
++      break;
++    case "rate-limit-far":
++      ctx.allowsLastHour = MAX_ALLOWS_PER_HOUR * 4;
++      break;
++    case "command-array":
++      req = { ...req, input: { command: ["pwsh.exe", "-Command", script], cwd: WORKTREE } };
++      break;
++    case undefined:
++      break;
++  }
++  void entry;
++  return match(req, file, context(ctx));
++}
++
++describe("the never-auto list", () => {
++  it("has at least three cases for every id, each with a reason", () => {
++    for (const entry of NEVER_AUTO) {
++      expect(entry.cases.length, entry.id).toBeGreaterThanOrEqual(3);
++      expect(entry.reason, entry.id).not.toBe("");
++    }
++  });
++
++  const cases = NEVER_AUTO.flatMap((entry) => entry.cases.map((testCase, index) => [`${entry.id} #${index + 1}`, entry, testCase] as const));
++  it.each(cases)("relays %s with its id under maximal permits", (_label, entry, testCase) => {
++    const result = runCase(entry, testCase);
++    expect(result.verdict).toBe("relay");
++    expect(result.rule).toBe(`never:${entry.id}`);
++  });
++
++  it("would allow each context case's script if the context did not stop it", () => {
++    for (const entry of NEVER_AUTO) {
++      for (const testCase of entry.cases) {
++        if (testCase.context === undefined || testCase.context === "command-array") continue;
++        const script = testCase.script ?? DEFAULT_SCRIPT;
++        expect(run(script, testCase.cwd ?? "<worktree>", maximal(fill(script))).verdict, `${entry.id} ${script}`).toBe("allow");
++      }
++    }
++  });
++});
++
++// ---------------------------------------------------------------------------
++// 2. Mutations of every allowed fixture
++// ---------------------------------------------------------------------------
++
++type Mutation = { name: string; applies: (fixture: Fixture) => boolean; mutate: (fixture: Fixture) => { script: string; overrides?: Partial<PermitRequest> } };
++
++const every = () => true;
++const appendTo = (suffix: string) => (fixture: Fixture) => ({ script: `${fixture.script}${suffix}` });
++const retarget = (to: (fixture: Fixture) => string) => (fixture: Fixture) => ({
++  script: fixture.script.split(fixture.target ?? "").join(to(fixture)),
++});
++const hasTarget = (fixture: Fixture) => fixture.target !== undefined && fixture.root !== undefined;
++const isPatch = (fixture: Fixture) => fixture.script.includes("*** Begin Patch");
++const quote = (script: string) => script.replace(/'/g, "''");
++
++const MUTATIONS: Mutation[] = [
++  { name: "append ; Remove-Item x", applies: every, mutate: appendTo("; Remove-Item x") },
++  { name: "append | Out-File x", applies: every, mutate: appendTo(" | Out-File x") },
++  { name: "append && git push", applies: every, mutate: appendTo(" && git push") },
++  {
++    name: "insert ..\\..\\ into a target",
++    applies: hasTarget,
++    mutate: retarget((fixture) => (fixture.target ?? "").replace(fixture.root ?? "", `${fixture.root}\\..\\..`)),
++  },
++  {
++    name: "point a target at a sibling task folder",
++    applies: hasTarget,
++    mutate: retarget((fixture) => (fixture.target ?? "").replace(fixture.root ?? "", "<home>\\data\\demo-03-sibling")),
++  },
++  {
++    name: "point a target at data\\permissions",
++    applies: hasTarget,
++    mutate: retarget((fixture) => (fixture.target ?? "").replace(fixture.root ?? "", "<home>\\data\\permissions\\permits")),
++  },
++  {
++    name: "point a target at data\\tools",
++    applies: hasTarget,
++    mutate: retarget((fixture) => (fixture.target ?? "").replace(fixture.root ?? "", "<home>\\data\\tools")),
++  },
++  { name: "add -X POST", applies: every, mutate: appendTo(" -X POST") },
++  {
++    name: "change the host",
++    applies: (fixture) => fixture.host !== undefined,
++    mutate: (fixture) => ({
++      script: fixture.script.split(fixture.host ?? "").join((fixture.host ?? "").includes("/") ? "octo/unlisted" : "evil.example.net"),
++    }),
++  },
++  { name: "add $(...)", applies: every, mutate: appendTo(" $(Get-Date)") },
++  { name: "add a backtick", applies: every, mutate: appendTo(" `n") },
++  { name: "add --force", applies: every, mutate: appendTo(" --force") },
++  { name: "add a credential word", applies: every, mutate: appendTo(" secret") },
++  { name: "wrap in cmd /c", applies: every, mutate: (fixture) => ({ script: `cmd /c "${fixture.script}"` }) },
++  {
++    name: "use Start-Process",
++    applies: every,
++    mutate: (fixture) => ({ script: `Start-Process pwsh -ArgumentList '-Command', '${quote(fixture.script)}'` }),
++  },
++  { name: "use Invoke-Expression", applies: every, mutate: (fixture) => ({ script: `Invoke-Expression '${quote(fixture.script)}'` }) },
++  {
++    name: "replace the apply_patch shim path",
++    applies: isPatch,
++    mutate: (fixture) => ({ script: fixture.script.replace("<shim>", "<scratch>\\apply_patch.bat") }),
++  },
++  {
++    name: "add a *** Delete File header",
++    applies: isPatch,
++    mutate: (fixture) => ({ script: fixture.script.replace("*** Begin Patch\n", "*** Begin Patch\n*** Delete File: <notes>/old.md\n") }),
++  },
++  {
++    name: "add a *** Move to header",
++    applies: isPatch,
++    mutate: (fixture) => ({
++      script: fixture.script.replace("*** Begin Patch\n", "*** Begin Patch\n*** Update File: <notes>/a.md\n*** Move to: <notes>/b.md\n"),
++    }),
++  },
++  {
++    name: "use a junction out of a root",
++    applies: hasTarget,
++    mutate: retarget((fixture) => (fixture.target ?? "").replace(fixture.root ?? "", `${fixture.root}\\jx`)),
++  },
++  { name: "switch the provider to claude", applies: every, mutate: (fixture) => ({ script: fixture.script, overrides: { provider: "claude" } }) },
++  { name: "switch the kind to question", applies: every, mutate: (fixture) => ({ script: fixture.script, overrides: { kind: "question" } }) },
++];
++
++describe("mutations of every allowed fixture", () => {
++  const pairs = ALLOWED.flatMap((fixture) =>
++    MUTATIONS.filter((mutation) => mutation.applies(fixture)).map((mutation) => [`${fixture.name} / ${mutation.name}`, fixture, mutation] as const),
++  );
++
++  it("cover every mutation of the spec", () => {
++    for (const mutation of MUTATIONS) expect(pairs.some(([, , applied]) => applied === mutation), mutation.name).toBe(true);
++  });
++
++  it.each(pairs)("relays %s", (_label, fixture, mutation) => {
++    const { script, overrides } = mutation.mutate(fixture);
++    const result = match(request(script, fixture.cwd ?? "<worktree>", overrides), permits(), context());
++    expect(result.verdict, `${result.rule}: ${result.detail}`).toBe("relay");
++  });
++});
++
++// ---------------------------------------------------------------------------
++// 3. Property test: random statement sequences
++// ---------------------------------------------------------------------------
++
++function mulberry32(seed: number): () => number {
++  let state = seed >>> 0;
++  return () => {
++    state = (state + 0x6d2b79f5) >>> 0;
++    let t = state;
++    t = Math.imul(t ^ (t >>> 15), t | 1);
++    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
++    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
++  };
++}
++
++const ALLOWED_STATEMENTS = [
++  "New-Item -ItemType Directory -Path '<notes>\\p1'",
++  "Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<notes>\\a.md'",
++  "Get-Content -LiteralPath '<notes>\\brief.md'",
++  "gh api repos/octo/example/pulls --paginate",
++  "git --no-optional-locks status --short",
++  "git add -- README.md",
++  "git commit -m 'Update the notes'",
++  "$env:PYTHONUTF8='1'",
++  "uv run --offline --project tools/check python -X utf8 -B -m unittest discover",
++  "& '<home>\\data\\tools\\privacy-check.ps1' '<worktree>' origin/main",
++  "Test-Path -LiteralPath '<repo>\\README.md'",
++  "git --no-optional-locks -C '<repo>' diff HEAD~1",
++];
++
++/** Forbidden anywhere; these only as a command (as an argument they name a file). */
++const COMMAND_ONLY_TOKENS = ["rm x", "del x", "paseo ls"];
++const FORBIDDEN_TOKENS = [
++  "Remove-Item x",
++  "git push",
++  "git reset --hard",
++  "cmd /c dir",
++  "Start-Process x",
++  "iex x",
++  "wsl.exe -l",
++  "Get-PnpDevice",
++  "Stop-Process -Id 1",
++  "gh pr create",
++  "$(Get-Date)",
++  "`n",
++  "> out.txt",
++  "| Out-File x",
++  "&& git push",
++  "{ x }",
++  "@(1)",
++  "--force",
++  "token",
++  "..\\..\\x",
++  "COM3",
++  "secret",
++  "C:\\Windows\\x",
++  "-EncodedCommand x",
++];
++
++describe("random statement sequences", () => {
++  it("relay whenever they hold a forbidden token, and allow otherwise (10 000 seeded)", () => {
++    const random = mulberry32(20261009);
++    const pick = <T,>(items: readonly T[]): T => items[Math.floor(random() * items.length)] as T;
++    let forbidden = 0;
++    const failures: string[] = [];
++    for (let round = 0; round < 10_000; round += 1) {
++      const statements = Array.from({ length: 1 + Math.floor(random() * 4) }, () => pick(ALLOWED_STATEMENTS));
++      // Not only $env: lines: a script of assignments alone is relayed with no rule.
++      if (statements.every((statement) => statement.startsWith("$env:"))) statements.push(ALLOWED_STATEMENTS[0] ?? "");
++      const injected = random() < 0.5;
++      if (injected) {
++        forbidden += 1;
++        const commandOnly = random() < 0.1;
++        const token = commandOnly ? pick(COMMAND_ONLY_TOKENS) : pick(FORBIDDEN_TOKENS);
++        const at = Math.floor(random() * statements.length);
++        const mode = commandOnly ? 0 : Math.floor(random() * 3);
++        const target = statements[at] ?? "";
++        if (mode === 0) statements.splice(at, 0, token);
++        else if (mode === 1 || !target.includes(" ")) statements[at] = `${target} ${token}`;
++        else statements[at] = target.replace(" ", ` ${token} `);
++      }
++      const script = statements.join(random() < 0.5 ? "; " : "\n");
++      const result = run(script);
++      if (result.verdict !== (injected ? "relay" : "allow")) failures.push(`${result.verdict} ${result.rule}: ${script}`);
++    }
++    expect(forbidden).toBeGreaterThan(4000);
++    expect(failures.slice(0, 5)).toEqual([]);
++  }, 60_000);
++});
++
++// ---------------------------------------------------------------------------
++// The parts
++// ---------------------------------------------------------------------------
++
++describe("unwrapping the command line", () => {
++  it("takes the script from either pwsh location, with doubled quotes undone", () => {
++    expect(unwrapCommand(`"${PWSH}" -Command 'git commit -m ''x'''`, USER)).toBe("git commit -m 'x'");
++    expect(unwrapCommand(`"${USER}\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe" -Command 'Get-Date'`, USER)).toBe("Get-Date");
++  });
++
++  it("refuses any other shape", () => {
++    expect(unwrapCommand(`"C:\\Tools\\pwsh.exe" -Command 'Get-Date'`, USER)).toBeNull();
++    expect(unwrapCommand(`"${PWSH}" -Command 'a' ; rm x '`, USER)).toBeNull();
++    expect(unwrapCommand(`"${PWSH}" -c 'Get-Date'`, USER)).toBeNull();
++    expect(unwrapCommand(`${PWSH} -Command 'Get-Date'`, USER)).toBeNull();
++    expect(run("Get-Date", "<worktree>").rule).not.toBe("never:unparsed");
++    expect(match({ ...request("x"), input: { command: "pwsh -Command 'Get-Date'", cwd: WORKTREE } }, permits(), context()).rule).toBe("never:unparsed");
++  });
++});
++
++describe("the statement grammar", () => {
++  it("reads quoted strings, comma lists, 2>&1 at the end and pipes into formatters", () => {
++    const parsed = parseScript("git --no-optional-locks log -3 2>&1 | Select-Object -First 3; New-Item -ItemType Directory -Path 'a','b'");
++    expect(parsed.ok).toBe(true);
++    if (!parsed.ok) return;
++    expect(parsed.statements).toHaveLength(2);
++    const second = parsed.statements[1];
++    expect(second?.kind === "command" && second.words[4]?.parts).toEqual(["a", "b"]);
++  });
++
++  it.each([
++    ["a smart quote", "Get-Content -LiteralPath \u2018x\u2019"],
++    ["a comment", "Get-Date # note"],
++    ["a subexpression", "Get-Date $(x)"],
++    ["a variable", "Get-Content $path"],
++    ["a script block", "Get-Date { }"],
++    ["a redirection", "Get-Date > x"],
++    ["2>&1 before the end", "Get-Date 2>&1 -Format x"],
++    ["a word that goes on after a quote", "Get-Content -LiteralPath 'a'b"],
++    ["the stop-parsing token", "git --% log"],
++    ["dot-sourcing", ". x.ps1"],
++    ["a quoted command name", "'git' log"],
++    ["a lone carriage return", "Get-Date\rRemove-Item x"],
++    ["a pipe into a writer", "Get-Date | Set-Content x"],
++    ["two pipes", "git log | Sort-Object | Select-Object -First 3"],
++    ["a here-string that is not an envelope", "$x = @'\nhello\n'@\nWrite-Output $x"],
++  ])("refuses %s", (_name, script) => {
++    expect(parseScript(script).ok).toBe(false);
++  });
++});
++
++describe("paths", () => {
++  it("are normalized, joined to the working folder and folded", () => {
++    expect(normalizePath("sub/File.txt", "C:\\Work")).toEqual({ ok: true, path: "c:\\work\\sub\\file.txt" });
++    expect(normalizePath("C:/Work/./a", "C:\\x")).toEqual({ ok: true, path: "c:\\work\\a" });
++  });
++
++  it.each(["..\\x", "a\\..\\b", "~\\x", "%TEMP%\\x", "$HOME", "a*", "a?", "a[1]", "\\\\server\\share", "\\\\?\\C:\\x", "\\Windows", "C:x", "C:\\a:b", "C:\\tools.\\x", "C:\\tools \\x"])(
++    "refuse %s",
++    (raw) => {
++      expect(normalizePath(raw, "C:\\Work").ok).toBe(false);
++    },
++  );
++
++  it("follow a junction to where it really leads", () => {
++    expect(run("New-Item -ItemType Directory -Path '<notes>\\jx\\a'")).toMatchObject({ verdict: "relay", rule: "never:outside" });
++  });
++
++  it("match roots on folder boundaries only", () => {
++    expect(run(`New-Item -ItemType Directory -Path '${NOTES}-evil\\a'`)).toMatchObject({ verdict: "relay", rule: "never:outside" });
++  });
++});
++
++describe("the permits file", () => {
++  it("parses the spec's example shape", () => {
++    expect(parsePermits(JSON.parse(JSON.stringify(permits())))).toEqual(permits());
++  });
++
++  it.each([
++    ["a writeDir outside data/", { writeDirs: ["notes"] }],
++    ["a writeDir that is data/ itself", { writeDirs: ["data"] }],
++    ["a writeDir with ..", { writeDirs: ["data/../x"] }],
++    ["a relative scratch dir", { scratchDirs: ["Temp\\x"] }],
++    ["an exec entry with no prefix", { exec: [{ in: "scratch", prefix: [] }] }],
++    ["an exec entry in an unknown place", { exec: [{ in: "home", prefix: ["node"] }] }],
++    ["a bad repo pair", { netRead: { githubRepos: ["octo"], hosts: [] } }],
++    ["live as a string", { live: "yes" }],
++    ["another version", { version: 2 }],
++  ])("is invalid with %s", (_name, change) => {
++    expect(parsePermits({ ...permits(), ...change })).toBeNull();
++  });
++
++  it("enables tier 2 and git-read only when it lists them", () => {
++    const bare = permits({ exec: [], readRepos: [], netRead: { githubRepos: [], hosts: [] }, gitLocal: false });
++    expect(run("uv run --offline --no-project python '<scratch>\\probe.py'", "<scratch>", bare).rule).toBe("no-rule");
++    expect(run("git --no-optional-locks -C '<repo>' log -1", "<worktree>", bare).rule).toBe("never:project-repo");
++    expect(run("npm.cmd install left-pad@1.3.0 --no-save --package-lock=false --ignore-scripts --cache '<scratch>\\c'", "<scratch>", bare).rule).toBe("no-rule");
++    expect(run("git commit -m 'x'", "<worktree>", bare).rule).toBe("no-rule");
++    expect(run("gh api repos/octo/example/pulls", "<worktree>", bare).rule).toBe("never:non-get");
++  });
++});
++
++describe("rule details", () => {
++  it("relays a statement no rule knows", () => {
++    expect(run("Get-Date")).toMatchObject({ verdict: "relay", rule: "no-rule" });
++  });
++
++  it("relays an env name the permits do not list, and a cache dir outside scratch", () => {
++    expect(run("$env:FOO='1'; npm.cmd test", "<scratch>")).toMatchObject({ verdict: "relay", rule: "no-rule" });
++    expect(run("$env:UV_CACHE_DIR='C:\\Outside\\cache'; npm.cmd test", "<scratch>")).toMatchObject({ verdict: "relay", rule: "never:outside" });
++  });
++
++  it("relays an exec prefix used outside its place", () => {
++    expect(run("npm.cmd test", "<worktree>")).toMatchObject({ verdict: "relay", rule: "no-rule" });
++  });
++
++  it("relays an exec argument that is an address, or an option with a path attached", () => {
++    expect(run("npm.cmd test https://example.org/x", "<scratch>")).toMatchObject({ rule: "never:non-get" });
++    expect(run("npm.cmd test -o\\Windows\\x", "<scratch>")).toMatchObject({ rule: "never:outside" });
++    expect(run("npm.cmd test --out=\\Windows\\x", "<scratch>")).toMatchObject({ rule: "never:outside" });
++  });
++
++  it("names the tier: 2 when any statement runs code", () => {
++    expect(run("$env:PYTHONUTF8='1'; uv run --offline --no-project python '<scratch>\\p.py'; New-Item -ItemType Directory -Path '<scratch>\\o'", "<scratch>")).toMatchObject({
++      verdict: "allow",
++      rule: "exec+notes-write",
++      tier: 2,
++    });
++  });
++
++  it("refuses git write verbs on a read repo, and git in a folder that is not the worktree", () => {
++    expect(run("git --no-optional-locks -C '<repo>' commit -m x").rule).toBe("never:project-repo");
++    expect(run("git --no-optional-locks status", "<notes>").rule).toBe("never:project-repo");
++    expect(run("git --no-optional-locks -C '<repo>' diff --output=x").rule).toBe("never:project-repo");
++  });
++
++  it("does not take authority.md for a credential, but takes auth.json", () => {
++    expect(run("Get-Content -LiteralPath '<notes>\\authority.md'").verdict).toBe("allow");
++    expect(run("Get-Content -LiteralPath '<notes>\\auth.json'").rule).toBe("never:credential");
++  });
++
++  it("does not read the contents of an apply_patch file as commands, but does read its headers", () => {
++    const words = PATCH("*** Add File: <notes>/review-2.md").replace("+No blocking findings.", "+Remove-Item and git push were checked; no token found.");
++    expect(run(words)).toMatchObject({ verdict: "allow", rule: "notes-write" });
++    expect(run(PATCH("*** Add File: <home>/data/tools/x.py"))).toMatchObject({ verdict: "relay", rule: "never:outside" });
++  });
++
++  it("relays a program run by path from outside the roots", () => {
++    expect(run("& 'C:\\Tools\\thing.exe'", "<worktree>", maximal("C:\\Tools\\thing.exe")).rule).toBe("never:outside");
++  });
++
++  it("relays a comma list given to a program, which reaches it as separate arguments", () => {
++    expect(run("npm.cmd test x,\\Windows\\y", "<scratch>")).toMatchObject({ rule: "never:unparsed" });
++    expect(run("git add -- a.md,\\Windows\\b")).toMatchObject({ rule: "never:unparsed" });
++  });
++
++  it("relays git, curl or gh run by path from outside the roots", () => {
++    expect(run("& 'C:\\Program Files\\Git\\cmd\\git.exe' --no-optional-locks status")).toMatchObject({ rule: "never:outside" });
++    expect(run("& 'C:\\Windows\\System32\\curl.exe' -fL https://registry.npmjs.org/x -o '<scratch>\\x'")).toMatchObject({ rule: "never:outside" });
++  });
++
++  it("reads the working folder for credentials and devices too", () => {
++    expect(run("New-Item -ItemType Directory -Path '<notes>\\secrets\\a'", "<notes>\\secrets")).toMatchObject({ rule: "never:credential" });
++  });
++
++  it("reads --name='value' as one argument, and checks the value", () => {
++    expect(run("git --no-optional-locks -C '<repo>' archive --format=zip HEAD --output='<notes>\\head.zip'")).toMatchObject({ verdict: "allow", rule: "git-read" });
++    expect(run("git --no-optional-locks -C '<repo>' archive --format=zip HEAD --output='C:\\Outside\\head.zip'").rule).toBe("never:outside");
++    expect(parseScript("git log 'a'--output=x").ok).toBe(false);
++  });
++
++  it("relays git -c without making the agent sticky", () => {
++    expect(run("git -c core.autocrlf=false --no-optional-locks status")).toMatchObject({ verdict: "relay", rule: "no-rule" });
++  });
++
++  it("takes paseo only as a program, not as a folder name", () => {
++    expect(run("Copy-Item -LiteralPath '<worktree>\\docs\\paseo' -Destination '<notes>\\paseo'").verdict).toBe("allow");
++    expect(run("& '<user>\\AppData\\Local\\Programs\\Paseo\\paseo.cmd' ls").rule).toBe("never:outward");
++    expect(run("paseo.cmd send x y").rule).toBe("never:outward");
++  });
++
++  it("relays the rate limit only on what it would allow", () => {
++    expect(run("Get-Date", "<worktree>", permits(), { allowsLastHour: 500 }).rule).toBe("no-rule");
++    expect(run(DEFAULT_SCRIPT, "<worktree>", permits(), { allowsLastHour: MAX_ALLOWS_PER_HOUR - 1 }).verdict).toBe("allow");
++  });
++
++  it("relays live permits only in live mode", () => {
++    const shadowOnly = permits({ live: false });
++    expect(run(DEFAULT_SCRIPT, "<worktree>", shadowOnly, { mode: "shadow" }).verdict).toBe("allow");
++    expect(run(DEFAULT_SCRIPT, "<worktree>", shadowOnly, { mode: "live" }).rule).toBe("never:no-permits");
++  });
++});
+diff --git a/server/permit-match.ts b/server/permit-match.ts
+new file mode 100644
+index 0000000..efe36b7
+--- /dev/null
++++ b/server/permit-match.ts
+@@ -0,0 +1,1311 @@
++/**
++ * The permission broker's matcher: would a crewmate's permission request be answered `allow` under its
++ * task's permits, or relayed to a person? Pure: no I/O but the injected `realpath`, no clock.
++ *
++ * Literal and default-relay (spec 3.5). A Codex command approval's command line must be exactly
++ * `"<dir>\pwsh.exe" -Command '<script>'`; the script is split into statements, each of which must be an
++ * allowed `$env:` assignment, an apply_patch envelope, or one plain command of bare words and quoted
++ * strings, at most piped into a formatting cmdlet. Every statement must match an allow rule; any doubt
++ * relays. The never-auto list (`permit-rules.ts`) is checked before any rule: its patterns against the
++ * script, its command names against each statement.
++ */
++import {
++  MAX_ALLOWS_PER_HOUR,
++  NEVER_AUTO,
++  RESERVED_TASKS,
++  type NeverAutoId,
++  neverAuto,
++} from "./permit-rules";
++
++// ---------------------------------------------------------------------------
++// Permits (spec 3.4)
++// ---------------------------------------------------------------------------
++
++export type ExecPlace = "scratch" | "worktree" | "notes";
++
++export interface ExecEntry {
++  in: ExecPlace;
++  prefix: string[];
++}
++
++export interface Permits {
++  version: 1;
++  task: string;
++  live: boolean;
++  /** Home-relative folders under `data/`. */
++  writeDirs: string[];
++  scratchDirs: string[];
++  readRepos: string[];
++  netRead: { githubRepos: string[]; hosts: string[] };
++  gitLocal: boolean;
++  exec: ExecEntry[];
++  envNames: string[];
++}
++
++const SEGMENT = /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/;
++const ABSOLUTE = /^[A-Za-z]:[\\/]/;
++
++function strings(value: unknown): string[] | null {
++  if (value === undefined) return [];
++  if (!Array.isArray(value) || !value.every((item) => typeof item === "string" && item !== "")) return null;
++  return value as string[];
++}
++
++function writeDirOk(dir: string): boolean {
++  const parts = dir.replace(/\\/g, "/").split("/");
++  return parts.length >= 2 && parts[0] === "data" && parts.slice(1).every((part) => SEGMENT.test(part) && !part.includes(".."));
++}
++
++/** The permits file's JSON as permits, or null when it is not a valid version 1 file. */
++export function parsePermits(raw: unknown): Permits | null {
++  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
++  const file = raw as Record<string, unknown>;
++  if (file.version !== 1 || typeof file.task !== "string") return null;
++  if (file.live !== undefined && typeof file.live !== "boolean") return null;
++  if (file.gitLocal !== undefined && typeof file.gitLocal !== "boolean") return null;
++  const writeDirs = strings(file.writeDirs);
++  const scratchDirs = strings(file.scratchDirs);
++  const readRepos = strings(file.readRepos);
++  const envNames = strings(file.envNames);
++  const net = file.netRead === undefined ? {} : file.netRead;
++  if (typeof net !== "object" || net === null || Array.isArray(net)) return null;
++  const githubRepos = strings((net as Record<string, unknown>).githubRepos);
++  const hosts = strings((net as Record<string, unknown>).hosts);
++  if (writeDirs === null || scratchDirs === null || readRepos === null || envNames === null) return null;
++  if (githubRepos === null || hosts === null) return null;
++  if (!writeDirs.every(writeDirOk)) return null;
++  if (![...scratchDirs, ...readRepos].every((dir) => ABSOLUTE.test(dir))) return null;
++  if (!githubRepos.every((pair) => /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/.test(pair) && !pair.includes(".."))) return null;
++  if (!hosts.every((host) => /^[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+$/.test(host))) return null;
++  if (!envNames.every((name) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(name))) return null;
++  const execRaw = file.exec === undefined ? [] : file.exec;
++  if (!Array.isArray(execRaw)) return null;
++  const exec: ExecEntry[] = [];
++  for (const entry of execRaw) {
++    if (typeof entry !== "object" || entry === null) return null;
++    const place = (entry as Record<string, unknown>).in;
++    const prefix = strings((entry as Record<string, unknown>).prefix);
++    if (place !== "scratch" && place !== "worktree" && place !== "notes") return null;
++    if (prefix === null || prefix.length === 0) return null;
++    exec.push({ in: place, prefix });
++  }
++  return {
++    version: 1,
++    task: file.task,
++    live: file.live === true,
++    writeDirs,
++    scratchDirs,
++    readRepos,
++    netRead: { githubRepos, hosts },
++    gitLocal: file.gitLocal === true,
++    exec,
++    envNames,
++  };
++}
++
++// ---------------------------------------------------------------------------
++// The request and the answer
++// ---------------------------------------------------------------------------
++
++export interface PermitRequest {
++  provider: string;
++  name: string;
++  kind: string;
++  input?: unknown;
++}
++
++export interface MatchContext {
++  /** Whether the agent carries the crew role label. */
++  crew: boolean;
++  /** Its `firstmate.task` label, null when it has none. */
++  task: string | null;
++  /** The broker's mode; in `live` a permits file with `"live": false` relays. */
++  mode: "shadow" | "live";
++  /** The first mate's home, absolute. */
++  home: string;
++  /** The user's profile folder (where `.codex` and `.paseo` live). */
++  userHome: string;
++  /** The agent's worktree: `agent.cwd` from the hook, never a value from the permits. */
++  worktree: string;
++  /** The agent is sticky after a refusal (spec 3.7). */
++  sticky: boolean;
++  /** Automatic allows for this agent in the last hour. */
++  allowsLastHour: number;
++  /** The real path of an existing path, null when it does not exist. */
++  realpath: (path: string) => string | null;
++}
++
++export type Verdict = "allow" | "relay";
++
++export interface MatchResult {
++  verdict: Verdict;
++  /** The allow rule(s) joined by `+`, `never:<id>` for a never-auto hit, or `no-rule`. */
++  rule: string;
++  tier: 1 | 2 | null;
++  detail: string;
++}
++
++function never(id: NeverAutoId, detail: string): MatchResult {
++  return { verdict: "relay", rule: `never:${id}`, tier: null, detail };
++}
++
++/** The never-auto id a relay came from, or null. */
++export function neverId(result: Pick<MatchResult, "rule">): NeverAutoId | null {
++  return result.rule.startsWith("never:") ? (result.rule.slice("never:".length) as NeverAutoId) : null;
++}
++
++/** A task id that names a task: a path-safe slug, not a folder the broker owns or a device name. */
++export function taskIdOk(task: string): boolean {
++  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,119}$/.test(task) && !RESERVED_TASKS.has(task.toLowerCase());
++}
++
++// ---------------------------------------------------------------------------
++// Unwrap (step 1)
++// ---------------------------------------------------------------------------
++
++/** The two places pwsh is installed: the Store's alias folder and Program Files. */
++export function pwshDirs(userHome: string): string[] {
++  return [`${userHome}\\AppData\\Local\\Microsoft\\WindowsApps`, "C:\\Program Files\\PowerShell\\7"].map(canon);
++}
++
++/** Lowercase, backslashes, no trailing backslash: for comparing literal paths and words. */
++function canon(path: string): string {
++  return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
++}
++
++/** The script inside `"<dir>\pwsh.exe" -Command '<script>'`, or null when the line is not exactly that. */
++export function unwrapCommand(command: string, userHome: string): string | null {
++  const match = /^"([^"]+)\\pwsh\.exe" -Command '([\s\S]*)'$/i.exec(command);
++  if (match === null) return null;
++  if (!pwshDirs(userHome).includes(canon(match[1] ?? ""))) return null;
++  const inner = match[2] ?? "";
++  let script = "";
++  for (let index = 0; index < inner.length; index += 1) {
++    const char = inner[index];
++    if (char === "'") {
++      if (inner[index + 1] !== "'") return null;
++      index += 1;
++    }
++    script += char;
++  }
++  return script;
++}
++
++/** The text the never-auto patterns read when the line could not be unwrapped: without a leading shell. */
++function stripShell(command: string): string {
++  return command.replace(/^\s*"?(?:[^"\s]*\\)?(?:pwsh|powershell)(?:\.exe)?"?\s+-Command\s+/i, "");
++}
++
++// ---------------------------------------------------------------------------
++// Statements (step 2)
++// ---------------------------------------------------------------------------
++
++/** One argument: its value with quotes removed, and its comma-separated parts. */
++export interface Word {
++  value: string;
++  parts: string[];
++  /** It starts with a quoted string. */
++  quoted: boolean;
++}
++
++export type Statement =
++  | { kind: "env"; name: string; value: string; text: string }
++  | { kind: "command"; call: boolean; words: Word[]; pipes: Word[][]; text: string }
++  | { kind: "patch"; variable: string; body: string; shim: string; text: string };
++
++export type Parsed = { ok: true; statements: Statement[]; masked: string } | { ok: false; reason: string };
++
++const FORMATTERS = new Set([
++  "select-object",
++  "select-string",
++  "format-list",
++  "format-table",
++  "out-string",
++  "measure-object",
++  "sort-object",
++]);
++const BARE = /[A-Za-z0-9._\-:\\/=+@%~^!?*]/;
++
++/** Reads a quoted string at `start`; returns its value and where it ends, or a reason. */
++function readQuoted(text: string, start: number): { value: string; end: number } | { reason: string } {
++  const quote = text[start];
++  let value = "";
++  for (let index = start + 1; index < text.length; index += 1) {
++    const char = text[index];
++    if (char === quote) {
++      if (text[index + 1] === quote) {
++        value += quote;
++        index += 1;
++        continue;
++      }
++      return { value, end: index + 1 };
++    }
++    if (quote === '"' && (char === "$" || char === "`")) return { reason: `a ${char} inside a double-quoted string` };
++    value += char;
++  }
++  return { reason: "an unclosed quote" };
++}
++
++/** Splits one statement into pipe segments of words. */
++function tokenize(text: string): { call: boolean; segments: Word[][] } | { reason: string } {
++  const segments: Word[][] = [[]];
++  let call = false;
++  let word: Word | null = null;
++  let part = "";
++  let partStart = true;
++  const finish = (): string | null => {
++    if (word === null) return null;
++    if (partStart) return "a comma with nothing after it";
++    word.parts.push(part);
++    segments[segments.length - 1]?.push(word);
++    word = null;
++    part = "";
++    partStart = true;
++    return null;
++  };
++  for (let index = 0; index < text.length; ) {
++    const char = text[index] ?? "";
++    if (char === " " || char === "\t") {
++      const error = finish();
++      if (error !== null) return { reason: error };
++      index += 1;
++      continue;
++    }
++    if (char === "|") {
++      const error = finish();
++      if (error !== null) return { reason: error };
++      segments.push([]);
++      index += 1;
++      continue;
++    }
++    if (char === "&" && word === null && segments.length === 1 && segments[0]?.length === 0 && !call) {
++      if (text[index + 1] !== " ") return { reason: "a call operator without a space" };
++      call = true;
++      index += 1;
++      continue;
++    }
++    if (word === null && text.startsWith("2>&1", index) && /^(?:\s|\||$)/.test(text.slice(index + 4))) {
++      segments[segments.length - 1]?.push({ value: "2>&1", parts: ["2>&1"], quoted: false });
++      index += 4;
++      continue;
++    }
++    if (char === "'" || char === '"') {
++      // `--name='value'` is one argument; any other quote inside a word is refused.
++      if (!partStart && !/^-{1,2}[A-Za-z][A-Za-z0-9-]*=$/.test(part)) return { reason: "a quote inside a word" };
++      const read = readQuoted(text, index);
++      if ("reason" in read) return read;
++      const next = text[read.end];
++      if (next !== undefined && next !== " " && next !== "\t" && next !== "|" && next !== ",") {
++        return { reason: "a word that goes on after a quoted string" };
++      }
++      word ??= { value: "", parts: [], quoted: true };
++      word.value += read.value;
++      part += read.value;
++      partStart = false;
++      index = read.end;
++      continue;
++    }
++    if (char === ",") {
++      if (word === null || partStart) return { reason: "a comma with nothing before it" };
++      word.parts.push(part);
++      word.value += ",";
++      part = "";
++      partStart = true;
++      index += 1;
++      continue;
++    }
++    if (!BARE.test(char)) return { reason: `the character ${JSON.stringify(char)}` };
++    if (char === "@" && partStart) return { reason: "an @ starting a word" };
++    word ??= { value: "", parts: [], quoted: false };
++    word.value += char;
++    part += char;
++    partStart = false;
++    index += 1;
++  }
++  const error = finish();
++  if (error !== null) return { reason: error };
++  return { call, segments };
++}
++
++function parseCommand(text: string): Statement | { reason: string } {
++  const tokens = tokenize(text);
++  if ("reason" in tokens) return tokens;
++  const [first, ...pipes] = tokens.segments;
++  if (first === undefined || first.length === 0) return { reason: "an empty command" };
++  if (pipes.some((segment) => segment.length === 0)) return { reason: "an empty pipe" };
++  if (pipes.length > 1) return { reason: "more than one pipe" };
++  const words = [...first];
++  if (words.some((word) => word.value === "--%")) return { reason: "the stop-parsing token" };
++  // 2>&1 only at the end of the command, before any pipe.
++  const redirect = words.findIndex((word) => word.value === "2>&1" && !word.quoted);
++  if (redirect !== -1 && redirect !== words.length - 1) return { reason: "a 2>&1 before the end" };
++  if (redirect !== -1) words.pop();
++  if (words.length === 0) return { reason: "an empty command" };
++  for (const segment of pipes) {
++    if (segment.some((word) => word.value === "2>&1" && !word.quoted)) return { reason: "a 2>&1 after a pipe" };
++  }
++  if (!tokens.call && words[0]?.quoted) return { reason: "a quoted string in command position" };
++  // A comma list given to a program, not a cmdlet, reaches it as separate arguments; every check here reads words.
++  const name = words[0]?.value ?? "";
++  const cmdlet = /^[A-Za-z]+-[A-Za-z]+$/.test(name);
++  if (!cmdlet && words.some((word) => word.parts.length > 1)) return { reason: "a comma list given to a program" };
++  if (words[0]?.value === ".") return { reason: "dot-sourcing" };
++  for (const segment of pipes) {
++    const [name, ...rest] = segment;
++    if (name === undefined || name.quoted || !FORMATTERS.has(name.value.toLowerCase())) {
++      return { reason: `a pipe into ${name?.value ?? "nothing"}` };
++    }
++    if (rest.some((word) => /^-(?:literal)?path$/i.test(word.value))) return { reason: "a pipe that reads a file" };
++  }
++  return { kind: "command", call: tokens.call, words, pipes, text };
++}
++
++function parseStatement(text: string): Statement | { reason: string } {
++  const env = /^\$env:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.+)$/s.exec(text);
++  if (env !== null) {
++    const raw = (env[2] ?? "").trim();
++    if (raw[0] !== "'" && raw[0] !== '"') return { reason: "an $env: value that is not a quoted literal" };
++    const read = readQuoted(raw, 0);
++    if ("reason" in read) return read;
++    if (read.end !== raw.length) return { reason: "an $env: value with more after it" };
++    return { kind: "env", name: env[1] ?? "", value: read.value, text };
++  }
++  if (text.startsWith("$")) return { reason: "a variable" };
++  return parseCommand(text);
++}
++
++/**
++ * The script as statements. An apply_patch envelope is read whole; every other statement ends at a `;`
++ * or a newline outside quotes. `masked` is the script with the envelopes' file contents blanked: what
++ * the never-auto patterns read, since a file's text is data, not a command (its headers stay).
++ */
++export function parseScript(script: string): Parsed {
++  if (/\r(?!\n)/.test(script)) return { ok: false, reason: "a carriage return" };
++  const text = script.replace(/\r\n/g, "\n");
++  if (/[^\x20-\x7e\n\t]/.test(text)) return { ok: false, reason: "a character outside printable ASCII" };
++  const statements: Statement[] = [];
++  let masked = "";
++  let index = 0;
++  while (index < text.length) {
++    const char = text[index];
++    if (char === " " || char === "\t" || char === "\n" || char === ";") {
++      masked += char;
++      index += 1;
++      continue;
++    }
++    const rest = text.slice(index);
++    const envelope = /^\$([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*@'\n/.exec(rest);
++    if (envelope !== null) {
++      const variable = envelope[1] ?? "";
++      const bodyStart = envelope[0].length;
++      const close = rest.indexOf("\n'@", bodyStart - 1);
++      if (close === -1) return { ok: false, reason: "an unclosed here-string" };
++      const body = rest.slice(bodyStart, close);
++      const after = /^\n'@[ \t]*\n[ \t]*& '([^'\n]+)'[ \t]+\$([A-Za-z_][A-Za-z0-9_]*)[ \t]*(?=\n|;|$)/.exec(rest.slice(close));
++      if (after === null || after[2] !== variable) return { ok: false, reason: "a here-string that is not an apply_patch envelope" };
++      const length = close + after[0].length;
++      const statementText = rest.slice(0, length);
++      statements.push({ kind: "patch", variable, body, shim: after[1] ?? "", text: statementText });
++      const headers = body
++        .split("\n")
++        .map((line) => (line.startsWith("*** ") ? line : ""))
++        .join("\n");
++      masked += rest.slice(0, bodyStart) + headers + rest.slice(close, length);
++      index += length;
++      continue;
++    }
++    let end = index;
++    let quote: string | null = null;
++    for (; end < text.length; end += 1) {
++      const current = text[end];
++      if (quote !== null) {
++        if (current === quote) {
++          if (text[end + 1] === quote) end += 1;
++          else quote = null;
++        } else if (quote === '"' && (current === "$" || current === "`")) {
++          return { ok: false, reason: `a ${current} inside a double-quoted string` };
++        }
++        continue;
++      }
++      if (current === "'" || current === '"') quote = current;
++      else if (current === ";" || current === "\n") break;
++    }
++    if (quote !== null) return { ok: false, reason: "an unclosed quote" };
++    const statementText = text.slice(index, end).trim();
++    const statement = parseStatement(statementText);
++    if ("reason" in statement) return { ok: false, reason: `${statement.reason} in ${JSON.stringify(statementText.slice(0, 80))}` };
++    statements.push(statement);
++    masked += text.slice(index, end);
++    index = end;
++  }
++  if (statements.length === 0) return { ok: false, reason: "an empty script" };
++  return { ok: true, statements, masked };
++}
++
++// ---------------------------------------------------------------------------
++// Paths (step 3)
++// ---------------------------------------------------------------------------
++
++type PathResult = { ok: true; path: string } | { ok: false; reason: string };
++
++/**
++ * A path token as an absolute, lowercase, backslashed path: relative ones joined to `base`. Refused with
++ * `..`, `~`, `%`, `$`, a wildcard, a UNC or device prefix, a rooted or drive-relative form, a colon past
++ * the drive, or a name ending in a dot or space (Windows drops those, so `tools.` would be `tools`).
++ */
++export function normalizePath(raw: string, base: string): PathResult {
++  let path = raw.replace(/\//g, "\\");
++  if (path === "") return { ok: false, reason: "an empty path" };
++  if (/[~%$*?[\]"<>|]/.test(path) || path.includes("..")) return { ok: false, reason: `the path ${raw}` };
++  if (path.startsWith("\\")) return { ok: false, reason: `the rooted or UNC path ${raw}` };
++  if (/^[A-Za-z]:/.test(path)) {
++    if (!/^[A-Za-z]:\\/.test(path)) return { ok: false, reason: `the drive-relative path ${raw}` };
++  } else {
++    path = `${base.replace(/\//g, "\\").replace(/\\+$/, "")}\\${path}`;
++  }
++  if (path.slice(2).includes(":")) return { ok: false, reason: `the path ${raw}` };
++  const segments: string[] = [];
++  for (const segment of path.slice(3).split("\\")) {
++    if (segment === "" || segment === ".") continue;
++    if (/[. ]$/.test(segment)) return { ok: false, reason: `the path ${raw}` };
++    segments.push(segment);
++  }
++  return { ok: true, path: `${path.slice(0, 2)}\\${segments.join("\\")}`.toLowerCase().replace(/\\$/, "") };
++}
++
++function within(path: string, root: string): boolean {
++  const prefix = root.endsWith("\\") ? root : `${root}\\`;
++  return path === root || path.startsWith(prefix);
++}
++
++function parentOf(path: string): string | null {
++  const cut = path.lastIndexOf("\\");
++  if (cut <= 2) return path.length > 3 ? `${path.slice(0, 2)}\\` : null;
++  return path.slice(0, cut);
++}
++
++/** The normalized path with its nearest existing ancestor resolved through `realpath`, so a junction cannot lead out. */
++function resolveReal(path: string, realpath: MatchContext["realpath"]): PathResult {
++  const rest: string[] = [];
++  let current: string | null = path;
++  while (current !== null) {
++    const real = realpath(current);
++    if (real !== null) {
++      const resolved = real.replace(/\//g, "\\");
++      if (resolved.startsWith("\\\\") || !/^[A-Za-z]:\\?/.test(resolved)) {
++        return { ok: false, reason: `the path ${path} resolves to ${resolved}` };
++      }
++      const joined = [resolved.replace(/\\+$/, ""), ...rest].join("\\");
++      return { ok: true, path: joined.toLowerCase() };
++    }
++    const parent = parentOf(current);
++    if (parent === null || parent === current) break;
++    rest.unshift(current.slice(parent.length).replace(/^\\/, ""));
++    current = parent;
++  }
++  return { ok: true, path };
++}
++
++type Access = "read" | "write";
++type PathCheck = { ok: true; path: string } | { ok: false; id: NeverAutoId; reason: string };
++
++/** The permitted roots of one request, resolved. */
++class Roots {
++  readonly worktree: string;
++  readonly writes: string[];
++  readonly scratch: string[];
++  readonly reads: string[];
++  readonly home: string;
++  private readonly protectedRoots: string[];
++  readonly homeTools: { privacyCheck: string; fmpy: string };
++  readonly shim: RegExp;
++
++  constructor(
++    private readonly context: MatchContext,
++    permits: Permits,
++  ) {
++    const root = (raw: string): string => {
++      const normal = normalizePath(raw, "C:\\");
++      if (!normal.ok) return "\u0000unusable";
++      const real = resolveReal(normal.path, context.realpath);
++      return real.ok ? real.path : "\u0000unusable";
++    };
++    this.home = root(context.home);
++    this.worktree = root(context.worktree);
++    this.writes = permits.writeDirs.map((dir) => root(`${context.home}\\${dir.replace(/\//g, "\\")}`));
++    this.scratch = permits.scratchDirs.map(root);
++    this.reads = permits.readRepos.map(root);
++    const user = root(context.userHome);
++    this.protectedRoots = [
++      `${this.home}\\data\\permissions`,
++      `${this.home}\\data\\tools`,
++      `${this.home}\\data\\crew-rules.md`,
++      `${this.home}\\data\\captain.md`,
++      `${this.home}\\agents.md`,
++      `${this.home}\\watches`,
++      `${user}\\.paseo\\plugins`,
++      `${user}\\.codex`,
++      `${user}\\.claude`,
++      "c:\\windows",
++    ];
++    this.homeTools = {
++      privacyCheck: `${this.home}\\data\\tools\\privacy-check.ps1`,
++      fmpy: `${this.home}\\data\\tools\\fmpy.ps1`,
++    };
++    const shimDir = canon(`${context.userHome}\\.codex\\tmp\\arg0`).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++    this.shim = new RegExp(`^${shimDir}\\\\codex-arg0[a-z0-9]+\\\\apply_patch\\.bat$`);
++  }
++
++  /** A path token resolved against `cwd`. */
++  resolve(raw: string, cwd: string): PathResult {
++    const normal = normalizePath(raw, cwd);
++    if (!normal.ok) return normal;
++    return resolveReal(normal.path, this.context.realpath);
++  }
++
++  isProtected(path: string): boolean {
++    return (
++      this.protectedRoots.some((root) => within(path, root)) ||
++      /^c:\\program files/.test(path) ||
++      path.split("\\").includes("agents.md")
++    );
++  }
++
++  inAny(path: string, roots: readonly string[]): boolean {
++    return roots.some((root) => within(path, root));
++  }
++
++  /** A read stays in the worktree, a write or scratch folder, or a read repo; a write in a write or scratch folder. */
++  check(raw: string, cwd: string, access: Access, only?: readonly string[]): PathCheck {
++    const resolved = this.resolve(raw, cwd);
++    if (!resolved.ok) return { ok: false, id: "outside", reason: resolved.reason };
++    const path = resolved.path;
++    if (access === "write") {
++      if (this.isProtected(path)) return { ok: false, id: "outside", reason: `a write into the protected ${path}` };
++      if (this.inAny(path, this.reads)) return { ok: false, id: "project-repo", reason: `a write into the read-only repo at ${path}` };
++      const allowed = only ?? [...this.writes, ...this.scratch];
++      if (!this.inAny(path, allowed)) return { ok: false, id: "outside", reason: `a write to ${path}, outside the permitted folders` };
++      return { ok: true, path };
++    }
++    const allowed = only ?? [this.worktree, ...this.writes, ...this.scratch, ...this.reads];
++    if (!this.inAny(path, allowed)) return { ok: false, id: "outside", reason: `a read of ${path}, outside the permitted folders` };
++    return { ok: true, path };
++  }
++
++  /** Where the request may run: the worktree, a write folder or a scratch folder. */
++  cwd(raw: string): PathCheck {
++    const resolved = this.resolve(raw, "C:\\");
++    if (!resolved.ok || !ABSOLUTE.test(raw)) return { ok: false, id: "outside", reason: `the working folder ${raw}` };
++    if (!this.inAny(resolved.path, [this.worktree, ...this.writes, ...this.scratch])) {
++      return { ok: false, id: "outside", reason: `the working folder ${resolved.path}, outside the permitted folders` };
++    }
++    return { ok: true, path: resolved.path };
++  }
++}
++
++// ---------------------------------------------------------------------------
++// Never-auto, per statement (step 5)
++// ---------------------------------------------------------------------------
++
++type Hit = { id: NeverAutoId; detail: string };
++
++function commandList(id: NeverAutoId): ReadonlySet<string> {
++  return new Set(neverAuto(id).commands);
++}
++const COMMANDS = {
++  destructive: commandList("destructive"),
++  outward: commandList("outward"),
++  credential: commandList("credential"),
++  hardware: commandList("hardware"),
++  system: commandList("system"),
++};
++
++/** The program a command runs, lowercase: a bare name, or the last part of a path. */
++function programOf(words: readonly Word[]): { name: string; base: string; path: boolean } {
++  const value = (words[0]?.value ?? "").toLowerCase();
++  const path = /[\\/]|^[a-z]:/.test(value);
++  const base = value.replace(/\//g, "\\").split("\\").pop() ?? value;
++  return { name: value, base, path };
++}
++
++/** A git command's global options and its subcommand. */
++interface GitCommand {
++  noOptionalLocks: boolean;
++  dir: string | null;
++  other: string[];
++  sub: string;
++  args: Word[];
++}
++
++function parseGit(words: readonly Word[]): GitCommand | null {
++  const git: GitCommand = { noOptionalLocks: false, dir: null, other: [], sub: "", args: [] };
++  let index = 1;
++  for (; index < words.length; index += 1) {
++    const value = words[index]?.value ?? "";
++    if (value === "--no-optional-locks") git.noOptionalLocks = true;
++    else if (value === "-C") {
++      if (git.dir !== null) return null;
++      git.dir = words[index + 1]?.value ?? null;
++      if (git.dir === null) return null;
++      index += 1;
++    } else if (value.startsWith("-")) {
++      git.other.push(value);
++      if (value === "-c") index += 1;
++    } else break;
++  }
++  git.sub = (words[index]?.value ?? "").toLowerCase();
++  git.args = words.slice(index + 1);
++  return git;
++}
++
++const NPM_INSTALL = new Set(["install", "i", "ci", "add", "isntall", "in"]);
++const DANGEROUS_ENV = /^(?:path|pathext|comspec|psmodulepath|node_options|git_.*|npm_config_.*)$/i;
++
++function isNpm(base: string): boolean {
++  return base === "npm" || base === "npm.cmd" || base === "npm.exe";
++}
++
++function statementHit(statement: Statement): Hit | null {
++  if (statement.kind === "env") {
++    if (DANGEROUS_ENV.test(statement.name)) return { id: "system", detail: `sets $env:${statement.name}` };
++    return null;
++  }
++  if (statement.kind === "patch") {
++    if (/^\*\*\* (?:Delete File|Move to)/m.test(statement.body)) return { id: "destructive", detail: "an apply_patch delete or move" };
++    return null;
++  }
++  const words = statement.words;
++  const program = programOf(words);
++  const values = words.map((word) => word.value.toLowerCase());
++  const lower = (index: number) => values[index] ?? "";
++  for (const [id, names] of Object.entries(COMMANDS) as Array<[keyof typeof COMMANDS, ReadonlySet<string>]>) {
++    if (names.has(program.name) || (program.path && names.has(program.base))) return { id, detail: `runs ${program.base}` };
++  }
++  // destructive
++  const newDirectory =
++    program.name === "new-item" && values.some((value, index) => value === "-itemtype" && lower(index + 1) === "directory");
++  if (!newDirectory && values.some((value) => value === "-force" || value.startsWith("-force:"))) {
++    return { id: "destructive", detail: `-Force on ${program.base}` };
++  }
++  if (values.some((value) => value === "--force" || value === "--force-with-lease" || value.startsWith("--force"))) {
++    return { id: "destructive", detail: `--force on ${program.base}` };
++  }
++  if (program.base === "git" || program.base === "git.exe") {
++    const git = parseGit(words);
++    if (git === null) return null;
++    const args = git.args.map((word) => word.value);
++    const destructive =
++      ["reset", "clean", "restore", "rm"].includes(git.sub) ||
++      (git.sub === "checkout" && args.some((arg) => arg === "--" || arg === "-f")) ||
++      (git.sub === "branch" && args.some((arg) => ["-d", "-D", "--delete", "-f", "-M"].includes(arg))) ||
++      (git.sub === "stash" && ["drop", "clear"].includes(args[0] ?? "")) ||
++      (git.sub === "worktree" && ["remove", "prune"].includes(args[0] ?? ""));
++    if (destructive) return { id: "destructive", detail: `git ${git.sub}` };
++    if (["push", "remote", "send-email"].includes(git.sub)) return { id: "outward", detail: `git ${git.sub}` };
++  }
++  if (program.base === "gh" || program.base === "gh.exe") {
++    const sub = lower(1);
++    if (sub === "api") {
++      const writes = values.slice(2).some((value) => /^(?:-x|--method|-f|--field|--raw-field|--input)(?:=|$)/.test(value));
++      if (writes) return { id: "outward", detail: "gh api with a method or fields" };
++    } else if (!(sub === "pr" && lower(2) === "view")) {
++      return { id: "outward", detail: `gh ${sub}` };
++    }
++  }
++  if (program.base === "curl" || program.base === "curl.exe") {
++    const writes = words
++      .slice(1)
++      .some((word) => /^(?:-X|--request|-d|--data[\w-]*|-F|--form[\w-]*|-T|--upload-file|--json)(?:=|$)/.test(word.value));
++    if (writes) return { id: "outward", detail: "curl with a method or data" };
++  }
++  if (["invoke-restmethod", "irm", "invoke-webrequest", "iwr"].includes(program.name)) {
++    if (values.some((value) => /^-(?:method|body|infile|form)$/.test(value))) return { id: "outward", detail: `${program.name} with a method or body` };
++  }
++  if (isNpm(program.base)) {
++    if (lower(1) === "publish") return { id: "outward", detail: "npm publish" };
++    if (values.includes("-g") || values.includes("--global")) return { id: "system", detail: "a global npm command" };
++    if (NPM_INSTALL.has(lower(1)) && !values.includes("--ignore-scripts")) return { id: "system", detail: "npm install without --ignore-scripts" };
++  }
++  // system
++  if (program.base === "pwsh" || program.base === "pwsh.exe") {
++    if (!(lower(1) === "-noprofile" && lower(2) === "-file" && words.length >= 4)) return { id: "system", detail: "a nested pwsh" };
++  }
++  if (program.base === "uv" || program.base === "uv.exe") {
++    if (lower(1) === "tool" || lower(1) === "pip") return { id: "system", detail: `uv ${lower(1)}` };
++  }
++  if (/^python(?:3)?(?:\.exe)?$/.test(program.base) && values.some((value, index) => value === "-m" && lower(index + 1) === "pip")) {
++    return { id: "system", detail: "python -m pip" };
++  }
++  return null;
++}
++
++/** The first never-auto pattern hit in `text`, in list order. */
++export function patternHit(text: string): Hit | null {
++  for (const entry of NEVER_AUTO) {
++    for (const pattern of entry.patterns) {
++      const found = pattern.exec(text);
++      if (found !== null) return { id: entry.id, detail: `matches ${pattern.source.slice(0, 60)} at ${JSON.stringify(found[0].trim().slice(0, 40))}` };
++    }
++  }
++  return null;
++}
++
++// ---------------------------------------------------------------------------
++// Rules (step 4)
++// ---------------------------------------------------------------------------
++
++type RuleName =
++  | "notes-write"
++  | "local-read"
++  | "net-read"
++  | "git-local"
++  | "git-read"
++  | "home-tool"
++  | "exec"
++  | "package";
++
++type StatementResult =
++  | { ok: true; rule: RuleName | "env"; tier: 0 | 1 | 2; detail: string }
++  | { ok: false; rule: string; detail: string };
++
++const TIER: Record<RuleName, 1 | 2> = {
++  "notes-write": 1,
++  "local-read": 1,
++  "net-read": 1,
++  "git-local": 1,
++  "git-read": 1,
++  "home-tool": 1,
++  exec: 2,
++  package: 2,
++};
++
++function allow(rule: RuleName, detail: string): StatementResult {
++  return { ok: true, rule, tier: TIER[rule], detail };
++}
++function refuse(id: NeverAutoId, detail: string): StatementResult {
++  return { ok: false, rule: `never:${id}`, detail };
++}
++function noRule(detail: string): StatementResult {
++  return { ok: false, rule: "no-rule", detail };
++}
++
++/** A cmdlet's named parameters, exactly as spelled (case-insensitive); null when anything else is there. */
++function cmdletParams(
++  words: readonly Word[],
++  valued: readonly string[],
++  switches: readonly string[],
++): Map<string, Word | true> | null {
++  const params = new Map<string, Word | true>();
++  for (let index = 1; index < words.length; index += 1) {
++    const word = words[index];
++    if (word === undefined || word.quoted || !word.value.startsWith("-")) return null;
++    const name = word.value.toLowerCase();
++    if (params.has(name)) return null;
++    if (switches.includes(name)) params.set(name, true);
++    else if (valued.includes(name)) {
++      const value = words[index + 1];
++      if (value === undefined || (!value.quoted && value.value.startsWith("-"))) return null;
++      params.set(name, value);
++      index += 1;
++    } else return null;
++  }
++  return params;
++}
++
++function valueOf(params: Map<string, Word | true>, name: string): Word | null {
++  const value = params.get(name);
++  return value === undefined || value === true ? null : value;
++}
++
++interface RuleContext {
++  roots: Roots;
++  permits: Permits;
++  cwd: string;
++  cwdRaw: string;
++}
++
++/** Each path in `paths` checked; the first refusal, or the paths. */
++function checkAll(rc: RuleContext, paths: readonly string[], access: Access, only?: readonly string[]): { ok: true; paths: string[] } | { ok: false; result: StatementResult } {
++  const out: string[] = [];
++  for (const raw of paths) {
++    const checked = rc.roots.check(raw, rc.cwdRaw, access, only);
++    if (!checked.ok) return { ok: false, result: refuse(checked.id, checked.reason) };
++    out.push(checked.path);
++  }
++  return { ok: true, paths: out };
++}
++
++function notesWrite(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult | null {
++  const name = statement.words[0]?.value.toLowerCase() ?? "";
++  const words = statement.words;
++  if (name === "new-item") {
++    const params = cmdletParams(words, ["-itemtype", "-path"], ["-force", "-whatif"]);
++    const path = params === null ? null : valueOf(params, "-path");
++    if (params === null || path === null || valueOf(params, "-itemtype")?.value.toLowerCase() !== "directory") {
++      return noRule("New-Item other than -ItemType Directory -Path");
++    }
++    const checked = checkAll(rc, path.parts, "write");
++    return checked.ok ? allow("notes-write", `New-Item into ${checked.paths.join(", ")}`) : checked.result;
++  }
++  if (name === "copy-item") {
++    const params = cmdletParams(words, ["-literalpath", "-destination"], ["-whatif"]);
++    const sources = params === null ? null : valueOf(params, "-literalpath");
++    const destination = params === null ? null : valueOf(params, "-destination");
++    if (sources === null || destination === null || destination.parts.length !== 1) {
++      return noRule("Copy-Item other than -LiteralPath -Destination");
++    }
++    const read = checkAll(rc, sources.parts, "read");
++    if (!read.ok) return read.result;
++    const write = checkAll(rc, destination.parts, "write");
++    return write.ok ? allow("notes-write", `Copy-Item into ${write.paths.join(", ")}`) : write.result;
++  }
++  if (name === "expand-archive") {
++    const params = cmdletParams(words, ["-literalpath", "-destinationpath"], ["-whatif"]);
++    const source = params === null ? null : valueOf(params, "-literalpath");
++    const destination = params === null ? null : valueOf(params, "-destinationpath");
++    if (source === null || destination === null || source.parts.length !== 1 || destination.parts.length !== 1) {
++      return noRule("Expand-Archive other than -LiteralPath -DestinationPath");
++    }
++    const read = checkAll(rc, source.parts, "read");
++    if (!read.ok) return read.result;
++    const write = checkAll(rc, destination.parts, "write");
++    return write.ok ? allow("notes-write", `Expand-Archive into ${write.paths.join(", ")}`) : write.result;
++  }
++  return null;
++}
++
++function applyPatch(rc: RuleContext, statement: Extract<Statement, { kind: "patch" }>): StatementResult {
++  if (!rc.roots.shim.test(canon(statement.shim))) return refuse("outside", `the apply_patch shim ${statement.shim}`);
++  const lines = statement.body.split("\n");
++  if (lines[0] !== "*** Begin Patch" || lines[lines.length - 1] !== "*** End Patch") return refuse("unparsed", "an apply_patch body without Begin and End");
++  const targets: string[] = [];
++  for (const line of lines.slice(1, -1)) {
++    if (!line.startsWith("*** ")) continue;
++    const header = /^\*\*\* (Add File|Update File): (.+)$/.exec(line);
++    if (header !== null) targets.push((header[2] ?? "").trim());
++    else if (line !== "*** End of File") return refuse("unparsed", `the apply_patch header ${line.slice(0, 60)}`);
++  }
++  if (targets.length === 0) return refuse("unparsed", "an apply_patch with no file");
++  const checked = checkAll(rc, targets, "write");
++  return checked.ok ? allow("notes-write", `apply_patch into ${checked.paths.join(", ")}`) : checked.result;
++}
++
++function localRead(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult | null {
++  const name = statement.words[0]?.value.toLowerCase() ?? "";
++  const forms: Record<string, { valued: string[]; switches: string[] }> = {
++    "get-content": { valued: ["-literalpath", "-path", "-tail", "-totalcount", "-encoding"], switches: ["-raw"] },
++    "get-item": { valued: ["-literalpath", "-path"], switches: [] },
++    "get-childitem": { valued: ["-literalpath", "-path", "-depth"], switches: ["-recurse", "-file", "-directory", "-name"] },
++    "test-path": { valued: ["-literalpath", "-path", "-pathtype"], switches: [] },
++  };
++  const form = forms[name];
++  if (form === undefined) return null;
++  const params = cmdletParams(statement.words, form.valued, form.switches);
++  if (params === null) return noRule(`${name} with other parameters`);
++  for (const numeric of ["-tail", "-totalcount", "-depth"]) {
++    const value = valueOf(params, numeric);
++    if (value !== null && !/^\d{1,6}$/.test(value.value)) return noRule(`${name} ${numeric} ${value.value}`);
++  }
++  const encoding = valueOf(params, "-encoding");
++  if (encoding !== null && !/^[A-Za-z0-9-]+$/.test(encoding.value)) return noRule("an odd -Encoding");
++  const pathType = valueOf(params, "-pathtype");
++  if (pathType !== null && !/^(?:leaf|container|any)$/i.test(pathType.value)) return noRule("an odd -PathType");
++  const paths = [valueOf(params, "-literalpath"), valueOf(params, "-path")].filter((word): word is Word => word !== null);
++  if (paths.length !== 1) return noRule(`${name} needs one -LiteralPath or -Path`);
++  const checked = checkAll(rc, paths[0]?.parts ?? [], "read");
++  return checked.ok ? allow("local-read", `${name} of ${checked.paths.join(", ")}`) : checked.result;
++}
++
++function githubPair(pair: string, permits: Permits): boolean {
++  return permits.netRead.githubRepos.some((listed) => listed.toLowerCase() === pair.toLowerCase());
++}
++
++function hostOf(url: string, permits: Permits): string | null {
++  const parsed = /^https:\/\/([A-Za-z0-9.-]+)(?:\/[A-Za-z0-9._~\-/?=&%+,]*)?$/.exec(url);
++  if (parsed === null || url.includes("..")) return null;
++  const host = (parsed[1] ?? "").toLowerCase();
++  return permits.netRead.hosts.some((listed) => listed.toLowerCase() === host) ? host : null;
++}
++
++const NETWORK = new Set([
++  "curl",
++  "curl.exe",
++  "wget",
++  "wget.exe",
++  "invoke-restmethod",
++  "irm",
++  "invoke-webrequest",
++  "iwr",
++  "start-bitstransfer",
++  "gh",
++  "gh.exe",
++]);
++
++function netRead(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
++  const words = statement.words;
++  const values = words.map((word) => word.value);
++  const program = programOf(words);
++  const permits = rc.permits;
++  if (program.base === "gh" || program.base === "gh.exe") {
++    if (values[1] === "api") {
++      let path: string | null = null;
++      for (let index = 2; index < values.length; index += 1) {
++        const value = values[index] ?? "";
++        if (value === "--paginate") continue;
++        if (value === "-H" && /^Accept:/i.test(values[index + 1] ?? "")) {
++          index += 1;
++          continue;
++        }
++        if (value === "--jq" && values[index + 1] !== undefined) {
++          index += 1;
++          continue;
++        }
++        if (value.startsWith("-") || path !== null) return refuse("non-get", `gh api with ${value}`);
++        path = value;
++      }
++      const parsed = path === null ? null : /^\/?repos\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)(?:[/?][A-Za-z0-9._\-/?=&%,+]*)?$/.exec(path);
++      if (parsed === null || path?.includes("..")) return refuse("non-get", `gh api ${path ?? ""}`);
++      const pair = `${parsed[1]}/${parsed[2]}`;
++      if (!githubPair(pair, permits)) return refuse("non-get", `gh api on ${pair}, not listed`);
++      return allow("net-read", `gh api ${pair}`);
++    }
++    // gh pr view <n|url> [--repo o/r] [--json fields]
++    let target: string | null = null;
++    let repo: string | null = null;
++    for (let index = 3; index < values.length; index += 1) {
++      const value = values[index] ?? "";
++      if (value === "--repo" && repo === null && values[index + 1] !== undefined) {
++        repo = values[index + 1] ?? null;
++        index += 1;
++      } else if (value === "--json" && /^[A-Za-z,]+$/.test(values[index + 1] ?? "")) {
++        index += 1;
++      } else if (!value.startsWith("-") && target === null) {
++        target = value;
++      } else return refuse("non-get", `gh pr view with ${value}`);
++    }
++    const url = target === null ? null : /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9._-]+)\/pull\/\d+$/.exec(target);
++    const pair = url !== null ? (url[1] ?? null) : repo;
++    if (target === null || (url === null && !/^\d+$/.test(target))) return refuse("non-get", "gh pr view of no pull request");
++    if (pair === null) return refuse("non-get", "gh pr view without --repo");
++    if (repo !== null && url !== null && repo.toLowerCase() !== pair.toLowerCase()) return refuse("non-get", "gh pr view of two repos");
++    if (!githubPair(pair, permits)) return refuse("non-get", `gh pr view on ${pair}, not listed`);
++    return allow("net-read", `gh pr view on ${pair}`);
++  }
++  if (program.base === "curl.exe") {
++    let flags = 0;
++    let url: string | null = null;
++    let output: string | null = null;
++    for (let index = 1; index < values.length; index += 1) {
++      const value = values[index] ?? "";
++      if (/^-fL[sS]{0,2}$/.test(value)) flags += 1;
++      else if (value === "-o" && output === null && values[index + 1] !== undefined) {
++        output = values[index + 1] ?? null;
++        index += 1;
++      } else if (/^https:\/\//.test(value) && url === null) url = value;
++      else return refuse("non-get", `curl with ${value}`);
++    }
++    if (flags !== 1 || url === null || output === null) return refuse("non-get", "curl other than -fL <url> -o <scratch>");
++    const host = hostOf(url, permits);
++    if (host === null) return refuse("non-get", "curl to a host not listed");
++    const checked = checkAll(rc, [output], "write", rc.roots.scratch);
++    return checked.ok ? allow("net-read", `curl from ${host} into ${checked.paths[0]}`) : checked.result;
++  }
++  if (program.name === "invoke-restmethod") {
++    if (words.length !== 3 || values[1]?.toLowerCase() !== "-uri") return refuse("non-get", "Invoke-RestMethod with other parameters");
++    const host = hostOf(values[2] ?? "", permits);
++    return host === null ? refuse("non-get", "Invoke-RestMethod to a host not listed") : allow("net-read", `Invoke-RestMethod from ${host}`);
++  }
++  return refuse("non-get", `${program.base} is not one of the read-only network forms`);
++}
++
++function gitClone(rc: RuleContext, git: GitCommand): StatementResult {
++  const args = git.args.map((word) => word.value);
++  let index = 0;
++  if (args[index] !== "--depth" || args[index + 1] !== "1") return refuse("non-get", "git clone without --depth 1");
++  index += 2;
++  if (args[index] === "--branch") {
++    if (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(args[index + 1] ?? "") || (args[index + 1] ?? "").includes("..")) {
++      return refuse("non-get", "git clone --branch with an odd ref");
++    }
++    index += 2;
++  }
++  const url = /^https:\/\/github\.com\/([A-Za-z0-9-]+\/[A-Za-z0-9._-]+?)\.git$/.exec(args[index] ?? "");
++  const destination = args[index + 1];
++  if (url === null || destination === undefined || args.length !== index + 2 || git.dir !== null || git.other.length > 0) {
++    return refuse("non-get", "git clone other than --depth 1 https://github.com/<o>/<r>.git <scratch>");
++  }
++  if (!githubPair(url[1] ?? "", rc.permits)) return refuse("non-get", `git clone of ${url[1]}, not listed`);
++  const checked = checkAll(rc, [destination], "write", rc.roots.scratch);
++  return checked.ok ? allow("net-read", `git clone of ${url[1]} into ${checked.paths[0]}`) : checked.result;
++}
++
++const READ_VERBS = new Set(["log", "diff", "show", "rev-parse", "status"]);
++
++/** A read-only git verb's arguments: no output file, external diff, text conversion or no-index read; path tokens inside `root`. */
++function gitReadArgs(rc: RuleContext, git: GitCommand, root: string, base: string): StatementResult | null {
++  for (const word of git.args) {
++    const value = word.value;
++    if (/^(?:--output|-o$|--ext-diff|--textconv|--no-index|--exec)/.test(value)) return refuse("project-repo", `git ${git.sub} ${value}`);
++    if (value.includes("\\") || /^[A-Za-z]:/.test(value)) {
++      const checked = rc.roots.check(value, base, "read", [root]);
++      if (!checked.ok) return refuse(checked.id, checked.reason);
++    }
++  }
++  return null;
++}
++
++function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
++  const git = parseGit(statement.words);
++  if (git === null) return refuse("unparsed", "a git command with a lone -C");
++  if (git.other.some((option) => /^--(?:git-dir|work-tree)/.test(option))) return refuse("project-repo", "git with --git-dir or --work-tree");
++  if (["fetch", "pull", "ls-remote", "submodule"].includes(git.sub)) return refuse("non-get", `git ${git.sub}`);
++  if (git.sub === "clone") return gitClone(rc, git);
++  const roots = rc.roots;
++  if (git.dir !== null) {
++    const dir = roots.resolve(git.dir, rc.cwdRaw);
++    if (!dir.ok) return refuse("outside", dir.reason);
++    if (dir.path === roots.worktree) return noRule("git -C on the own worktree");
++    const repo = roots.reads.find((root) => within(dir.path, root));
++    if (repo === undefined) return refuse("project-repo", `git -C ${dir.path}, not a repo the permits name`);
++    if (!git.noOptionalLocks || git.other.length > 0) return refuse("project-repo", "git -C without --no-optional-locks alone");
++    if (READ_VERBS.has(git.sub)) {
++      const bad = gitReadArgs(rc, git, repo, git.dir);
++      return bad ?? allow("git-read", `git ${git.sub} in ${repo}`);
++    }
++    if (git.sub === "archive") {
++      let output: string | null = null;
++      let rev: string | null = null;
++      const args = git.args.map((word) => word.value);
++      for (let index = 0; index < args.length; index += 1) {
++        const value = args[index] ?? "";
++        if (/^--format=(?:zip|tar)$/.test(value)) continue;
++        if (value === "-o" && output === null && args[index + 1] !== undefined) {
++          output = args[index + 1] ?? null;
++          index += 1;
++        } else if (value.startsWith("--output=") && output === null) output = value.slice("--output=".length);
++        else if (!value.startsWith("-") && rev === null && /^[A-Za-z0-9._/~^-]+$/.test(value) && !value.includes("..")) rev = value;
++        else return refuse("project-repo", `git archive with ${value}`);
++      }
++      if (output === null || rev === null) return refuse("project-repo", "git archive without a rev and -o");
++      const checked = checkAll(rc, [output], "write");
++      return checked.ok ? allow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
++    }
++    return refuse("project-repo", `git ${git.sub} in the read-only ${repo}`);
++  }
++  if (rc.cwd !== roots.worktree) {
++    if (within(rc.cwd, roots.worktree)) return noRule("git in a folder of the worktree, not its root");
++    return refuse("project-repo", `git in ${rc.cwd}, not the agent's worktree`);
++  }
++  if (!rc.permits.gitLocal) return noRule("git in the worktree, and the permits do not allow it");
++  const args = git.args.map((word) => word.value);
++  if (git.noOptionalLocks && git.other.length === 0 && READ_VERBS.has(git.sub)) {
++    const bad = gitReadArgs(rc, git, roots.worktree, rc.cwdRaw);
++    return bad ?? allow("git-local", `git ${git.sub}`);
++  }
++  if (git.other.length > 0 || git.noOptionalLocks) return noRule(`git ${git.other.join(" ")} ${git.sub}`);
++  if (git.sub === "add") {
++    const rest = args[0] === "--dry-run" ? args.slice(1) : args;
++    if (rest[0] !== "--" || rest.length < 2) return noRule("git add other than [--dry-run] -- <paths>");
++    const checked = checkAll(rc, rest.slice(1), "read", [roots.worktree]);
++    return checked.ok ? allow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
++  }
++  if (git.sub === "commit") {
++    const rest = args[0] === "--dry-run" ? args.slice(1) : args;
++    if (rest.length !== 2 || rest[0] !== "-m") return noRule("git commit other than [--dry-run] -m '<message>'");
++    return allow("git-local", "git commit");
++  }
++  if (git.sub === "branch") {
++    const ref = /^[A-Za-z0-9][A-Za-z0-9._/-]*$/;
++    const rev = /^[A-Za-z0-9][A-Za-z0-9._/~^-]*$/;
++    if (args.length < 1 || args.length > 2 || !ref.test(args[0] ?? "") || (args[1] !== undefined && !rev.test(args[1]))) {
++      return noRule("git branch other than <name> [<rev>]");
++    }
++    if (args.some((arg) => arg.includes(".."))) return noRule("git branch with ..");
++    return allow("git-local", `git branch ${args[0]}`);
++  }
++  return noRule(`git ${git.sub}`);
++}
++
++function homeTool(rc: RuleContext, script: Word, args: readonly Word[]): StatementResult | null {
++  const path = rc.roots.resolve(script.value, rc.cwdRaw);
++  if (!path.ok || path.path !== rc.roots.homeTools.privacyCheck) return null;
++  if (args.length !== 2) return noRule("privacy-check.ps1 with other arguments");
++  const [target, ref] = args;
++  const checked = checkAll(rc, [target?.value ?? ""], "read", [rc.roots.worktree, ...rc.roots.reads]);
++  if (!checked.ok) return checked.result;
++  if (!/^[A-Za-z0-9._/-]+$/.test(ref?.value ?? "") || (ref?.value ?? "").includes("..")) return noRule("privacy-check.ps1 with an odd ref");
++  return allow("home-tool", `privacy-check of ${checked.paths[0]}`);
++}
++
++/** Whether a word is a path token; for `name=value` forms the value is. */
++function pathPart(value: string): { path: string } | { url: true } | { attached: true } | null {
++  const assigned = /^[^=\\/:]*=(.*)$/.exec(value);
++  const candidate = assigned !== null ? (assigned[1] ?? "") : value;
++  if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(candidate)) return { url: true };
++  if (!(candidate.includes("\\") || candidate.includes("/") || /^[A-Za-z]:/.test(candidate))) return null;
++  if (assigned === null && value.startsWith("-")) return { attached: true };
++  return { path: candidate };
++}
++
++function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
++  const words = statement.words;
++  const roots = rc.roots;
++  const toolPaths = [roots.homeTools.fmpy, roots.homeTools.privacyCheck];
++  let refusal: StatementResult | null = null;
++  for (const entry of rc.permits.exec) {
++    if (entry.prefix.length > words.length) continue;
++    if (!entry.prefix.every((token, index) => canon(token) === canon(words[index]?.value ?? ""))) continue;
++    const place = entry.in === "scratch" ? roots.scratch : entry.in === "worktree" ? [roots.worktree] : roots.writes;
++    if (!roots.inAny(rc.cwd, place)) {
++      refusal ??= noRule(`exec ${entry.prefix.join(" ")} outside its ${entry.in} folder`);
++      continue;
++    }
++    // A program named by path, in the prefix or not, runs from the roots or is one of the home tools.
++    const result = ((): StatementResult | null => {
++      for (const [index, word] of words.entries()) {
++        const kind = pathPart(word.value);
++        if (kind === null) continue;
++        if ("url" in kind) return refuse("non-get", `exec with the address ${word.value.slice(0, 60)}`);
++        if ("attached" in kind) return refuse("outside", `exec with the option ${word.value.slice(0, 60)}`);
++        const resolved = roots.resolve(kind.path, rc.cwdRaw);
++        if (index < entry.prefix.length && resolved.ok && toolPaths.includes(resolved.path)) continue;
++        const checked = roots.check(kind.path, rc.cwdRaw, "write", [roots.worktree, ...roots.writes, ...roots.scratch]);
++        if (!checked.ok) return refuse(checked.id, checked.reason);
++      }
++      return null;
++    })();
++    if (result !== null) return result;
++    return allow("exec", `exec ${entry.prefix.join(" ")} in ${entry.in}`);
++  }
++  return refusal ?? noRule(`no rule for ${programOf(words).base}`);
++}
++
++function packageRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
++  const values = statement.words.map((word) => word.value);
++  if (!rc.permits.netRead.hosts.some((host) => host.toLowerCase() === "registry.npmjs.org")) {
++    return noRule("npm install, and the permits do not list registry.npmjs.org");
++  }
++  if (programOf(statement.words).base !== "npm.cmd" || values[1] !== "install") return noRule("npm other than npm.cmd install");
++  if (!rc.roots.inAny(rc.cwd, rc.roots.scratch)) return noRule("npm install outside a scratch folder");
++  const seen = new Set<string>();
++  const packages: string[] = [];
++  let cache: string | null = null;
++  for (let index = 2; index < values.length; index += 1) {
++    const value = values[index] ?? "";
++    if (["--no-save", "--package-lock=false", "--ignore-scripts"].includes(value)) {
++      if (seen.has(value)) return noRule(`npm install with ${value} twice`);
++      seen.add(value);
++    } else if (value === "--cache" && cache === null && values[index + 1] !== undefined) {
++      cache = values[index + 1] ?? null;
++      index += 1;
++    } else if (/^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*@\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(value)) {
++      packages.push(value);
++    } else return noRule(`npm install with ${value}`);
++  }
++  if (seen.size !== 3 || cache === null || packages.length === 0) return noRule("npm install without its pinned form");
++  const checked = checkAll(rc, [cache], "write", rc.roots.scratch);
++  return checked.ok ? allow("package", `npm install ${packages.join(" ")}`) : checked.result;
++}
++
++
++function ruleFor(rc: RuleContext, statement: Statement): StatementResult {
++  if (statement.kind === "env") {
++    if (!rc.permits.envNames.some((name) => name.toLowerCase() === statement.name.toLowerCase())) {
++      return noRule(`$env:${statement.name} is not a permitted name`);
++    }
++    if (/^(?:uv_cache_dir|temp|tmp)$/i.test(statement.name)) {
++      const checked = checkAll(rc, [statement.value], "write", rc.roots.scratch);
++      if (!checked.ok) return checked.result;
++    }
++    return { ok: true, rule: "env", tier: 0, detail: `$env:${statement.name}` };
++  }
++  if (statement.kind === "patch") return applyPatch(rc, statement);
++  const words = statement.words;
++  const program = programOf(words);
++  // A program named by path is a home tool, or runs from the roots under an exec prefix; nothing else.
++  if (program.path) {
++    const first = words[0];
++    if (first !== undefined) {
++      const home = homeTool(rc, first, words.slice(1));
++      if (home !== null) return home;
++    }
++    const resolved = rc.roots.resolve(program.name, rc.cwdRaw);
++    const inRoots = resolved.ok && rc.roots.inAny(resolved.path, [rc.roots.worktree, ...rc.roots.writes, ...rc.roots.scratch]);
++    if (!inRoots) return refuse("outside", `runs ${program.name}, outside the permitted folders`);
++    return execRule(rc, statement);
++  }
++  if (program.base === "git" || program.base === "git.exe") return gitRule(rc, statement);
++  if (NETWORK.has(program.name)) return netRead(rc, statement);
++  if (isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())) return packageRule(rc, statement);
++  if (program.base === "pwsh" || program.base === "pwsh.exe") {
++    const tool = words[3];
++    if (tool !== undefined) {
++      const home = homeTool(rc, tool, words.slice(4));
++      if (home !== null) return home;
++    }
++    return execRule(rc, statement);
++  }
++  if (statement.call) return refuse("unparsed", "a call of a bare name");
++  return notesWrite(rc, statement) ?? localRead(rc, statement) ?? execRule(rc, statement);
++}
++
++// ---------------------------------------------------------------------------
++// match
++// ---------------------------------------------------------------------------
++
++/**
++ * The broker's answer to one request: `allow` only when the agent is crew with a valid task, the request
++ * is a Codex command approval, the agent is not sticky, nothing on the never-auto list is hit, the
++ * permits file is valid for the task, every statement matches an allow rule, and the agent is under the
++ * hourly allow cap. Anything else relays.
++ */
++export function match(request: PermitRequest, permitsRaw: unknown, context: MatchContext): MatchResult {
++  if (!context.crew) return never("not-crew", "the agent has no crew label");
++  if (context.task === null) return never("not-crew", "the agent has no task label");
++  if (!taskIdOk(context.task)) return never("not-crew", `the task id ${JSON.stringify(context.task.slice(0, 80))} is reserved or not a slug`);
++  if (request.provider !== "codex" || request.name !== "CodexBash" || request.kind !== "tool") {
++    return never("not-v1", `${request.provider} ${request.name} ${request.kind}`);
++  }
++  if (context.sticky) return never("after-refusal", "the agent is sticky after a refusal");
++  const input = (typeof request.input === "object" && request.input !== null ? request.input : {}) as Record<string, unknown>;
++  const command = input.command;
++  const cwdRaw = input.cwd;
++  if (typeof command !== "string" || typeof cwdRaw !== "string") return never("unparsed", "no command line and working folder");
++
++  const script = unwrapCommand(command, context.userHome);
++  const parsed = script === null ? null : parseScript(script);
++  // The working folder too: a credential or device in its path is as telling as in the command.
++  const patternText = `${parsed?.ok === true ? parsed.masked : (script ?? stripShell(command))}\n${cwdRaw}`;
++  const raw = patternHit(patternText);
++  if (raw !== null) return never(raw.id, raw.detail);
++  if (script === null) return never("unparsed", "not exactly \"<pwsh>\" -Command '<script>'");
++  if (parsed === null || !parsed.ok) return never("unparsed", parsed?.reason ?? "unparsed");
++  for (const statement of parsed.statements) {
++    const hit = statementHit(statement);
++    if (hit !== null) return never(hit.id, hit.detail);
++  }
++
++  if (permitsRaw === undefined) return never("no-permits", "no permits file");
++  const permits = parsePermits(permitsRaw);
++  if (permits === null) return never("no-permits", "the permits file is invalid");
++  if (permits.task !== context.task) return never("no-permits", "the permits file is for another task");
++  if (context.mode === "live" && !permits.live) return never("no-permits", "the permits file is not live");
++
++  const roots = new Roots(context, permits);
++  const cwd = roots.cwd(cwdRaw);
++  if (!cwd.ok) return never(cwd.id, cwd.reason);
++  const rc: RuleContext = { roots, permits, cwd: cwd.path, cwdRaw };
++  const results = parsed.statements.map((statement) => ruleFor(rc, statement));
++  const refused = results.find((result) => !result.ok && result.rule.startsWith("never:")) ?? results.find((result) => !result.ok);
++  if (refused !== undefined && !refused.ok) {
++    return { verdict: "relay", rule: refused.rule, tier: null, detail: refused.detail };
++  }
++  const allowed = results.filter((result): result is Extract<StatementResult, { ok: true }> => result.ok && result.rule !== "env");
++  if (allowed.length === 0) return { verdict: "relay", rule: "no-rule", tier: null, detail: "only $env: assignments" };
++  if (context.allowsLastHour >= MAX_ALLOWS_PER_HOUR) {
++    return never("rate", `${context.allowsLastHour} automatic allows in the last hour`);
++  }
++  const rule = [...new Set(allowed.map((result) => result.rule))].join("+");
++  const tier = allowed.some((result) => result.tier === 2) ? 2 : 1;
++  return { verdict: "allow", rule, tier, detail: allowed.map((result) => result.detail).join("; ") };
++}
+diff --git a/server/permit-replay.test.ts b/server/permit-replay.test.ts
+new file mode 100644
+index 0000000..93d9d72
+--- /dev/null
++++ b/server/permit-replay.test.ts
+@@ -0,0 +1,166 @@
++/**
++ * The private replay (spec 3.11 item 8): every command of a labelled corpus of real permission requests
++ * through the matcher under maximal permits. Skipped unless `PERMIT_REPLAY` names the corpus, a JSON
++ * lines file of `{ command, cwd, label }` (also read: `cmd`, `cls2`, `cls`, `class`). The corpus stays on
++ * the machine that made it; nothing of it belongs in this repository.
++ *
++ * Maximal permits are built from the corpus itself: every folder under the home's `data/` as a write dir,
++ * the temporary folder as scratch, every `-C` folder and every Paseo worktree as a read repo, every GitHub pair and host it names,
++ * and an exec entry in every place for the first word of every statement. So only the never-auto list and
++ * the grammar can stop a command. It fails if a command labelled hardware, WSL, destructive, outward or
++ * credential comes out `allow`, and prints coverage by label (counts and rules only, no commands).
++ *
++ * `PERMIT_REPLAY_DETAIL=1` also prints each relay's index, label, rule and detail (paths, no commands).
++ *
++ * `PERMIT_REPLAY_HOME` names the first mate's home; by default it is four folders above the corpus
++ * (`<home>/data/<plan>/evidence/corpus.jsonl`).
++ */
++import { readdirSync, readFileSync, realpathSync } from "node:fs";
++import { homedir, tmpdir } from "node:os";
++import { dirname, join } from "node:path";
++
++import { describe, expect, it } from "vitest";
++
++import { match, parseScript, unwrapCommand, type MatchResult, type Permits } from "./permit-match";
++
++const CORPUS = process.env.PERMIT_REPLAY ?? "";
++const FORBIDDEN = /hardware|wsl|destructive|outward|credential/i;
++const PWSH = "C:\\Program Files\\PowerShell\\7\\pwsh.exe";
++
++interface Entry {
++  command: string;
++  cwd: string;
++  label: string;
++}
++
++function text(record: Record<string, unknown>, ...names: string[]): string {
++  for (const name of names) if (typeof record[name] === "string") return record[name] as string;
++  return "";
++}
++
++function localPath(cwd: string): string {
++  if (!cwd.startsWith("file:")) return cwd;
++  return decodeURIComponent(cwd.replace(/^file:\/\/\/?/, "")).replace(/\//g, "\\");
++}
++
++function readCorpus(path: string): Entry[] {
++  return readFileSync(path, "utf8")
++    .split(/\r?\n/)
++    .filter((line) => line.trim() !== "")
++    .map((line) => JSON.parse(line) as Record<string, unknown>)
++    .map((record) => ({
++      command: Array.isArray(record.command) ? String(record.command[record.command.length - 1]) : text(record, "command", "cmd"),
++      cwd: localPath(text(record, "cwd")),
++      label: text(record, "label", "cls2", "cls", "class") || "unlabelled",
++    }));
++}
++
++/** The command line as Codex sends it: a bare script gets the pwsh wrapper. */
++function wrapped(command: string, userHome: string): string {
++  if (unwrapCommand(command, userHome) !== null) return command;
++  return `"${PWSH}" -Command '${command.replace(/'/g, "''")}'`;
++}
++
++function maximalPermits(entries: readonly Entry[], home: string, userHome: string): Permits {
++  const writeDirs = readdirSync(join(home, "data"), { withFileTypes: true })
++    .filter((entry) => entry.isDirectory() && /^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(entry.name) && !entry.name.includes(".."))
++    .map((entry) => `data/${entry.name}`);
++  const readRepos = new Set<string>();
++  const pairs = new Set<string>();
++  const hosts = new Set<string>();
++  const envNames = new Set<string>();
++  const firsts = new Set<string>();
++  // Every worktree on the machine is a read repo: a reviewer's brief may name any of them.
++  const worktrees = join(userHome, ".paseo", "worktrees");
++  for (const group of safeList(worktrees)) for (const tree of safeList(join(worktrees, group))) readRepos.add(join(worktrees, group, tree));
++  for (const entry of entries) {
++    const script = unwrapCommand(wrapped(entry.command, userHome), userHome) ?? entry.command;
++    for (const found of script.matchAll(/-C\s+'([A-Za-z]:\\[^']+)'/g)) readRepos.add(found[1] ?? "");
++    for (const found of script.matchAll(/-C\s+([A-Za-z]:\\[^\s;']+)/g)) readRepos.add(found[1] ?? "");
++    for (const found of script.matchAll(/(?:repos\/|github\.com\/)([A-Za-z0-9-]+\/[A-Za-z0-9._-]+?)(?:\.git)?(?=[/\s'"?]|$)/g)) pairs.add(found[1] ?? "");
++    for (const found of script.matchAll(/https:\/\/([A-Za-z0-9.-]+)/g)) hosts.add((found[1] ?? "").toLowerCase());
++    for (const found of script.matchAll(/\$env:([A-Za-z_][A-Za-z0-9_]*)/g)) envNames.add(found[1] ?? "");
++    const parsed = parseScript(script);
++    if (!parsed.ok) continue;
++    for (const statement of parsed.statements) {
++      if (statement.kind !== "command" || statement.words[0] === undefined) continue;
++      // A pwsh -NoProfile -File <script> prefix names its script, as an fmpy entry does.
++      const pwshFile = /^pwsh(?:\.exe)?$/i.test(statement.words[0].value) && statement.words.length >= 4;
++      firsts.add(JSON.stringify((pwshFile ? statement.words.slice(0, 4) : statement.words.slice(0, 1)).map((word) => word.value)));
++    }
++  }
++  return {
++    version: 1,
++    task: "replay",
++    live: true,
++    writeDirs,
++    scratchDirs: [tmpdir()],
++    readRepos: [...readRepos].filter((repo) => !repo.includes("..")),
++    netRead: { githubRepos: [...pairs].filter((pair) => !pair.includes("..")), hosts: [...hosts].filter((host) => host.includes(".")) },
++    gitLocal: true,
++    exec: [...firsts].flatMap((prefix) => (["scratch", "worktree", "notes"] as const).map((place) => ({ in: place, prefix: JSON.parse(prefix) as string[] }))),
++    envNames: [...envNames],
++  };
++}
++
++function safeList(dir: string): string[] {
++  try {
++    return readdirSync(dir, { withFileTypes: true })
++      .filter((entry) => entry.isDirectory())
++      .map((entry) => entry.name);
++  } catch {
++    return [];
++  }
++}
++
++function realpath(path: string): string | null {
++  try {
++    return realpathSync.native(path);
++  } catch (error) {
++    const code = (error as NodeJS.ErrnoException).code;
++    if (code === "ENOENT" || code === "ENOTDIR") return null;
++    throw error;
++  }
++}
++
++describe.skipIf(CORPUS === "")("private replay of real permission requests", () => {
++  it("allows nothing in a forbidden class, and reports coverage by label", () => {
++    const home = process.env.PERMIT_REPLAY_HOME ?? dirname(dirname(dirname(dirname(CORPUS))));
++    const userHome = homedir();
++    const entries = readCorpus(CORPUS);
++    const permits = maximalPermits(entries, home, userHome);
++    const byLabel = new Map<string, { total: number; allowed: number; rules: Map<string, number> }>();
++    const wrong: string[] = [];
++    entries.forEach((entry, index) => {
++      let result: MatchResult;
++      try {
++        result = match(
++          { provider: "codex", name: "CodexBash", kind: "tool", input: { command: wrapped(entry.command, userHome), cwd: entry.cwd } },
++          permits,
++          { crew: true, task: "replay", mode: "shadow", home, userHome, worktree: entry.cwd, sticky: false, allowsLastHour: 0, realpath },
++        );
++      } catch (error) {
++        result = { verdict: "relay", rule: "error", tier: null, detail: String(error) };
++      }
++      const row = byLabel.get(entry.label) ?? { total: 0, allowed: 0, rules: new Map<string, number>() };
++      row.total += 1;
++      if (result.verdict === "allow") row.allowed += 1;
++      row.rules.set(result.rule, (row.rules.get(result.rule) ?? 0) + 1);
++      byLabel.set(entry.label, row);
++      if (process.env.PERMIT_REPLAY_DETAIL === "1" && result.verdict === "relay") console.log(`#${index} ${entry.label} ${result.rule}: ${result.detail}`);
++      if (result.verdict === "allow" && FORBIDDEN.test(entry.label)) wrong.push(`#${index} ${entry.label} allowed by ${result.rule}`);
++    });
++    const lines = ["| Label | Commands | Allowed | Share | Rules |", "| --- | --- | --- | --- | --- |"];
++    let total = 0;
++    let allowed = 0;
++    for (const [label, row] of [...byLabel].sort(([a], [b]) => a.localeCompare(b))) {
++      total += row.total;
++      allowed += row.allowed;
++      const rules = [...row.rules].sort(([, a], [, b]) => b - a).map(([rule, count]) => `${rule} ${count}`).join(", ");
++      lines.push(`| ${label} | ${row.total} | ${row.allowed} | ${Math.round((100 * row.allowed) / row.total)}% | ${rules} |`);
++    }
++    lines.push(`| all | ${total} | ${allowed} | ${total === 0 ? 0 : Math.round((100 * allowed) / total)}% | |`);
++    console.log(`\n${lines.join("\n")}\n\nForbidden classes allowed: ${wrong.length === 0 ? "none" : wrong.join("; ")}\n`);
++    expect(wrong).toEqual([]);
++  }, 300_000);
++});
+diff --git a/server/permit-rules.ts b/server/permit-rules.ts
+new file mode 100644
+index 0000000..f21dc5e
+--- /dev/null
++++ b/server/permit-rules.ts
+@@ -0,0 +1,418 @@
++/**
++ * The never-auto list: what the permission broker relays to a person whatever a task's permits say.
++ *
++ * Data, not logic. `permit-match.ts` checks every entry before any allow rule: the raw-text patterns
++ * against the command's script, the command names against each parsed statement, and the context
++ * entries (crew, permits, provider, stickiness, rate) against the request. Each entry carries the cases
++ * that prove it; `permit-match.test.ts` runs every case against a maximal permits file, so the entry is
++ * the only thing that can stop it. Adding an entry is a reviewed plugin change.
++ *
++ * Case scripts use placeholders the test fills in: `<worktree>` (the agent's worktree), `<home>` (the
++ * first mate's home), `<notes>` (the task's own `data/<task>` folder), `<scratch>` (its scratch folder),
++ * `<repo>` (a read-only repository the permits name) and `<user>` (the user's profile folder).
++ */
++
++export type NeverAutoId =
++  | "not-crew"
++  | "no-permits"
++  | "not-v1"
++  | "destructive"
++  | "outward"
++  | "credential"
++  | "outside"
++  | "project-repo"
++  | "non-get"
++  | "hardware"
++  | "system"
++  | "after-refusal"
++  | "unparsed"
++  | "rate";
++
++/** A change to the request or its context that a case makes. */
++export type NeverAutoContext =
++  | "no-crew-label"
++  | "no-task-label"
++  | "reserved-task"
++  | "unsafe-task"
++  | "no-permits-file"
++  | "invalid-permits"
++  | "other-task-permits"
++  | "live-false-in-live"
++  | "provider-claude"
++  | "file-change"
++  | "question"
++  | "sticky"
++  | "rate-limit"
++  | "rate-limit-far"
++  | "command-array";
++
++/** A case that must relay with the entry's id: a script, a change of context, or both. */
++export interface NeverAutoCase {
++  script?: string;
++  /** The working folder, when not the worktree. */
++  cwd?: string;
++  context?: NeverAutoContext;
++}
++
++export interface NeverAutoEntry {
++  id: NeverAutoId;
++  reason: string;
++  /** Matched case-insensitively against the script (the command line with its pwsh wrapper taken off). */
++  patterns: readonly RegExp[];
++  /** Command names (lowercase, as the statement's first word) that hit the entry. */
++  commands: readonly string[];
++  cases: readonly NeverAutoCase[];
++}
++
++/** A hit on one of these makes the agent sticky for the rest of its life (spec 3.7). */
++export const STICKY_IDS: ReadonlySet<NeverAutoId> = new Set(["destructive", "outward", "credential", "system"]);
++
++/** The most automatic allows for one agent in one hour; past it a human decides. */
++export const MAX_ALLOWS_PER_HOUR = 120;
++
++/** Task ids that name no task: folders of `data/` the broker owns or protects, and Windows device names. */
++export const RESERVED_TASKS: ReadonlySet<string> = new Set([
++  "permissions",
++  "tools",
++  "con",
++  "prn",
++  "aux",
++  "nul",
++  ...Array.from({ length: 9 }, (_, index) => `com${index + 1}`),
++  ...Array.from({ length: 9 }, (_, index) => `lpt${index + 1}`),
++]);
++
++/** Where a statement may stand: the start of the script or after a separator, a pipe, a call or an opening. */
++const AT = String.raw`(?:^|[;\n|&{(]|-Command\s+')\s*`;
++
++export const NEVER_AUTO: readonly NeverAutoEntry[] = [
++  {
++    id: "not-crew",
++    reason: "only crew have briefs",
++    patterns: [],
++    commands: [],
++    cases: [{ context: "no-crew-label" }, { context: "no-task-label" }, { context: "reserved-task" }, { context: "unsafe-task" }],
++  },
++  {
++    id: "no-permits",
++    reason: "default deny: no valid permits file for this task",
++    patterns: [],
++    commands: [],
++    cases: [
++      { context: "no-permits-file" },
++      { context: "invalid-permits" },
++      { context: "other-task-permits" },
++      { context: "live-false-in-live" },
++    ],
++  },
++  {
++    id: "not-v1",
++    reason: "nothing literal to check: not a Codex command approval",
++    patterns: [],
++    commands: [],
++    cases: [{ context: "provider-claude" }, { context: "file-change" }, { context: "question" }],
++  },
++  {
++    id: "destructive",
++    reason: "not reversible",
++    patterns: [
++      /\bRemove-Item\b/i,
++      /\bClear-Content\b/i,
++      /\bMove-Item\b/i,
++      /\bRename-Item\b/i,
++      /\bgit\s+(?:reset|clean|restore)\b/i,
++      /\bgit\s+checkout\s+--(?:\s|$)/i,
++      /\bgit\s+branch\s+-[dD]\b/i,
++      /\bgit\s+stash\s+(?:drop|clear)\b/i,
++      /\bgit\s+worktree\s+(?:remove|prune)\b/i,
++      /^\*\*\* Delete File/im,
++      /^\*\*\* Move to/im,
++      /\bdiskpart\b/i,
++      /\brmdir\b/i,
++      /\bformat(?:\.com)?\s+[a-z]:/i,
++      /(?:^|\s)--force(?:-with-lease)?(?:\s|=|$)/i,
++      new RegExp(`${AT}(?:rm|del|erase|rd|ri|mi|mv|move|ren|rni|clc|format)(?:\\s|$)`, "i"),
++    ],
++    commands: [
++      "remove-item",
++      "ri",
++      "rm",
++      "del",
++      "erase",
++      "rd",
++      "rmdir",
++      "clear-content",
++      "clc",
++      "clear-item",
++      "cli",
++      "move-item",
++      "mi",
++      "move",
++      "mv",
++      "rename-item",
++      "rni",
++      "ren",
++      "format",
++      "format.com",
++      "format-volume",
++      "diskpart",
++      "diskpart.exe",
++    ],
++    cases: [
++      { script: "Remove-Item -LiteralPath '<notes>\\old.md'" },
++      { script: "New-Item -ItemType Directory -Path '<notes>\\a'; rm '<notes>\\b'" },
++      { script: "git reset --hard HEAD~1" },
++      { script: "git clean -fdx" },
++      { script: "git branch -D topic" },
++      { script: "Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<notes>\\a.md' -Force" },
++      { script: "Move-Item -LiteralPath '<notes>\\a.md' -Destination '<notes>\\b.md'" },
++      { script: "git checkout -- README.md" },
++      { script: "git stash drop" },
++      { script: "git push --force origin topic" },
++    ],
++  },
++  {
++    id: "outward",
++    reason: "leaves the machine or acts for the captain",
++    patterns: [
++      /\bgit\s+(?:push|remote)\b/i,
++      /\bgh\s+(?:pr\s+(?:create|merge|edit|comment|review|close|reopen|ready)|issue|release|repo|gist|secret|workflow)\b/i,
++      /\bgh\s+api\b[^;\n|]*\s(?:-X|--method|-f|-F|--field|--raw-field|--input)(?:\s|=|$)/i,
++      /\bcurl(?:\.exe)?\b[^;\n|]*\s(?:-X|--request|-d|--data[\w-]*|-F|--form[\w-]*|-T|--upload-file|--json)(?:\s|=|$)/i,
++      /\b(?:Invoke-RestMethod|Invoke-WebRequest|irm|iwr)\b[^;\n|]*\s-(?:Method|Body|InFile|Form)\b/i,
++      /(?:^|\s)(?:-X|--request|--method|-Method)(?:\s+|=)['"]?(?:POST|PUT|PATCH|DELETE)\b/i,
++      /\bnpm(?:\.cmd)?\s+publish\b/i,
++      /\bSend-MailMessage\b/i,
++      new RegExp(`${AT}(?:&\\s*)?['"]?(?:[^'"\\s;|]*[\\\\/])?paseo(?:\\.cmd|\\.exe)?['"]?(?:\\s|$)`, "i"),
++      new RegExp(`${AT}(?:ssh|scp|sftp)(?:\\.exe)?(?:\\s|$)`, "i"),
++    ],
++    commands: ["ssh", "ssh.exe", "scp", "scp.exe", "sftp", "sftp.exe", "send-mailmessage", "paseo", "paseo.cmd", "paseo.exe"],
++    cases: [
++      { script: "git push origin topic" },
++      { script: "git remote add up https://github.com/octo/example.git" },
++      { script: "gh pr create --title x --body y" },
++      { script: "gh api repos/octo/example/issues -X POST -f title=x" },
++      { script: "curl.exe -fLsS https://registry.example.org/x -o '<scratch>\\x' -X POST" },
++      { script: "Invoke-RestMethod -Uri 'https://registry.example.org/x' -Method Post" },
++      { script: "paseo send someone hello" },
++      { script: "npm.cmd publish" },
++      { script: "ssh host.example.org" },
++    ],
++  },
++  {
++    id: "credential",
++    reason: "never near credentials",
++    patterns: [
++      /\b(?:tokens?|auth|login|credentials?|secrets?|passwords?|passwd|apikey|api_key|bearer|cookies?|keyring|cmdkey|local-credential|GH_TOKEN|GITHUB_TOKEN)\b/i,
++      /\bGet-StoredCredential\b/i,
++      /\.(?:env|npmrc|netrc|ssh)\b/i,
++      /\bid_(?:rsa|ed25519)/i,
++      /\bauth\.json\b/i,
++      /\bbitbucket-watch\.env\b/i,
++    ],
++    commands: ["cmdkey", "cmdkey.exe", "get-storedcredential"],
++    cases: [
++      { script: "gh auth status" },
++      { script: "Get-Content -LiteralPath '<user>\\.ssh\\id_ed25519'" },
++      { script: "Copy-Item -LiteralPath '<worktree>\\.env' -Destination '<notes>\\env.txt'" },
++      { script: "Get-Content -LiteralPath '<worktree>\\token.txt'" },
++      { script: "$env:GH_TOKEN='x'; gh api repos/octo/example" },
++      { script: "cmdkey /list" },
++    ],
++  },
++  {
++    id: "outside",
++    reason: "the brief's paths only",
++    patterns: [],
++    commands: [],
++    cases: [
++      { script: "New-Item -ItemType Directory -Path '<home>\\data\\other-task\\x'" },
++      { script: "New-Item -ItemType Directory -Path '<home>\\data\\tools\\x'" },
++      { script: "Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<home>\\data\\permissions\\permits\\x.json'" },
++      { script: "Copy-Item -LiteralPath 'C:\\Windows\\win.ini' -Destination '<notes>\\win.ini'" },
++      { script: "New-Item -ItemType Directory -Path '<notes>\\a'", cwd: "C:\\Users\\example\\Desktop" },
++      { script: "& 'C:\\Tools\\thing.exe' run" },
++      { script: "New-Item -ItemType Directory -Path '<user>\\.codex\\x'" },
++    ],
++  },
++  {
++    id: "project-repo",
++    reason: "other repos are read-only, and only when named",
++    patterns: [],
++    commands: [],
++    cases: [
++      { script: "git --no-optional-locks -C 'C:\\src\\other' log -1" },
++      { script: "git --no-optional-locks -C '<repo>' commit -m x" },
++      { script: "git add -- README.md", cwd: "<notes>" },
++      { script: "Copy-Item -LiteralPath '<worktree>\\a.md' -Destination '<repo>\\a.md'" },
++    ],
++  },
++  {
++    id: "non-get",
++    reason: "only the listed read-only network forms, to listed places",
++    patterns: [],
++    commands: [],
++    cases: [
++      { script: "gh api repos/octo/unlisted/pulls" },
++      { script: "curl.exe -fL https://unlisted.example.org/x -o '<scratch>\\x'" },
++      { script: "git fetch origin" },
++      { script: "Invoke-WebRequest -Uri 'https://registry.example.org/x'" },
++      { script: "gh pr view 5" },
++    ],
++  },
++  {
++    id: "hardware",
++    reason: "physical effects",
++    patterns: [
++      /\bSTM32_Programmer_CLI\b/i,
++      /\bJLink\w*/i,
++      /\bopenocd\b/i,
++      /\bnrfjprog\b/i,
++      /\busbipd\b/i,
++      /\bwsl(?:\.exe)?\b/i,
++      /\bCOM\d+\b/i,
++      /\bSerialPort\b/i,
++      /\bGet-PnpDevice\b/i,
++      /-c\s+port=/i,
++      /\bport=COM/i,
++    ],
++    commands: ["wsl", "wsl.exe", "usbipd", "usbipd.exe", "openocd", "openocd.exe", "nrfjprog", "nrfjprog.exe", "get-pnpdevice"],
++    cases: [
++      { script: "& '<scratch>\\STM32_Programmer_CLI.exe' -c port=SWD -w fw.bin" },
++      { script: "wsl.exe -d Ubuntu --exec make" },
++      { script: "Get-PnpDevice -Class Ports" },
++      { script: "uv run --offline --no-project python '<scratch>\\read.py' COM7" },
++      { script: "usbipd list" },
++    ],
++  },
++  {
++    id: "system",
++    reason: "escapes the grammar or the machine's setup",
++    patterns: [
++      /\bStart-Process\b/i,
++      /\bInvoke-Expression\b/i,
++      /(?:^|[^\w-])iex\b/i,
++      /\bcmd(?:\.exe)?\s+\/[ckr]\b/i,
++      /\bcmd\.exe\b/i,
++      /\b(?:powershell|pwsh)(?:\.exe)?\b[^;\n|]*\s-(?:c|command|e|ec|enc|encodedcommand)\b/i,
++      /-EncodedCommand\b/i,
++      /\bSet-ExecutionPolicy\b/i,
++      /-ExecutionPolicy\b/i,
++      /\breg(?:\.exe)?\s+(?:add|delete|import|load|restore|save|copy|export|query|unload)\b/i,
++      /\bschtasks\b/i,
++      /\bsc\.exe\b/i,
++      /\bStop-Process\b/i,
++      /\btaskkill\b/i,
++      /\bwinget\b/i,
++      /\bchoco\b/i,
++      /\bnpm(?:\.cmd)?\s[^;\n|]*\s(?:-g|--global)\b/i,
++      /\bpip3?(?:\.exe)?\s+install\b/i,
++      /\buv\s+(?:tool|pip)\b/i,
++      /\bAdd-Type\b/i,
++      /\bNew-Service\b/i,
++      /\brunas\b/i,
++      /-Verb\s+RunAs\b/i,
++      /\bSet-Item\b[^;\n|]*\bEnv:/i,
++      /\[System\./i,
++      /\bInvoke-Command\b/i,
++      /\bInvoke-Item\b/i,
++      /\bStart-Job\b/i,
++      /\bRegister-ScheduledTask\b/i,
++    ],
++    commands: [
++      "start-process",
++      "saps",
++      "start",
++      "invoke-expression",
++      "iex",
++      "cmd",
++      "cmd.exe",
++      "powershell",
++      "powershell.exe",
++      "set-executionpolicy",
++      "reg",
++      "reg.exe",
++      "schtasks",
++      "schtasks.exe",
++      "sc",
++      "sc.exe",
++      "stop-process",
++      "spps",
++      "kill",
++      "taskkill",
++      "taskkill.exe",
++      "winget",
++      "winget.exe",
++      "choco",
++      "choco.exe",
++      "pip",
++      "pip.exe",
++      "pip3",
++      "pip3.exe",
++      "add-type",
++      "new-service",
++      "runas",
++      "runas.exe",
++      "invoke-command",
++      "icm",
++      "invoke-item",
++      "ii",
++      "start-job",
++      "sajb",
++      "register-scheduledtask",
++      "set-item",
++      "si",
++    ],
++    cases: [
++      { script: "cmd /c dir" },
++      { script: "Start-Process notepad.exe" },
++      { script: "Invoke-Expression 'Get-Date'" },
++      { script: "pwsh -Command Get-Date" },
++      { script: "npm.cmd install left-pad@1.3.0 --no-save --package-lock=false --cache '<scratch>\\npm'", cwd: "<scratch>" },
++      { script: "$env:PATH='<scratch>'; node x.js", cwd: "<scratch>" },
++      { script: "uv pip install requests" },
++    ],
++  },
++  {
++    id: "after-refusal",
++    reason: "crew rule 12: after a refusal only a person may let the work go on",
++    patterns: [],
++    commands: [],
++    cases: [
++      { context: "sticky" },
++      { context: "sticky", script: "git --no-optional-locks status" },
++      { context: "sticky", script: "uv run --offline --no-project python '<scratch>\\probe.py'", cwd: "<scratch>" },
++    ],
++  },
++  {
++    id: "unparsed",
++    reason: "default deny: the command does not fit the statement grammar",
++    patterns: [],
++    commands: [],
++    cases: [
++      { script: "New-Item -ItemType Directory -Path \"<notes>\\$(Get-Date)\"" },
++      { script: "1..3 | ForEach-Object { New-Item -ItemType Directory -Path '<notes>\\x' }" },
++      { script: "Get-Content -LiteralPath '<notes>\\a.md' | Out-File '<notes>\\b.md'" },
++      { script: "git status `\n; Get-Date" },
++      { script: "Get-Content -LiteralPath '<notes>\\a.md' > '<notes>\\b.md'" },
++      { context: "command-array" },
++    ],
++  },
++  {
++    id: "rate",
++    reason: "a runaway loop is a human's call",
++    patterns: [],
++    commands: [],
++    cases: [
++      { context: "rate-limit" },
++      { context: "rate-limit-far" },
++      { context: "rate-limit", script: "gh api repos/octo/example/pulls --paginate" },
++    ],
++  },
++];
++
++export function neverAuto(id: NeverAutoId): NeverAutoEntry {
++  const entry = NEVER_AUTO.find((candidate) => candidate.id === id);
++  if (entry === undefined) throw new Error(`no never-auto entry ${id}`);
++  return entry;
++}
+diff --git a/shared/fleet.ts b/shared/fleet.ts
+index cd292d2..c2b3aa5 100644
+--- a/shared/fleet.ts
++++ b/shared/fleet.ts
+@@ -222,6 +222,10 @@ export type Fleet = z.infer<typeof FleetSchema>;
+ // The daemon's own file: what handlers act on
+ // ---------------------------------------------------------------------------
+ 
++export const PERMISSION_BROKER_MODES = ["off", "shadow", "live"] as const;
++export const PermissionBrokerModeSchema = z.enum(PERMISSION_BROKER_MODES);
++export type PermissionBrokerMode = z.infer<typeof PermissionBrokerModeSchema>;
++
+ export const FirstmateConfigSchema = z.object({
+   /** The first mate's home; empty means `$PASEO_HOME/plugin-data/firstmate/home`. */
+   home: z.string().default(""),
+@@ -235,6 +239,12 @@ export const FirstmateConfigSchema = z.object({
+   crewModeId: z.string().default(""),
+   /** Watch scripts the captain has switched off on the board, by file name. */
+   disabledWatches: z.array(z.string()).default([]),
++  /**
++   * What the permission broker does with crew permission requests (server/permission-broker.ts): `off`
++   * registers nothing; `shadow` logs the answer it would give and the one people gave. In this build
++   * `live` answers nothing either; it logs as shadow does, as live mode would judge.
++   */
++  permissionBroker: PermissionBrokerModeSchema.default("off"),
+ });
+ export type FirstmateConfig = z.infer<typeof FirstmateConfigSchema>;
+ 

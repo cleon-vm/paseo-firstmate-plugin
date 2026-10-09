@@ -11,7 +11,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 # Overlays applied after this one, in order.
-later="reveal-in-explorer chat-input-lag steer-box-click status-line-reads steer-notify"
+later="reveal-in-explorer chat-input-lag steer-box-click status-line-reads steer-notify permission-broker"
 scratch=$(mktemp -d)
 cp -R "$here/original/." "$scratch/"
 cd "$scratch"

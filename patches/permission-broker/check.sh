@@ -1,25 +1,25 @@
 #!/bin/sh
-# Applies steer-notify.patch to a scratch copy of original/ with the documented
+# Applies permission-broker.patch to a scratch copy of original/ with the documented
 # command and checks the result is byte-identical to modified/. original/ is
-# 0.3.4 with the first eight overlays.
+# 0.3.4 with the nine earlier overlays.
 # Then checks each file in modified/: where a later overlay edits it, against
 # that overlay's original/ (its base); otherwise against the repository root
 # (line endings ignored there, since a Windows checkout may have CRLF).
 # Scratch is retained for inspection. Run from anywhere:
-# sh patches/steer-notify/check.sh. Exits non-zero on failure.
+# sh patches/permission-broker/check.sh. Exits non-zero on failure.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 # Overlays applied after this one, in order.
-later="permission-broker"
+later=""
 scratch=$(mktemp -d)
 cp -R "$here/original/." "$scratch/"
 cd "$scratch"
 # TMPDIR can be inside a checkout. Stop parent repository discovery so apply
 # treats scratch as standalone, rather than silently skipping every patch path.
 ceiling=$(dirname "$scratch")
-GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply --check "$here/steer-notify.patch"
-GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply "$here/steer-notify.patch"
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply --check "$here/permission-broker.patch"
+GIT_CEILING_DIRECTORIES="$ceiling" git -c core.autocrlf=false apply "$here/permission-broker.patch"
 status=0
 cr=$(printf '\r')
 for file in $(cd "$here/modified" && find . -type f | sort); do
