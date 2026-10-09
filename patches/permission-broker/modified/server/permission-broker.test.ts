@@ -1,5 +1,5 @@
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -367,6 +367,121 @@ describe("live answers", () => {
 // ---------------------------------------------------------------------------
 // 5. Sticky
 // ---------------------------------------------------------------------------
+
+describe("round 1 review regressions", () => {
+  it.each(["missing", "live:false", "invalid", "other-task"])("keeps destructive stickiness under %s permits through reload", async (initial) => {
+    const s = await setup("live");
+    if (initial === "live:false") await writePermits(s.m);
+    if (initial === "invalid") await writePermits(s.m, { version: 99 });
+    if (initial === "other-task") await writePermits(s.m, { task: "demo-02-other" });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, "Remove-Item x", { requestId: "destructive" }), s.paseo);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "never:no-permits", answered: false });
+    await writePermits(s.m, { live: true });
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 1000 });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "later" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "never:after-refusal", answered: false });
+    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]?.reason).toBe("never:destructive");
+  });
+
+  it.each([
+    ["outward", "git push origin topic"],
+    ["credential", "Get-Content .env"],
+    ["system", "Set-ExecutionPolicy Unrestricted"],
+  ])("keeps %s stickiness even without live permits", async (reason, script) => {
+    const s = await setup("live");
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script), s.paseo);
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "later" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]?.reason).toBe(`never:${reason}`);
+  });
+
+  it.each(["deny", "blocked"])("rechecks stickiness when %s lands during matching", async (trigger) => {
+    let s: Setup;
+    let refusal: Promise<void> | undefined;
+    s = await setup("live", { realpath: (path) => {
+      if (refusal === undefined && path.endsWith("review-scratch-1")) {
+        refusal = trigger === "deny"
+          ? s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "other", resolution: { behavior: "deny" } }, s.paseo)
+          : s.server.emit("agent.turn_ended", { agent: agent(s.m), turnId: "t1", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "blocked: database unavailable" }] }, s.paseo);
+      }
+      try { return realpathSync.native(path); } catch { return null; }
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(refusal).toBeDefined();
+    await refusal;
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).find((line) => line.event === "request")).toMatchObject({ rule: "never:after-refusal", answered: false });
+  });
+
+  it("rejects changed permits bytes even when both versions allow the request", async () => {
+    let s: Setup;
+    let changed: Promise<void> | undefined;
+    s = await setup("live", { realpath: (path) => {
+      if (changed === undefined && path.endsWith("review-scratch-1")) {
+        changed = writePermits(s.m, { live: true, netRead: { githubRepos: ["octo/another"], hosts: [] } });
+      }
+      try { return realpathSync.native(path); } catch { return null; }
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(changed).toBeDefined();
+    await changed;
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "changed", answered: false });
+    // The replacement permits are valid and still authorize this command for another agent.
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2", requestId: "fresh" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["fresh"]);
+  });
+
+  it("reserves the final attempt before compacting, retaining failures across reload", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: {}, attempts: { "crew-1": Array.from({ length: 4095 }, (_, index) => `old-${index}`) } }));
+    s.daemon.answerError = new Error("daemon unavailable");
+    s.daemon.answerStarted.mockImplementation(() => {
+      // Even the final permitted call has its no-retry marker durably saved before sending.
+      expect(JSON.parse(readFileSync(s.m.stateFile, "utf8")).attempts["crew-1"]).toBeNull();
+    });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "last" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["last"]);
+    expect((await s.lines()).at(-1)).toMatchObject({ answered: false, answerError: "Error" });
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toBeNull();
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 1000 });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "last" }), s.paseo);
+    expect(s.daemon.answers).toHaveLength(1);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "attempt-cap", answered: false });
+  });
+
+  it("compacts a full attempt ledger and never retries an old ID after reload", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    const ids = Array.from({ length: 4096 }, (_, index) => `old-${index}`);
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: {}, attempts: { "crew-1": ids } }));
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "overflow" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "attempt-cap", answered: false });
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toBeNull();
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 31 * 24 * 60 * 60 * 1000 });
+    await reloaded.ready;
+    for (const requestId of ["old-0", "new-id"]) {
+      await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId }), s.paseo);
+    }
+    expect(s.daemon.answers).toEqual([]);
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toBeNull();
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2", requestId: "other-agent" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["other-agent"]);
+  });
+});
 
 describe("after a refusal", () => {
   async function stickyAfter(trigger: (s: Setup) => Promise<void>, mode: FirstmateConfig["permissionBroker"] = "shadow") {

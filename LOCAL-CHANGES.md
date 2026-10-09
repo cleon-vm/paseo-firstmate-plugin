@@ -91,7 +91,9 @@ the root, because this overlay changes that file.
 
 Its state (sticky crewmates, the last hour's allows, and requests reserved for a live answer) is kept in
 `plugin-data/firstmate/permission-broker.json`; its log is in the home's
-`data/permissions/`. It adds no package dependency of its own; the Paseo requirement is
+`data/permissions/`. Never-auto triggers stay sticky even before permits become live. Attempt history
+compacts after 4096 reservations per agent; later requests from that agent relay permanently, so
+history stays bounded without allowing old failed calls to retry. It adds no package dependency of its own; the Paseo requirement is
 upstream's `>=0.11.0`.
 
 ## Where the plugin lives

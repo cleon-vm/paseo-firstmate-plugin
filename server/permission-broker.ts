@@ -37,7 +37,7 @@ import { isCrew, paseoRelayHost } from "./crew-relay";
 import { parseCrewReport } from "./crew-report";
 import { pluginDir } from "./data-dir";
 import type { PaseoApi } from "./host-types";
-import { match, neverId, parseNeverAutoExtra, taskIdOk, type MatchResult } from "./permit-match";
+import { match, neverId, parseNeverAutoExtra, taskIdOk, type MatchContext, type MatchResult } from "./permit-match";
 import { neverAuto, STICKY_IDS } from "./permit-rules";
 import { closingText } from "./report-cache";
 import { serialized } from "./serialize";
@@ -51,6 +51,7 @@ const MAX_AGENTS = 2000;
 const HOUR_MS = 60 * 60 * 1000;
 const ANSWER_TIMEOUT_MS = 10_000;
 const RESOLUTION_WINDOW_MS = 30_000;
+const MAX_ATTEMPTS_PER_AGENT = 4096;
 const STUCK_TURN_STATES: ReadonlySet<string> = new Set(["blocked", "needs-decision", "failed"]);
 
 export interface BrokerState {
@@ -58,8 +59,8 @@ export interface BrokerState {
   sticky: Record<string, { at: string; reason: string }>;
   /** When each crewmate's requests were judged `allow` in the last hour (ISO). */
   allows: Record<string, string[]>;
-  /** Live calls reserved before sending, including failures; never retried after reload. */
-  attempts?: Record<string, string[]>;
+  /** Live calls reserved before sending. Null is an exhausted ledger: relay for the agent's life. */
+  attempts?: Record<string, string[] | null>;
 }
 
 export function emptyBrokerState(): BrokerState {
@@ -217,37 +218,53 @@ export class PermissionBroker {
       paths.set(path, real);
       return real;
     };
+    const context: MatchContext = {
+      crew: true,
+      task: facts.task,
+      mode,
+      home,
+      userHome: this.userHome,
+      worktree: event.agent.cwd,
+      sticky: state.sticky[agentId] !== undefined,
+      allowsLastHour: recent.length,
+      realpath: mode === "live" ? recordPath : this.realpath,
+      extraHardware,
+    };
     let result: MatchResult;
     try {
-      result = match(event.request, permits.raw, {
-        crew: true,
-        task: facts.task,
-        mode,
-        home,
-        userHome: this.userHome,
-        worktree: event.agent.cwd,
-        sticky: state.sticky[agentId] !== undefined,
-        allowsLastHour: recent.length,
-        realpath: mode === "live" ? recordPath : this.realpath,
-        extraHardware,
-      });
+      result = match(event.request, permits.raw, context);
     } catch (error) {
       result = { verdict: "relay", rule: "error", tier: null, detail: error instanceof Error ? error.message : String(error) };
     }
 
     const at = new Date(now).toISOString();
-    if (mode === "live" && state.attempts?.[agentId]?.includes(event.request.id)) {
+    // Permits stay the first verdict gate in live. Never-auto observations still make a crew
+    // member sticky even while permits are missing or not live; shadow can never send an answer.
+    let stickyId = neverId(result);
+    if (mode === "live" && result.rule === "never:no-permits") {
+      try {
+        stickyId = neverId(match(event.request, permits.raw, { ...context, mode: "shadow" }));
+      } catch {
+        // The live verdict already relays; an incomplete observation cannot authorize anything.
+      }
+    }
+    if (stickyId !== null && STICKY_IDS.has(stickyId) && state.sticky[agentId] === undefined) {
+      state.sticky[agentId] = { at, reason: `never:${stickyId}` };
+    }
+    const attempts = state.attempts?.[agentId];
+    if (mode === "live" && attempts?.includes(event.request.id)) {
       result = { verdict: "relay", rule: "already-attempted", tier: null, detail: "a live answer was already attempted for this request" };
+    }
+    if (mode === "live" && (attempts === null || (attempts?.length ?? 0) >= MAX_ATTEMPTS_PER_AGENT)) {
+      state.attempts![agentId] = null;
+      result = { verdict: "relay", rule: "attempt-cap", tier: null, detail: "the agent's live attempt ledger is exhausted; relay for its remaining life" };
     }
     if (result.verdict === "allow") state.allows[agentId] = [...recent, at];
     else if (recent.length !== (state.allows[agentId] ?? []).length) state.allows[agentId] = recent;
-    const id = neverId(result);
-    if (id !== null && STICKY_IDS.has(id) && state.sticky[agentId] === undefined) {
-      state.sticky[agentId] = { at, reason: result.rule };
-    }
     if (mode === "live" && result.verdict === "allow") {
       state.attempts ??= {};
       state.attempts[agentId] = [...(state.attempts[agentId] ?? []), event.request.id];
+      if (state.attempts[agentId]!.length >= MAX_ATTEMPTS_PER_AGENT) state.attempts[agentId] = null;
     }
     const saved = await this.persist(now);
     if (!saved && mode === "live" && result.verdict === "allow") {
@@ -458,7 +475,11 @@ export async function readBrokerState(path: string): Promise<BrokerState> {
   if (typeof object.attempts === "object" && object.attempts !== null) {
     state.attempts = {};
     for (const [agentId, ids] of Object.entries(object.attempts)) {
-      if (Array.isArray(ids)) state.attempts[agentId] = ids.filter((id): id is string => typeof id === "string");
+      if (ids === null) state.attempts[agentId] = null;
+      else if (Array.isArray(ids)) {
+        const kept = ids.filter((id): id is string => typeof id === "string");
+        state.attempts[agentId] = kept.length >= MAX_ATTEMPTS_PER_AGENT ? null : kept;
+      }
     }
   }
   return state;

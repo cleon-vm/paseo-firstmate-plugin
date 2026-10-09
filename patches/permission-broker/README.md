@@ -37,7 +37,8 @@ matching request once with `allow`. It never denies a request or sends a message
   checks and sending allow. Paseo cannot lock paths through the command's eventual execution; a path
   replacement after the SDK call remains a limitation of this API.
   Live relays `git commit` because crew-controlled hooks can execute arbitrary code, and inline interpreter
-  switches such as `-c`, `-e`, bundled short forms and `--eval`; shadow still logs them. Named script/test
+  switches such as `-c`, `-e`, `-p`, attached code and bundled short forms, `--eval`, and `deno eval`
+  (including through a launcher or with global options); shadow still logs them. Named script/test
   exec prefixes and pinned package installs remain opt-in tier 2. Read-only git remains confined to
   literal `readRepos`. D2(a) and D3(a) were accepted; neither rule kind is disabled wholesale.
 - **The never-auto list** (`server/permit-rules.ts`) is data: each entry has an id, a reason, its
@@ -56,7 +57,9 @@ matching request once with `allow`. It never denies a request or sends a message
 - **After a refusal.** A crewmate becomes sticky for the rest of its life when a person denies one of its
   requests, when a turn of it ends on a `blocked:`, `needs-decision:` or `failed:` line, or when a request
   of it hits `destructive`, `outward`, `credential` or `system`. Its later requests relay as
-  `never:after-refusal`. A sticky mark is never pruned by age. Sticky marks and the last hour's allow times (for the 120-an-hour `rate` cap) are
+  `never:after-refusal`. Never-auto triggers are recorded even with missing, invalid or non-live permits;
+  the live verdict still checks permits first and relays as `never:no-permits`. A sticky mark is never
+  pruned by age. Sticky marks and the last hour's allow times (for the 120-an-hour `rate` cap) are
   kept in `plugin-data/firstmate/permission-broker.json`, so a reload forgets neither.
 - **The log.** One JSON line per request and per resolution in `data/permissions/log-YYYY-MM.jsonl` in the
   home, appended, never edited. Commands, working folders and details are redacted (credential words with
@@ -71,6 +74,11 @@ matching request once with `allow`. It never denies a request or sends a message
   has no per-call timeout/cancellation; the broker stops waiting after ten seconds and logs `TimeoutError`.
   That does not cancel an SDK call already sent, which may complete later. The rate cap reserves at most
   120 allows per agent/hour even for concurrent hooks, and sticky checks are repeated before answering.
+  Attempt history retains at most 4095 request IDs per agent. Reserving the 4096th compacts it into a
+  durable exhausted marker (`attempts[agentId]: null`); that final call may proceed, and every later
+  request from that agent relays as `attempt-cap`, including after reload. Older full ledgers compact
+  on load. This bounds per-agent history while preserving never-retry for failures for the agent's
+  entire life. Expiring old IDs by time would permit retries; other agents keep their own budgets.
 - **Guarded.** Every hook catches its own errors and writes them to stderr: a failure costs that event's
   log line and nothing else.
 

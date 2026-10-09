@@ -1228,7 +1228,9 @@ function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "comman
   const words = statement.words;
   // A prefix naming an interpreter flag does not name the program it will run. Keep these visible in
   // shadow, but require a person for inline code (including bundled short flags) in live mode.
-  if (rc.mode === "live" && words.some((word) => /^-[bBdiIOqsSuUvVxXp]*[ce][bBdiIOqsSuUvVxXp]*$|^--(?:eval|print|command)(?:=|$)/.test(word.value))) {
+  if (rc.mode === "live" && (words.some((word) => /^-[bBdiIOqsSuUvVxX]*[cep]|^--(?:eval|print|command)(?:=|$)/.test(word.value))
+    || words.some((word, index) => programOf([word]).native === "deno"
+      && words.slice(index + 1).some((argument) => argument.value === "eval")))) {
     return noRule("inline interpreter code requires a person in live mode");
   }
   const roots = rc.roots;

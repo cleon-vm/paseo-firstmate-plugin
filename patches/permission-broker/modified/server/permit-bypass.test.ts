@@ -130,6 +130,19 @@ function judge(attempt: Attempt, mode: MatchContext["mode"] = "shadow") {
 }
 
 describe("live execution follow-ups", () => {
+  it.each([
+    ["python '-cprint(1)'", ["python"]],
+    ["python '-Bcprint(1)'", ["python"]],
+    ["node -p '1+1'", ["node"]],
+    ["deno eval 'console.log(1)'", ["deno"]],
+    ["deno --quiet eval 'console.log(1)'", ["deno"]],
+    ["uv run deno eval 'console.log(1)'", ["uv", "run"]],
+  ] as Array<[string, string[]]>)("relays inline code form %s in live", (script, prefix) => {
+    const attempt = { name: "inline code", script, prefix };
+    expect(judge(attempt, "live").verdict).toBe("relay");
+    expect(judge(attempt, "shadow").verdict).toBe("allow");
+  });
+
   it("checks task and live permits before never-auto and rules", () => {
     const request = { provider: "codex", name: "CodexBash", kind: "tool", input: { command: '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command \'git push\'', cwd: WORKTREE } };
     const permits = permitsFor({ name: "order", script: "git push" });
