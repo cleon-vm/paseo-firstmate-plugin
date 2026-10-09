@@ -105,19 +105,19 @@ export function parsePermits(raw: unknown): Permits | null {
 
 /**
  * The private never-auto supplement (`data/permissions/never-auto-extra.json` in the home, spec amendment
- * 2026-10-09): hardware command names kept out of this public repository. Its basenames lowercase and
- * without `.exe`, or null when the file is not a valid version 1 supplement.
+ * 2026-10-09): hardware command names kept out of this public repository. Its names as `nativeName` gives
+ * them (lowercase, no executable suffix), or null when the file is not a valid version 1 supplement.
  */
 export function parseNeverAutoExtra(raw: unknown): string[] | null {
   if (typeof raw !== "object" || raw === null || (raw as { version?: unknown }).version !== 1) return null;
   const names = (raw as { neverAuto?: { hardware?: { commandBasenames?: unknown } } }).neverAuto?.hardware?.commandBasenames;
   if (!Array.isArray(names) || !names.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))) return null;
-  return names.map((name: string) => baseName(name));
+  return names.map((name: string) => nativeName(name));
 }
 
-/** A command word's basename as the supplement compares it: last path part, lowercase, without `.exe`. */
-function baseName(word: string): string {
-  return (word.replace(/\//g, "\\").split("\\").pop() ?? word).toLowerCase().replace(/\.exe$/, "");
+/** A word's native name: last path part, lowercase, without a Windows executable suffix (.exe, .com, .bat, .cmd). */
+function nativeName(word: string): string {
+  return (word.replace(/\//g, "\\").split("\\").pop() ?? word).toLowerCase().replace(/\.(?:exe|com|bat|cmd)$/, "");
 }
 
 // ---------------------------------------------------------------------------
@@ -677,11 +677,16 @@ const COMMANDS = {
 };
 
 /** The program a command runs, lowercase: a bare name, or the last part of a path. */
-function programOf(words: readonly Word[]): { name: string; base: string; path: boolean } {
+/**
+ * The program a command runs, lowercase: `name` as written, `base` its last path part, and `native` that
+ * part without a Windows executable suffix (.exe, .com, .bat, .cmd). Every check of which tool runs reads
+ * `native`, so no suffix variant of git, gh, curl or npm reaches exec without its own policy.
+ */
+function programOf(words: readonly Word[]): { name: string; base: string; native: string; path: boolean } {
   const value = (words[0]?.value ?? "").toLowerCase();
   const path = /[\\/]|^[a-z]:/.test(value);
   const base = value.replace(/\//g, "\\").split("\\").pop() ?? value;
-  return { name: value, base, path };
+  return { name: value, base, native: nativeName(base), path };
 }
 
 /** A git command's global options and its subcommand. */
@@ -717,8 +722,8 @@ function parseGit(words: readonly Word[]): GitCommand | null {
 const NPM_INSTALL = new Set(["install", "i", "ci", "add", "isntall", "in"]);
 const DANGEROUS_ENV = /^(?:path|pathext|comspec|psmodulepath|node_options|git_.*|npm_config_.*)$/i;
 
-function isNpm(base: string): boolean {
-  return base === "npm" || base === "npm.cmd" || base === "npm.exe";
+function isNpm(native: string): boolean {
+  return native === "npm";
 }
 
 function statementHit(statement: Statement, extraHardware: readonly string[] | null): Hit | null {
@@ -734,14 +739,14 @@ function statementHit(statement: Statement, extraHardware: readonly string[] | n
   const program = programOf(words);
   const values = words.map((word) => word.value.toLowerCase());
   const lower = (index: number) => values[index] ?? "";
-  // A native program by path or with .exe is the same program: rm.exe is rm.
-  const native = program.base.replace(/\.(?:exe|com)$/, "");
+  // A native program by path or with an executable suffix is the same program: rm.exe is rm.
+  const native = program.native;
   for (const [id, names] of Object.entries(COMMANDS) as Array<[keyof typeof COMMANDS, ReadonlySet<string>]>) {
     if (names.has(program.name) || names.has(program.base) || names.has(native)) return { id, detail: `runs ${program.base}` };
   }
   // The private supplement's hardware names, as any word: bare, with .exe, by path, or run through another program.
   if (extraHardware !== null) {
-    const listed = words.flatMap((word) => word.parts).find((part) => extraHardware.includes(baseName(part)));
+    const listed = words.flatMap((word) => word.parts).find((part) => extraHardware.includes(nativeName(part)));
     if (listed !== undefined) return { id: "hardware", detail: "a hardware tool the never-auto supplement names" };
   }
   // destructive
@@ -753,7 +758,7 @@ function statementHit(statement: Statement, extraHardware: readonly string[] | n
   if (values.some((value) => value === "--force" || value === "--force-with-lease" || value.startsWith("--force"))) {
     return { id: "destructive", detail: `--force on ${program.base}` };
   }
-  if (program.base === "git" || program.base === "git.exe") {
+  if (program.native === "git") {
     const git = parseGit(words);
     if (git === null) return null;
     const args = git.args.map((word) => word.value);
@@ -766,7 +771,7 @@ function statementHit(statement: Statement, extraHardware: readonly string[] | n
     if (destructive) return { id: "destructive", detail: `git ${git.sub}` };
     if (["push", "remote", "send-email"].includes(git.sub)) return { id: "outward", detail: `git ${git.sub}` };
   }
-  if (program.base === "gh" || program.base === "gh.exe") {
+  if (program.native === "gh") {
     const sub = lower(1);
     if (sub === "api") {
       // -X and -f/-F take their value attached too (-XPOST, -ftitle=x).
@@ -776,7 +781,7 @@ function statementHit(statement: Statement, extraHardware: readonly string[] | n
       return { id: "outward", detail: `gh ${sub}` };
     }
   }
-  if (program.base === "curl" || program.base === "curl.exe") {
+  if (program.native === "curl") {
     const writes = words
       .slice(1)
       // Short options bundle and take their value attached: -dvalue, -XPOST, -fLd value.
@@ -786,19 +791,19 @@ function statementHit(statement: Statement, extraHardware: readonly string[] | n
   if (["invoke-restmethod", "irm", "invoke-webrequest", "iwr"].includes(program.name)) {
     if (values.some((value) => /^-(?:method|body|infile|form)$/.test(value))) return { id: "outward", detail: `${program.name} with a method or body` };
   }
-  if (isNpm(program.base)) {
+  if (isNpm(program.native)) {
     if (lower(1) === "publish") return { id: "outward", detail: "npm publish" };
     if (values.includes("-g") || values.includes("--global")) return { id: "system", detail: "a global npm command" };
     if (NPM_INSTALL.has(lower(1)) && !values.includes("--ignore-scripts")) return { id: "system", detail: "npm install without --ignore-scripts" };
   }
   // system
-  if (program.base === "pwsh" || program.base === "pwsh.exe") {
+  if (program.native === "pwsh") {
     if (!(lower(1) === "-noprofile" && lower(2) === "-file" && words.length >= 4)) return { id: "system", detail: "a nested pwsh" };
   }
-  if (program.base === "uv" || program.base === "uv.exe") {
+  if (program.native === "uv") {
     if (lower(1) === "tool" || lower(1) === "pip") return { id: "system", detail: `uv ${lower(1)}` };
   }
-  if (/^python(?:3)?(?:\.exe)?$/.test(program.base) && values.some((value, index) => value === "-m" && lower(index + 1) === "pip")) {
+  if (/^python3?$/.test(program.native) && values.some((value, index) => value === "-m" && lower(index + 1) === "pip")) {
     return { id: "system", detail: "python -m pip" };
   }
   return null;
@@ -999,26 +1004,15 @@ function hostOf(url: string, permits: Permits): string | null {
   return permits.netRead.hosts.some((listed) => listed.toLowerCase() === host) ? host : null;
 }
 
-const NETWORK = new Set([
-  "curl",
-  "curl.exe",
-  "wget",
-  "wget.exe",
-  "invoke-restmethod",
-  "irm",
-  "invoke-webrequest",
-  "iwr",
-  "start-bitstransfer",
-  "gh",
-  "gh.exe",
-]);
+/** Network programs by native name; only net-read may allow them. */
+const NETWORK = new Set(["curl", "wget", "invoke-restmethod", "irm", "invoke-webrequest", "iwr", "start-bitstransfer", "gh"]);
 
 function netRead(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
   const words = statement.words;
   const values = words.map((word) => word.value);
   const program = programOf(words);
   const permits = rc.permits;
-  if (program.base === "gh" || program.base === "gh.exe") {
+  if (program.native === "gh") {
     if (values[1] === "api") {
       let path: string | null = null;
       for (let index = 2; index < values.length; index += 1) {
@@ -1316,20 +1310,20 @@ function ruleFor(rc: RuleContext, statement: Statement): StatementResult {
     if (!inRoots) return refuse("outside", `runs ${program.name}, outside the permitted folders`);
     // A git, gh, curl or npm install from the roots answers to its own policy first, then runs as exec.
     const own =
-      program.base === "git" || program.base === "git.exe"
+      program.native === "git"
         ? gitRule(rc, statement)
-        : NETWORK.has(program.base)
+        : NETWORK.has(program.native)
           ? netRead(rc, statement)
-          : isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())
+          : isNpm(program.native) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())
             ? packageRule(rc, statement)
             : null;
     if (own !== null && !own.ok) return own;
     return execRule(rc, statement);
   }
-  if (program.base === "git" || program.base === "git.exe") return gitRule(rc, statement);
-  if (NETWORK.has(program.name)) return netRead(rc, statement);
-  if (isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())) return packageRule(rc, statement);
-  if (program.base === "pwsh" || program.base === "pwsh.exe") {
+  if (program.native === "git") return gitRule(rc, statement);
+  if (NETWORK.has(program.native)) return netRead(rc, statement);
+  if (isNpm(program.native) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())) return packageRule(rc, statement);
+  if (program.native === "pwsh") {
     const tool = words[3];
     if (tool !== undefined) {
       const home = homeTool(rc, tool, words.slice(4));

@@ -200,7 +200,8 @@ describe("shadow never answers", () => {
       expect(lines.every((line) => line.event !== "request" || line.answered === false)).toBe(true);
       expect(lines.some((line) => line.verdict === "allow")).toBe(true);
     }
-  });
+    // Every fixture through real file I/O, twice: about 4 s alone, more beside the rest of the suite.
+  }, 30_000);
 
   it("has no code path to an answer: no module of the broker names respondToPermission", async () => {
     for (const file of ["permission-broker.ts", "permit-match.ts", "permit-rules.ts"]) {

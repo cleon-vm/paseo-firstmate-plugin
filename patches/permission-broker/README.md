@@ -36,11 +36,11 @@ SDK's permission answer or sends anything to an agent, in any mode.
   patterns and command names, and the cases that prove it. It is checked before any rule, against the
   script and against each statement: `not-crew`, `no-permits`, `not-v1`, `destructive`, `outward`,
   `credential`, `outside`, `project-repo`, `non-get`, `hardware`, `system`, `after-refusal`, `unparsed`,
-  `rate`. A native program is recognized with `.exe` or by path too (`rm.exe` is `rm`).
+  `rate`. A program is recognized by one native name, its last path part case-folded without a Windows executable suffix (`.exe`, `.com`, `.bat`, `.cmd`): `rm.exe` is `rm`, and `git.com` run by path still answers to the git rule.
 - **The private supplement** (spec amendment of 2026-10-09). Hardware tool names that may not appear in a
   public repository live in `data/permissions/never-auto-extra.json` in the home:
   `{ "version": 1, "neverAuto": { "hardware": { "commandBasenames": [...] } } }`. It is read on every
-  request. A listed name, compared case-folded with and without `.exe`, bare, by path or as any word of a
+  request. A listed name, compared by the same native name (case-folded, with or without an executable suffix), bare, by path or as any word of a
   statement (so also inside an `exec` prefix), relays as `never:hardware` whatever the permits say. If the
   file is missing, unreadable or invalid, every `exec` statement relays (`never:hardware`); the other rules
   are unaffected. Its names are never logged. The tests use a synthetic one,

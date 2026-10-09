@@ -58,10 +58,10 @@ index 9899407..92f72c9 100644
      console.error(`[firstmate] ${configPath()} is invalid, using defaults: ${parsed.error.message}`);
 diff --git a/server/permission-broker.test.ts b/server/permission-broker.test.ts
 new file mode 100644
-index 0000000..ca2b37d
+index 0000000..4a236d9
 --- /dev/null
 +++ b/server/permission-broker.test.ts
-@@ -0,0 +1,520 @@
+@@ -0,0 +1,521 @@
 +import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 +import { realpathSync } from "node:fs";
 +import { tmpdir } from "node:os";
@@ -264,7 +264,8 @@ index 0000000..ca2b37d
 +      expect(lines.every((line) => line.event !== "request" || line.answered === false)).toBe(true);
 +      expect(lines.some((line) => line.verdict === "allow")).toBe(true);
 +    }
-+  });
++    // Every fixture through real file I/O, twice: about 4 s alone, more beside the rest of the suite.
++  }, 30_000);
 +
 +  it("has no code path to an answer: no module of the broker names respondToPermission", async () => {
 +    for (const file of ["permission-broker.ts", "permit-match.ts", "permit-rules.ts"]) {
@@ -1057,10 +1058,10 @@ index 0000000..c31ad47
 +}
 diff --git a/server/permit-bypass.test.ts b/server/permit-bypass.test.ts
 new file mode 100644
-index 0000000..ef3b12e
+index 0000000..97ea338
 --- /dev/null
 +++ b/server/permit-bypass.test.ts
-@@ -0,0 +1,264 @@
+@@ -0,0 +1,283 @@
 +/**
 + * The review's bypass hunt (round 1), kept as regression tests: 47 commands that a maximal permits file
 + * must still relay. Each case gets an exec entry in every place for the first word of each of its
@@ -1313,6 +1314,25 @@ index 0000000..ef3b12e
 +      expect(run(script, exec([])).verdict, script).toBe("allow");
 +    }
 +    expect(run(`Get-Content -LiteralPath ${at} -Stream x`, exec([])).verdict).toBe("relay");
++  });
++
++  it("R2-B1: sends git, gh and curl with any Windows executable suffix through their own policy", () => {
++    const cases: Array<[string, string, string]> = [];
++    for (const suffix of [".com", ".bat", ".cmd", ".EXE", ".Com"]) {
++      cases.push(
++        [`gh${suffix}`, "api repos/octo/example/issues -XPOST", "never:outward"],
++        [`curl${suffix}`, "-dvalue", "never:outward"],
++        [`git${suffix}`, "push origin topic", "never:outward"],
++        [`git${suffix}`, "--no-optional-locks diff --output=result.txt", "never:project-repo"],
++      );
++    }
++    for (const [tool, args, rule] of cases) {
++      const path = `${SCRATCH}\\${tool}`;
++      expect(run(`& '${path}' ${args}`, exec([path])).rule, `${tool} ${args}`).toBe(rule);
++    }
++    // The same suffixes on a destructive or hardware name, too.
++    expect(run(`& '${SCRATCH}\\rm.bat' x`, exec([`${SCRATCH}\\rm.bat`])).rule).toBe("never:destructive");
++    expect(run(`& '${SCRATCH}\\hwb.cmd' inspect`, exec([`${SCRATCH}\\hwb.cmd`])).rule).toBe("never:hardware");
 +  });
 +
 +  it("S1: compares exec prefix tokens exactly, except an absolute program path", () => {
@@ -2282,10 +2302,10 @@ index 0000000..0263cd3
 +});
 diff --git a/server/permit-match.ts b/server/permit-match.ts
 new file mode 100644
-index 0000000..438ffac
+index 0000000..a55520c
 --- /dev/null
 +++ b/server/permit-match.ts
-@@ -0,0 +1,1403 @@
+@@ -0,0 +1,1397 @@
 +/**
 + * The permission broker's matcher: would a crewmate's permission request be answered `allow` under its
 + * task's permits, or relayed to a person? Pure: no I/O but the injected `realpath`, no clock.
@@ -2393,19 +2413,19 @@ index 0000000..438ffac
 +
 +/**
 + * The private never-auto supplement (`data/permissions/never-auto-extra.json` in the home, spec amendment
-+ * 2026-10-09): hardware command names kept out of this public repository. Its basenames lowercase and
-+ * without `.exe`, or null when the file is not a valid version 1 supplement.
++ * 2026-10-09): hardware command names kept out of this public repository. Its names as `nativeName` gives
++ * them (lowercase, no executable suffix), or null when the file is not a valid version 1 supplement.
 + */
 +export function parseNeverAutoExtra(raw: unknown): string[] | null {
 +  if (typeof raw !== "object" || raw === null || (raw as { version?: unknown }).version !== 1) return null;
 +  const names = (raw as { neverAuto?: { hardware?: { commandBasenames?: unknown } } }).neverAuto?.hardware?.commandBasenames;
 +  if (!Array.isArray(names) || !names.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))) return null;
-+  return names.map((name: string) => baseName(name));
++  return names.map((name: string) => nativeName(name));
 +}
 +
-+/** A command word's basename as the supplement compares it: last path part, lowercase, without `.exe`. */
-+function baseName(word: string): string {
-+  return (word.replace(/\//g, "\\").split("\\").pop() ?? word).toLowerCase().replace(/\.exe$/, "");
++/** A word's native name: last path part, lowercase, without a Windows executable suffix (.exe, .com, .bat, .cmd). */
++function nativeName(word: string): string {
++  return (word.replace(/\//g, "\\").split("\\").pop() ?? word).toLowerCase().replace(/\.(?:exe|com|bat|cmd)$/, "");
 +}
 +
 +// ---------------------------------------------------------------------------
@@ -2965,11 +2985,16 @@ index 0000000..438ffac
 +};
 +
 +/** The program a command runs, lowercase: a bare name, or the last part of a path. */
-+function programOf(words: readonly Word[]): { name: string; base: string; path: boolean } {
++/**
++ * The program a command runs, lowercase: `name` as written, `base` its last path part, and `native` that
++ * part without a Windows executable suffix (.exe, .com, .bat, .cmd). Every check of which tool runs reads
++ * `native`, so no suffix variant of git, gh, curl or npm reaches exec without its own policy.
++ */
++function programOf(words: readonly Word[]): { name: string; base: string; native: string; path: boolean } {
 +  const value = (words[0]?.value ?? "").toLowerCase();
 +  const path = /[\\/]|^[a-z]:/.test(value);
 +  const base = value.replace(/\//g, "\\").split("\\").pop() ?? value;
-+  return { name: value, base, path };
++  return { name: value, base, native: nativeName(base), path };
 +}
 +
 +/** A git command's global options and its subcommand. */
@@ -3005,8 +3030,8 @@ index 0000000..438ffac
 +const NPM_INSTALL = new Set(["install", "i", "ci", "add", "isntall", "in"]);
 +const DANGEROUS_ENV = /^(?:path|pathext|comspec|psmodulepath|node_options|git_.*|npm_config_.*)$/i;
 +
-+function isNpm(base: string): boolean {
-+  return base === "npm" || base === "npm.cmd" || base === "npm.exe";
++function isNpm(native: string): boolean {
++  return native === "npm";
 +}
 +
 +function statementHit(statement: Statement, extraHardware: readonly string[] | null): Hit | null {
@@ -3022,14 +3047,14 @@ index 0000000..438ffac
 +  const program = programOf(words);
 +  const values = words.map((word) => word.value.toLowerCase());
 +  const lower = (index: number) => values[index] ?? "";
-+  // A native program by path or with .exe is the same program: rm.exe is rm.
-+  const native = program.base.replace(/\.(?:exe|com)$/, "");
++  // A native program by path or with an executable suffix is the same program: rm.exe is rm.
++  const native = program.native;
 +  for (const [id, names] of Object.entries(COMMANDS) as Array<[keyof typeof COMMANDS, ReadonlySet<string>]>) {
 +    if (names.has(program.name) || names.has(program.base) || names.has(native)) return { id, detail: `runs ${program.base}` };
 +  }
 +  // The private supplement's hardware names, as any word: bare, with .exe, by path, or run through another program.
 +  if (extraHardware !== null) {
-+    const listed = words.flatMap((word) => word.parts).find((part) => extraHardware.includes(baseName(part)));
++    const listed = words.flatMap((word) => word.parts).find((part) => extraHardware.includes(nativeName(part)));
 +    if (listed !== undefined) return { id: "hardware", detail: "a hardware tool the never-auto supplement names" };
 +  }
 +  // destructive
@@ -3041,7 +3066,7 @@ index 0000000..438ffac
 +  if (values.some((value) => value === "--force" || value === "--force-with-lease" || value.startsWith("--force"))) {
 +    return { id: "destructive", detail: `--force on ${program.base}` };
 +  }
-+  if (program.base === "git" || program.base === "git.exe") {
++  if (program.native === "git") {
 +    const git = parseGit(words);
 +    if (git === null) return null;
 +    const args = git.args.map((word) => word.value);
@@ -3054,7 +3079,7 @@ index 0000000..438ffac
 +    if (destructive) return { id: "destructive", detail: `git ${git.sub}` };
 +    if (["push", "remote", "send-email"].includes(git.sub)) return { id: "outward", detail: `git ${git.sub}` };
 +  }
-+  if (program.base === "gh" || program.base === "gh.exe") {
++  if (program.native === "gh") {
 +    const sub = lower(1);
 +    if (sub === "api") {
 +      // -X and -f/-F take their value attached too (-XPOST, -ftitle=x).
@@ -3064,7 +3089,7 @@ index 0000000..438ffac
 +      return { id: "outward", detail: `gh ${sub}` };
 +    }
 +  }
-+  if (program.base === "curl" || program.base === "curl.exe") {
++  if (program.native === "curl") {
 +    const writes = words
 +      .slice(1)
 +      // Short options bundle and take their value attached: -dvalue, -XPOST, -fLd value.
@@ -3074,19 +3099,19 @@ index 0000000..438ffac
 +  if (["invoke-restmethod", "irm", "invoke-webrequest", "iwr"].includes(program.name)) {
 +    if (values.some((value) => /^-(?:method|body|infile|form)$/.test(value))) return { id: "outward", detail: `${program.name} with a method or body` };
 +  }
-+  if (isNpm(program.base)) {
++  if (isNpm(program.native)) {
 +    if (lower(1) === "publish") return { id: "outward", detail: "npm publish" };
 +    if (values.includes("-g") || values.includes("--global")) return { id: "system", detail: "a global npm command" };
 +    if (NPM_INSTALL.has(lower(1)) && !values.includes("--ignore-scripts")) return { id: "system", detail: "npm install without --ignore-scripts" };
 +  }
 +  // system
-+  if (program.base === "pwsh" || program.base === "pwsh.exe") {
++  if (program.native === "pwsh") {
 +    if (!(lower(1) === "-noprofile" && lower(2) === "-file" && words.length >= 4)) return { id: "system", detail: "a nested pwsh" };
 +  }
-+  if (program.base === "uv" || program.base === "uv.exe") {
++  if (program.native === "uv") {
 +    if (lower(1) === "tool" || lower(1) === "pip") return { id: "system", detail: `uv ${lower(1)}` };
 +  }
-+  if (/^python(?:3)?(?:\.exe)?$/.test(program.base) && values.some((value, index) => value === "-m" && lower(index + 1) === "pip")) {
++  if (/^python3?$/.test(program.native) && values.some((value, index) => value === "-m" && lower(index + 1) === "pip")) {
 +    return { id: "system", detail: "python -m pip" };
 +  }
 +  return null;
@@ -3287,26 +3312,15 @@ index 0000000..438ffac
 +  return permits.netRead.hosts.some((listed) => listed.toLowerCase() === host) ? host : null;
 +}
 +
-+const NETWORK = new Set([
-+  "curl",
-+  "curl.exe",
-+  "wget",
-+  "wget.exe",
-+  "invoke-restmethod",
-+  "irm",
-+  "invoke-webrequest",
-+  "iwr",
-+  "start-bitstransfer",
-+  "gh",
-+  "gh.exe",
-+]);
++/** Network programs by native name; only net-read may allow them. */
++const NETWORK = new Set(["curl", "wget", "invoke-restmethod", "irm", "invoke-webrequest", "iwr", "start-bitstransfer", "gh"]);
 +
 +function netRead(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
 +  const words = statement.words;
 +  const values = words.map((word) => word.value);
 +  const program = programOf(words);
 +  const permits = rc.permits;
-+  if (program.base === "gh" || program.base === "gh.exe") {
++  if (program.native === "gh") {
 +    if (values[1] === "api") {
 +      let path: string | null = null;
 +      for (let index = 2; index < values.length; index += 1) {
@@ -3604,20 +3618,20 @@ index 0000000..438ffac
 +    if (!inRoots) return refuse("outside", `runs ${program.name}, outside the permitted folders`);
 +    // A git, gh, curl or npm install from the roots answers to its own policy first, then runs as exec.
 +    const own =
-+      program.base === "git" || program.base === "git.exe"
++      program.native === "git"
 +        ? gitRule(rc, statement)
-+        : NETWORK.has(program.base)
++        : NETWORK.has(program.native)
 +          ? netRead(rc, statement)
-+          : isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())
++          : isNpm(program.native) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())
 +            ? packageRule(rc, statement)
 +            : null;
 +    if (own !== null && !own.ok) return own;
 +    return execRule(rc, statement);
 +  }
-+  if (program.base === "git" || program.base === "git.exe") return gitRule(rc, statement);
-+  if (NETWORK.has(program.name)) return netRead(rc, statement);
-+  if (isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())) return packageRule(rc, statement);
-+  if (program.base === "pwsh" || program.base === "pwsh.exe") {
++  if (program.native === "git") return gitRule(rc, statement);
++  if (NETWORK.has(program.native)) return netRead(rc, statement);
++  if (isNpm(program.native) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())) return packageRule(rc, statement);
++  if (program.native === "pwsh") {
 +    const tool = words[3];
 +    if (tool !== undefined) {
 +      const home = homeTool(rc, tool, words.slice(4));

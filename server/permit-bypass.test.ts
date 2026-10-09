@@ -252,6 +252,25 @@ describe("round 1 fixes", () => {
     expect(run(`Get-Content -LiteralPath ${at} -Stream x`, exec([])).verdict).toBe("relay");
   });
 
+  it("R2-B1: sends git, gh and curl with any Windows executable suffix through their own policy", () => {
+    const cases: Array<[string, string, string]> = [];
+    for (const suffix of [".com", ".bat", ".cmd", ".EXE", ".Com"]) {
+      cases.push(
+        [`gh${suffix}`, "api repos/octo/example/issues -XPOST", "never:outward"],
+        [`curl${suffix}`, "-dvalue", "never:outward"],
+        [`git${suffix}`, "push origin topic", "never:outward"],
+        [`git${suffix}`, "--no-optional-locks diff --output=result.txt", "never:project-repo"],
+      );
+    }
+    for (const [tool, args, rule] of cases) {
+      const path = `${SCRATCH}\\${tool}`;
+      expect(run(`& '${path}' ${args}`, exec([path])).rule, `${tool} ${args}`).toBe(rule);
+    }
+    // The same suffixes on a destructive or hardware name, too.
+    expect(run(`& '${SCRATCH}\\rm.bat' x`, exec([`${SCRATCH}\\rm.bat`])).rule).toBe("never:destructive");
+    expect(run(`& '${SCRATCH}\\hwb.cmd' inspect`, exec([`${SCRATCH}\\hwb.cmd`])).rule).toBe("never:hardware");
+  });
+
   it("S1: compares exec prefix tokens exactly, except an absolute program path", () => {
     expect(run("node x.js", exec(["node"])).verdict).toBe("allow");
     expect(run("NODE x.js", exec(["node"])).verdict).toBe("relay");
