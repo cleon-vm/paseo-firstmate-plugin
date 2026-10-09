@@ -5,7 +5,6 @@ import { nameHomeOnce } from "./server/home-name";
 import { exitCrew, interruptCrew, relaunchCrew, steerCrew } from "./server/crew";
 import { registerCrewRelay } from "./server/crew-relay";
 import { registerCrewSeen } from "./server/crew-seen";
-import { registerPermissionBroker } from "./server/permission-broker";
 import { loadFleet, readAgentTools } from "./server/fleet";
 import { registerReportCache } from "./server/report-cache";
 import { findFiles, listDirectory, readTextFile, requireHome, writeTextFile } from "./server/files";
@@ -60,8 +59,6 @@ export default function contribute(server: PluginServerContext) {
   const watches = startWatches(server, readFirstmateConfig);
   // A crewmate whose own first mate is gone — after a restart — or that the captain steered has its news relayed to the current one; see server/crew-relay.ts.
   const crewRelay = registerCrewRelay(server, readFirstmateConfig);
-  // Crew permission requests checked against their task's permits and logged; this build never answers one. See server/permission-broker.ts.
-  const permissionBroker = registerPermissionBroker(server, readFirstmateConfig);
 
   server.handle(readConfig, async () => {
     const config = await readFirstmateConfig();
@@ -178,7 +175,6 @@ export default function contribute(server: PluginServerContext) {
     reports.stop();
     unregisterCrewSeen();
     crewRelay.stop();
-    permissionBroker.stop();
     watches.stop();
   };
 }

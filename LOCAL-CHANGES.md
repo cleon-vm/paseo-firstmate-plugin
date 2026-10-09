@@ -1,12 +1,12 @@
 # Local changes
 
-This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.3.4**, taken from the npm package, with nine local patches applied. It is not a fork and nothing here has been sent upstream.
+This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.3.4**, taken from the npm package, with ten local patches applied. It is not a fork and nothing here has been sent upstream.
 
 - Upstream: https://github.com/gpambrozio/paseo-plugins (monorepo, plugin in `firstmate/`)
-- The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the nine patches below are local.
+- The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the ten patches below are local.
 - `README.md` and `CHANGELOG.md` are upstream's; `README.md` also has install instructions for this repository and a note on the patches.
 
-Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.3.4 plus all nine patches, including the steer-box, status-report and steer-notify overlays, with one exception: `server/cli.ts` also carries a Windows change from this repository's first commit that no patch records (it finds the desktop app's bundled `paseo.cmd` and starts it through `Paseo.exe`, since Windows cannot spawn a `.cmd` directly). Upstream has not changed that file up to 0.3.4, so it is kept as it was; reapplying the nine patches to an npm install does not restore it. The package version is upstream's 0.3.4; each patch README records its local version note.
+Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.3.4 plus all ten patches, including the steer-box, status-report, steer-notify and permission-broker overlays, with one exception: `server/cli.ts` also carries a Windows change from this repository's first commit that no patch records (it finds the desktop app's bundled `paseo.cmd` and starts it through `Paseo.exe`, since Windows cannot spawn a `.cmd` directly). Upstream has not changed that file up to 0.3.4, so it is kept as it was; reapplying the ten patches to an npm install does not restore it. The package version is upstream's 0.3.4; each patch README records its local version note.
 
 ## Base 0.3.4 and Paseo 0.11.0
 
@@ -35,11 +35,12 @@ The re-cut, for the next upstream version: starting from the new stock files, fo
 | Notification relay | After a Restart, relays the Paseo notes (finished, errored, needs permission, was closed) of crewmates whose creator is gone — such as the previous first mate — to the current first mate as `<firstmate-crew>` notes worded like Paseo's own, from the plugin's lifecycle hooks with no model turn spent on looking. Skips crewmates whose creator is live and notes Paseo already delivered; dedupes, rate-limits and persists its queue in `plugin-data/firstmate/crew-relay.json`. | modified `client/transcript-rows.ts`, `index.server.ts`, `server/templates.ts`, `templates/data/charter.md`, `templates/messages/restart-note.md`; new `server/crew-relay.ts`, `server/crew-relay.test.ts`, `templates/messages/crew-relay*.md` (4) | [patches/notification-relay/README.md](patches/notification-relay/README.md) |
 | Reveal in explorer | Reveals a file (selected) or a folder of the home in the file manager of the machine running Paseo — Explorer, Finder or `xdg-open` — through a new `firstmate.files.reveal` RPC, confined like a read and started from an argument list. The Files view gets Reveal and Copy path on the open file's toolbar, Reveal for the current folder, and a right-click menu (long press on native) on rows and the open file's header, with a note that it opens on the machine running Paseo. | modified `client/files.tsx`, `client/web.ts`, `index.server.ts`, `shared/files.ts`; new `client/reveal.ts`, `client/reveal.test.ts`, `server/reveal.ts`, `server/reveal.test.ts` | [patches/reveal-in-explorer/README.md](patches/reveal-in-explorer/README.md) |
 | Chat input lag | Keeps composer keystrokes from rebuilding the history Markdown and inline tokens by stabilizing history callbacks and memoizing the history JSX. Includes a render-count regression and history/link/streaming invalidation checks. | modified `client/chat.tsx`; new `client/chat.test.ts` | [patches/chat-input-lag/README.md](patches/chat-input-lag/README.md) |
+| Permission broker | Checks every crew permission request against the task's permits file (`data/permissions/permits/<task>.json` in the home) and a fixed never-auto list, and logs the answer it would give and the one a person gave to `data/permissions/log-YYYY-MM.jsonl`. **Shadow only: it never answers.** Off unless `permissionBroker` in the config is `"shadow"` (or `"live"`, which in this build also answers nothing). | modified `index.server.ts`, `server/config.ts`, `shared/fleet.ts`; new `server/permission-broker.ts`, `server/permit-match.ts`, `server/permit-rules.ts`, their tests (4) and a synthetic test fixture | [patches/permission-broker/README.md](patches/permission-broker/README.md) |
 | Steer box click | Only a card's header (title and summary) toggles it open and closed; the action buttons and the steer box sit outside that pressable, so a click in the box no longer folds the card and hides the box. | modified `client/card.tsx`; new `client/card.test.ts` | [patches/steer-box-click/README.md](patches/steer-box-click/README.md) |
 
-The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay, steer-notify overlay. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it), `modified/` (every patched or new file), a README and `check.sh`. `.gitattributes` pins every patch folder to LF, so a CRLF checkout keeps them byte-identical to the LF files npm installs.
+The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay, steer-notify overlay, permission-broker overlay. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it), `modified/` (every patched or new file), a README and `check.sh`. `.gitattributes` pins every patch folder to LF, so a CRLF checkout keeps them byte-identical to the LF files npm installs.
 
-To check every record, from the repository root (Git Bash on Windows): `for p in patches/*/check.sh; do sh "$p" || echo "FAILED $p"; done`. Each check applies its patch to a scratch copy of its `original/` with the documented command, checks the result is byte-identical to `modified/`, and checks each file against the repository root (line endings ignored) or, where a later patch edits that file again, against that patch's `original/`. So the nine checks together also check the chain from one patch to the next. The checks bound parent repository discovery for their scratch apply commands, so a TMPDIR inside a checkout cannot make a patch silently skip its paths, and they keep their scratch copies for inspection.
+To check every record, from the repository root (Git Bash on Windows): `for p in patches/*/check.sh; do sh "$p" || echo "FAILED $p"; done`. Each check applies its patch to a scratch copy of its `original/` with the documented command, checks the result is byte-identical to `modified/`, and checks each file against the repository root (line endings ignored) or, where a later patch edits that file again, against that patch's `original/`. So the ten checks together also check the chain from one patch to the next. The checks bound parent repository discovery for their scratch apply commands, so a TMPDIR inside a checkout cannot make a patch silently skip its paths, and they keep their scratch copies for inspection.
 
 ## Status-report fix after the seven patches
 
@@ -71,6 +72,24 @@ The steered crewmates are kept with the relay's queue in
 `plugin-data/firstmate/crew-relay.json`. It adds no package dependency of its own;
 the Paseo requirement is upstream's `>=0.11.0`.
 
+## Permission broker after steer notify
+
+The [permission-broker overlay](patches/permission-broker/README.md) is local too. It
+checks each crew permission request against the task's permits and the never-auto list
+and logs the answer it would give, beside the answer a person gave. In this build it
+never answers, in any mode; `"live"` logs as live mode will judge and answers nothing.
+It is off by default (`permissionBroker: "off"`). It records changes to
+`index.server.ts`, `server/config.ts` and `shared/fleet.ts`, and adds the broker, the
+matcher, the never-auto list and their tests. Its `original/` captures those files after
+the steer-notify overlay. Apply it after that overlay and undo it before. The
+steer-notify check compares `index.server.ts` with this overlay's `original/` instead of
+the root, because this overlay changes that file.
+
+Its state (sticky crewmates, the last hour's allows) is kept in
+`plugin-data/firstmate/permission-broker.json`; its log is in the home's
+`data/permissions/`. It adds no package dependency of its own; the Paseo requirement is
+upstream's `>=0.11.0`.
+
 ## Where the plugin lives
 
 The installed copy (`$P`) is under the Paseo plugins folder:
@@ -83,7 +102,7 @@ The `<install-id>` folder can change on reinstall; use the current one.
 
 ## Reapply after an upstream / npm update
 
-An npm update of the plugin overwrites `$P` and drops all nine patches. The patches are cut on npm 0.3.4. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
+An npm update of the plugin overwrites `$P` and drops all ten patches. The patches are cut on npm 0.3.4. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
 
 ```
 git -c core.autocrlf=false apply -p2 --directory=. --check <repo>/patches/quota-pill/quota-pill.patch
@@ -139,6 +158,13 @@ git -c core.autocrlf=false apply --check <repo>/patches/steer-notify/steer-notif
 git -c core.autocrlf=false apply <repo>/patches/steer-notify/steer-notify.patch
 ```
 
+Then the permission-broker overlay (plain paths), checking first:
+
+```
+git -c core.autocrlf=false apply --check <repo>/patches/permission-broker/permission-broker.patch
+git -c core.autocrlf=false apply <repo>/patches/permission-broker/permission-broker.patch
+```
+
 Then `paseo plugin reload firstmate`. To install this repository over the npm source instead, from a clone at `<plugin-dir>`, remove FirstMate, then install the directory with its existing ID and reload:
 
 ```
@@ -164,6 +190,7 @@ paseo plugin reload firstmate
 Or undo the patches in place from `$P`, newest first:
 
 ```
+git -c core.autocrlf=false apply --reverse <repo>/patches/permission-broker/permission-broker.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/steer-notify/steer-notify.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/status-line-reads/status-line-reads.patch
 git -c core.autocrlf=false apply -p2 --directory=. --reverse <repo>/patches/steer-box-click/steer-box-click.patch

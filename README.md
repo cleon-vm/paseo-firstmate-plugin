@@ -20,10 +20,12 @@ manages, and Paseo itself tells the first mate when a worker finishes, fails or 
 There is nothing else to install.
 
 This repository is a patched copy of FirstMate 0.3.4 from
-[gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with nine local patches on
+[gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with ten local patches on
 top: a quota pill, Windows watches, images in the Files view, a notification relay after a restart,
 Reveal in explorer, fixes for chat typing lag and steer-box clicks, responsive
-status-report reads, and telling the first mate about a steer at once. [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
+status-report reads, telling the first mate about a steer at once, and a permission broker that logs
+what it would answer for crew permission requests (shadow only: it answers nothing, and it is off
+unless `permissionBroker` is set). [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
 describes each one and how to reapply or undo it.
 
 Moving from 0.2.1 to 0.3.4 brings upstream's sidebar crew count, folding long suggestions, its type
@@ -57,7 +59,7 @@ paseo plugin install https://github.com/cleon-vm/paseo-firstmate-plugin.git --id
 ```
 
 `paseo plugin install npm:@gpambrozio/paseo-firstmate` installs upstream's stock FirstMate, without
-the nine patches.
+the ten patches.
 
 To hack on it, clone the repository and run `npm install` and `npm test -- --exclude 'patches/**'`.
 To switch an existing install to a local clone, remove the plugin, then install the directory with the

@@ -8,6 +8,8 @@ patches/status-line-reads/** text eol=lf
 patches/steer-box-click/** text eol=lf
 # Same for the steer-notify overlay.
 patches/steer-notify/** text eol=lf
+# And the permission-broker overlay.
+patches/permission-broker/** text eol=lf
 # And the five older patch folders: from a CRLF checkout their patches do not
 # apply to the LF files npm installs either.
 patches/windows-watches/** text eol=lf
