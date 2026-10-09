@@ -740,6 +740,16 @@ describe("unwrapping the command line", () => {
     expect(unwrapCommand(`"${USER}\\AppData\\Local\\Microsoft\\WindowsApps\\pwsh.exe" -Command 'Get-Date'`, USER)).toBe("Get-Date");
   });
 
+  it("takes -NoProfile -Command too, which only runs less", () => {
+    expect(unwrapCommand(`"${PWSH}" -NoProfile -Command 'Get-Date'`, USER)).toBe("Get-Date");
+    expect(unwrapCommand(`"${PWSH}" -NoProfile -ExecutionPolicy Bypass -Command 'Get-Date'`, USER)).toBeNull();
+  });
+
+  it("never counts the wrapper itself against a line it cannot unwrap: unparsed, not system", () => {
+    const line = `"${PWSH}" -NoLogo -NoProfile -Command 'git --no-optional-locks status'`;
+    expect(match({ ...request("x"), input: { command: line, cwd: WORKTREE } }, permits(), context()).rule).toBe("never:unparsed");
+  });
+
   it("refuses any other shape", () => {
     expect(unwrapCommand(`"C:\\Tools\\pwsh.exe" -Command 'Get-Date'`, USER)).toBeNull();
     expect(unwrapCommand(`"${PWSH}" -Command 'a' ; rm x '`, USER)).toBeNull();

@@ -16,7 +16,9 @@ SDK's permission answer or sends anything to an agent, in any mode.
   (`never:no-permits`). The format is the planning spec's (version 1: `writeDirs`, `scratchDirs`,
   `readRepos`, `netRead`, `gitLocal`, `exec`, `envNames`, `live`).
 - **The matcher** (`server/permit-match.ts`) is pure, with one injected `realpath`. The command line must be
-  exactly `"<pwsh dir>\pwsh.exe" -Command '<script>'` from one of the two known pwsh folders. The
+  exactly `"<pwsh dir>\pwsh.exe" -Command '<script>'` (or `-NoProfile -Command`, which Codex also sends
+  and which only runs less) from one of the two known pwsh folders. A line it cannot unwrap relays as
+  `never:unparsed`; the wrapper's own `-Command` never counts as a nested shell. The
   script is split into statements: allowed `$env:NAME='literal'` assignments, apply_patch envelopes, or one
   plain command of bare words and quoted strings, at most piped into a formatting cmdlet. Every statement
   must match an allow rule (`notes-write`, `local-read`, `net-read`, `git-local`, `git-read`, `home-tool`,
@@ -101,9 +103,10 @@ git -c core.autocrlf=false apply patches/permission-broker/permission-broker.pat
   mate are not looked at, reserved task, no task, missing, non-JSON, invalid and other-task permits,
   `live: false` in live mode); the log's shape, redaction, a failing write, a failing hook and the rate cap.
 - `server/permit-replay.test.ts`: skipped unless `PERMIT_REPLAY` names a JSON lines corpus of real requests
-  (`{ command, cwd, label }`). It replays them under maximal permits built from the corpus, prints coverage
-  by label, and fails if anything labelled hardware, WSL, destructive, outward or credential is allowed. The
-  corpus stays on the machine that made it; nothing of it belongs in this repository.
+  (`{ command, cwd, label }`, with optional `labels` tags and the `launcher` argv). It replays them under
+  maximal permits built from the corpus, prints coverage by label, and fails if anything labelled or tagged
+  hardware, WSL, destructive, outward or credential is allowed. The corpus stays on the machine that made
+  it; nothing of it belongs in this repository.
 
 No dependency change of its own; the Paseo requirement is upstream's `>=0.11.0`. Not run in a live Paseo
 app.

@@ -3,7 +3,7 @@
  * task's permits, or relayed to a person? Pure: no I/O but the injected `realpath`, no clock.
  *
  * Literal and default-relay (spec 3.5). A Codex command approval's command line must be exactly
- * `"<dir>\pwsh.exe" -Command '<script>'`; the script is split into statements, each of which must be an
+ * `"<dir>\pwsh.exe" [-NoProfile] -Command '<script>'`; the script is split into statements, each of which must be an
  * allowed `$env:` assignment, an apply_patch envelope, or one plain command of bare words and quoted
  * strings, at most piped into a formatting cmdlet. Every statement must match an allow rule; any doubt
  * relays. The never-auto list (`permit-rules.ts`) is checked before any rule: its patterns against the
@@ -173,9 +173,12 @@ function canon(path: string): string {
   return path.replace(/\//g, "\\").replace(/\\+$/, "").toLowerCase();
 }
 
-/** The script inside `"<dir>\pwsh.exe" -Command '<script>'`, or null when the line is not exactly that. */
+/**
+ * The script inside `"<dir>\pwsh.exe" -Command '<script>'` (or `-NoProfile -Command`, which Codex also
+ * sends and which only runs less), or null when the line is not exactly that.
+ */
 export function unwrapCommand(command: string, userHome: string): string | null {
-  const match = /^"([^"]+)\\pwsh\.exe" -Command '([\s\S]*)'$/i.exec(command);
+  const match = /^"([^"]+)\\pwsh\.exe" (?:-NoProfile )?-Command '([\s\S]*)'$/i.exec(command);
   if (match === null) return null;
   if (!pwshDirs(userHome).includes(canon(match[1] ?? ""))) return null;
   const inner = match[2] ?? "";
@@ -193,7 +196,7 @@ export function unwrapCommand(command: string, userHome: string): string | null 
 
 /** The text the never-auto patterns read when the line could not be unwrapped: without a leading shell. */
 function stripShell(command: string): string {
-  return command.replace(/^\s*"?(?:[^"\s]*\\)?(?:pwsh|powershell)(?:\.exe)?"?\s+-Command\s+/i, "");
+  return command.replace(/^\s*(?:"[^"]*\\(?:pwsh|powershell)(?:\.exe)?"|(?:[^"\s]*\\)?(?:pwsh|powershell)(?:\.exe)?)(?:\s+-[A-Za-z]+)*?\s+-Command\s+/i, "");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,14 +1,16 @@
 /**
  * The private replay (spec 3.11 item 8): every command of a labelled corpus of real permission requests
  * through the matcher under maximal permits. Skipped unless `PERMIT_REPLAY` names the corpus, a JSON
- * lines file of `{ command, cwd, label }` (also read: `cmd`, `cls2`, `cls`, `class`). The corpus stays on
- * the machine that made it; nothing of it belongs in this repository.
+ * lines file of `{ command, cwd, label }` (also read: `cmd`, `cls2`, `cls`, `class`; `labels`, an array of
+ * forbidden-class tags; and `launcher`, the argv before the script, used to rebuild the command line Codex
+ * sends). The corpus stays on the machine that made it; nothing of it belongs in this repository.
  *
  * Maximal permits are built from the corpus itself: every folder under the home's `data/` as a write dir,
- * the temporary folder as scratch, every `-C` folder and every Paseo worktree as a read repo, every GitHub pair and host it names,
- * and an exec entry in every place for the first word of every statement. So only the never-auto list and
- * the grammar can stop a command. It fails if a command labelled hardware, WSL, destructive, outward or
- * credential comes out `allow`, and prints coverage by label (counts and rules only, no commands).
+ * the temporary folder as scratch, every `-C` folder and every Paseo worktree as a read repo, every GitHub
+ * pair and host it names, and an exec entry in every place for the first word of every statement. So only
+ * the never-auto list and the grammar can stop a command. It fails if a command labelled or tagged
+ * hardware, WSL, destructive, outward or credential comes out `allow`, and prints coverage by label (counts
+ * and rules only, no commands).
  *
  * `PERMIT_REPLAY_DETAIL=1` also prints each relay's index, label, rule and detail (paths, no commands).
  *
@@ -31,6 +33,8 @@ interface Entry {
   command: string;
   cwd: string;
   label: string;
+  tags: string[];
+  launcher: string[] | null;
 }
 
 function text(record: Record<string, unknown>, ...names: string[]): string {
@@ -52,13 +56,29 @@ function readCorpus(path: string): Entry[] {
       command: Array.isArray(record.command) ? String(record.command[record.command.length - 1]) : text(record, "command", "cmd"),
       cwd: localPath(text(record, "cwd")),
       label: text(record, "label", "cls2", "cls", "class") || "unlabelled",
+      tags: Array.isArray(record.labels) ? record.labels.filter((tag): tag is string => typeof tag === "string") : [],
+      launcher:
+        Array.isArray(record.launcher) && record.launcher.length >= 2 && record.launcher.every((part) => typeof part === "string")
+          ? (record.launcher as string[])
+          : null,
     }));
 }
 
-/** The command line as Codex sends it: a bare script gets the pwsh wrapper. */
-function wrapped(command: string, userHome: string): string {
-  if (unwrapCommand(command, userHome) !== null) return command;
-  return `"${PWSH}" -Command '${command.replace(/'/g, "''")}'`;
+/** The script of an entry: its command, unwrapped when it carries the pwsh wrapper. */
+function scriptOf(entry: Entry, userHome: string): string {
+  return unwrapCommand(entry.command, userHome) ?? entry.command;
+}
+
+/** The command line as Codex sends it: the entry's launcher and its script, or the plain pwsh wrapper. */
+function wrapped(entry: Entry, userHome: string): string {
+  if (unwrapCommand(entry.command, userHome) !== null) return entry.command;
+  const quoted = `'${entry.command.replace(/'/g, "''")}'`;
+  if (entry.launcher !== null) return `"${entry.launcher[0]}" ${[...entry.launcher.slice(1), quoted].join(" ")}`;
+  return `"${PWSH}" -Command ${quoted}`;
+}
+
+function forbidden(entry: Entry): boolean {
+  return FORBIDDEN.test(entry.label) || entry.tags.some((tag) => FORBIDDEN.test(tag));
 }
 
 function maximalPermits(entries: readonly Entry[], home: string, userHome: string): Permits {
@@ -74,7 +94,7 @@ function maximalPermits(entries: readonly Entry[], home: string, userHome: strin
   const worktrees = join(userHome, ".paseo", "worktrees");
   for (const group of safeList(worktrees)) for (const tree of safeList(join(worktrees, group))) readRepos.add(join(worktrees, group, tree));
   for (const entry of entries) {
-    const script = unwrapCommand(wrapped(entry.command, userHome), userHome) ?? entry.command;
+    const script = scriptOf(entry, userHome);
     for (const found of script.matchAll(/-C\s+'([A-Za-z]:\\[^']+)'/g)) readRepos.add(found[1] ?? "");
     for (const found of script.matchAll(/-C\s+([A-Za-z]:\\[^\s;']+)/g)) readRepos.add(found[1] ?? "");
     for (const found of script.matchAll(/(?:repos\/|github\.com\/)([A-Za-z0-9-]+\/[A-Za-z0-9._-]+?)(?:\.git)?(?=[/\s'"?]|$)/g)) pairs.add(found[1] ?? "");
@@ -131,11 +151,14 @@ describe.skipIf(CORPUS === "")("private replay of real permission requests", () 
     const permits = maximalPermits(entries, home, userHome);
     const byLabel = new Map<string, { total: number; allowed: number; rules: Map<string, number> }>();
     const wrong: string[] = [];
+    let tagged = 0;
+    let otherLauncher = 0;
     entries.forEach((entry, index) => {
+      const command = wrapped(entry, userHome);
       let result: MatchResult;
       try {
         result = match(
-          { provider: "codex", name: "CodexBash", kind: "tool", input: { command: wrapped(entry.command, userHome), cwd: entry.cwd } },
+          { provider: "codex", name: "CodexBash", kind: "tool", input: { command, cwd: entry.cwd } },
           permits,
           { crew: true, task: "replay", mode: "shadow", home, userHome, worktree: entry.cwd, sticky: false, allowsLastHour: 0, realpath },
         );
@@ -147,8 +170,10 @@ describe.skipIf(CORPUS === "")("private replay of real permission requests", () 
       if (result.verdict === "allow") row.allowed += 1;
       row.rules.set(result.rule, (row.rules.get(result.rule) ?? 0) + 1);
       byLabel.set(entry.label, row);
+      if (forbidden(entry)) tagged += 1;
+      if (unwrapCommand(command, userHome) === null) otherLauncher += 1;
       if (process.env.PERMIT_REPLAY_DETAIL === "1" && result.verdict === "relay") console.log(`#${index} ${entry.label} ${result.rule}: ${result.detail}`);
-      if (result.verdict === "allow" && FORBIDDEN.test(entry.label)) wrong.push(`#${index} ${entry.label} allowed by ${result.rule}`);
+      if (result.verdict === "allow" && forbidden(entry)) wrong.push(`#${index} ${entry.label} [${entry.tags.join(",")}] allowed by ${result.rule}`);
     });
     const lines = ["| Label | Commands | Allowed | Share | Rules |", "| --- | --- | --- | --- | --- |"];
     let total = 0;
@@ -160,7 +185,9 @@ describe.skipIf(CORPUS === "")("private replay of real permission requests", () 
       lines.push(`| ${label} | ${row.total} | ${row.allowed} | ${Math.round((100 * row.allowed) / row.total)}% | ${rules} |`);
     }
     lines.push(`| all | ${total} | ${allowed} | ${total === 0 ? 0 : Math.round((100 * allowed) / total)}% | |`);
-    console.log(`\n${lines.join("\n")}\n\nForbidden classes allowed: ${wrong.length === 0 ? "none" : wrong.join("; ")}\n`);
+    console.log(`\n${lines.join("\n")}\n`);
+    console.log(`Labelled or tagged forbidden: ${tagged}. Of those allowed: ${wrong.length === 0 ? "none" : wrong.join("; ")}`);
+    console.log(`Command lines the matcher does not unwrap (another launcher form): ${otherLauncher}\n`);
     expect(wrong).toEqual([]);
   }, 300_000);
 });
