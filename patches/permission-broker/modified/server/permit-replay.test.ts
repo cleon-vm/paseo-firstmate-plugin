@@ -23,7 +23,7 @@ import { dirname, join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
-import { match, parseScript, unwrapCommand, type MatchResult, type Permits } from "./permit-match";
+import { match, parseNeverAutoExtra, parseScript, unwrapCommand, type MatchResult, type Permits } from "./permit-match";
 
 const CORPUS = process.env.PERMIT_REPLAY ?? "";
 const FORBIDDEN = /hardware|wsl|destructive|outward|credential/i;
@@ -133,6 +133,14 @@ function safeList(dir: string): string[] {
   }
 }
 
+function readSupplement(home: string): string[] | null {
+  try {
+    return parseNeverAutoExtra(JSON.parse(readFileSync(join(home, "data", "permissions", "never-auto-extra.json"), "utf8")));
+  } catch {
+    return null;
+  }
+}
+
 function realpath(path: string): string | null {
   try {
     return realpathSync.native(path);
@@ -149,6 +157,8 @@ describe.skipIf(CORPUS === "")("private replay of real permission requests", () 
     const userHome = homedir();
     const entries = readCorpus(CORPUS);
     const permits = maximalPermits(entries, home, userHome);
+    // The home's private supplement, as the broker reads it; never printed.
+    const extraHardware = readSupplement(home);
     const byLabel = new Map<string, { total: number; allowed: number; rules: Map<string, number> }>();
     const wrong: string[] = [];
     let tagged = 0;
@@ -160,7 +170,7 @@ describe.skipIf(CORPUS === "")("private replay of real permission requests", () 
         result = match(
           { provider: "codex", name: "CodexBash", kind: "tool", input: { command, cwd: entry.cwd } },
           permits,
-          { crew: true, task: "replay", mode: "shadow", home, userHome, worktree: entry.cwd, sticky: false, allowsLastHour: 0, realpath },
+          { crew: true, task: "replay", mode: "shadow", home, userHome, worktree: entry.cwd, sticky: false, allowsLastHour: 0, realpath, extraHardware },
         );
       } catch (error) {
         result = { verdict: "relay", rule: "error", tier: null, detail: String(error) };

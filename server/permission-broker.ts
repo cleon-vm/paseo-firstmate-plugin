@@ -37,7 +37,7 @@ import { isCrew, paseoRelayHost } from "./crew-relay";
 import { parseCrewReport } from "./crew-report";
 import { pluginDir } from "./data-dir";
 import type { PaseoApi } from "./host-types";
-import { match, neverId, taskIdOk, type MatchResult } from "./permit-match";
+import { match, neverId, parseNeverAutoExtra, taskIdOk, type MatchResult } from "./permit-match";
 import { neverAuto, STICKY_IDS } from "./permit-rules";
 import { closingText } from "./report-cache";
 import { serialized } from "./serialize";
@@ -46,9 +46,8 @@ import { serialized } from "./serialize";
 export const PLAN_LABEL = "firstmate.plan";
 /** The most of a command a log line keeps. */
 export const MAX_LOGGED_COMMAND = 2000;
-/** How many crewmates' labels are kept, and how long a sticky mark or an allow time is. */
+/** How many crewmates' labels are kept, and how long an allow time is. */
 const MAX_AGENTS = 2000;
-const STICKY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const HOUR_MS = 60 * 60 * 1000;
 const STUCK_TURN_STATES: ReadonlySet<string> = new Set(["blocked", "needs-decision", "failed"]);
 
@@ -180,6 +179,7 @@ export class PermissionBroker {
     const mode = config.permissionBroker === "live" ? "live" : "shadow";
     const home = resolveHome(config);
     const permits = facts.task !== null && taskIdOk(facts.task) ? await this.readPermits(home, facts.task) : { raw: undefined, sha: null };
+    const extraHardware = await this.readSupplement(home);
     const state = await this.load();
     const now = this.now();
     const agentId = event.agent.id;
@@ -196,6 +196,7 @@ export class PermissionBroker {
         sticky: state.sticky[agentId] !== undefined,
         allowsLastHour: recent.length,
         realpath: this.realpath,
+        extraHardware,
       });
     } catch (error) {
       result = { verdict: "relay", rule: "error", tier: null, detail: error instanceof Error ? error.message : String(error) };
@@ -276,6 +277,19 @@ export class PermissionBroker {
     await this.persist(now);
   }
 
+  /**
+   * The private never-auto supplement, `data/permissions/never-auto-extra.json` in the home (spec amendment
+   * 2026-10-09), read on every request. Null when it is missing, unreadable or invalid: then no exec
+   * statement is allowed. Its names are never logged.
+   */
+  private async readSupplement(home: string): Promise<string[] | null> {
+    try {
+      return parseNeverAutoExtra(JSON.parse(await readFile(join(home, "data", "permissions", "never-auto-extra.json"), "utf8")));
+    } catch {
+      return null;
+    }
+  }
+
   private async readPermits(home: string, task: string): Promise<{ raw: unknown; sha: string | null }> {
     let bytes: Buffer;
     try {
@@ -318,9 +332,7 @@ export class PermissionBroker {
   private async persist(now: number): Promise<void> {
     const state = this.state;
     if (state === null) return;
-    for (const [agentId, mark] of Object.entries(state.sticky)) {
-      if (Date.parse(mark.at) <= now - STICKY_TTL_MS) delete state.sticky[agentId];
-    }
+    // Sticky marks are never pruned by age: an agent stays sticky for its whole life (spec 3.7).
     for (const [agentId, times] of Object.entries(state.allows)) {
       const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
       if (recent.length === 0) delete state.allows[agentId];

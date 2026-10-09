@@ -276,6 +276,20 @@ describe("after a refusal", () => {
     expect(verdicts["after-reload"]).toBe("notes-write");
   });
 
+  it("lasts the agent's life: still sticky 31 days later, after other requests and a reload", async () => {
+    const s = await setup();
+    await writePermits(s.m);
+    await s.server.emit("agent.permission_resolved", { agent: agent(s.m, "crew-1"), requestId: "x", resolution: { behavior: "deny" } }, s.paseo);
+    s.wired.stop();
+    const later = T0 + 31 * 24 * 60 * 60 * 1000;
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => later });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2", requestId: "other" }), s.paseo);
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-1", requestId: "mine" }), s.paseo);
+    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]).toBeDefined();
+    expect((await s.lines()).find((line) => line.requestId === "mine")?.rule).toBe("never:after-refusal");
+  });
+
   it("is kept per agent: another crewmate is not sticky", async () => {
     const s = await setup();
     await writePermits(s.m);
@@ -357,6 +371,32 @@ describe("gates", () => {
     await writePermits(s.m);
     await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "b" }), s.paseo);
     expect((await s.lines()).map((line) => line.rule)).toEqual(["never:no-permits", "notes-write"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The private never-auto supplement (spec amendment 2026-10-09)
+// ---------------------------------------------------------------------------
+
+describe("the never-auto supplement", () => {
+  const supplementPath = (m: Machine) => join(m.home, "data", "permissions", "never-auto-extra.json");
+  const fixture = () => readFile(join(import.meta.dirname, "permit-fixtures", "never-auto-extra.json"));
+
+  it("is read on every request: missing or invalid relays every exec statement, and a listed name relays as hardware", async () => {
+    const s = await setup();
+    await writePermits(s.m, { exec: [{ in: "scratch", prefix: ["npm.cmd", "test"] }, { in: "scratch", prefix: ["hwb"] }] });
+    const ask = (script: string, requestId: string) =>
+      s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId, cwd: s.m.scratch, id: "crew-2" }), s.paseo);
+    await ask("npm.cmd test", "missing");
+    await writeFile(supplementPath(s.m), await fixture());
+    await ask("npm.cmd test", "present");
+    await ask("hwb inspect", "listed");
+    await ask(ALLOWED_SCRIPT(s.m), "notes");
+    await writeFile(supplementPath(s.m), "{ not json");
+    await ask("npm.cmd test", "invalid");
+    const rules = Object.fromEntries((await s.lines()).map((line) => [line.requestId, line.rule]));
+    expect(rules).toEqual({ missing: "never:hardware", present: "exec", listed: "never:hardware", notes: "notes-write", invalid: "never:hardware" });
+    expect(JSON.stringify(await s.lines())).not.toContain("hwtool-a");
   });
 });
 

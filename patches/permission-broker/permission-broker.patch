@@ -58,10 +58,10 @@ index 9899407..92f72c9 100644
      console.error(`[firstmate] ${configPath()} is invalid, using defaults: ${parsed.error.message}`);
 diff --git a/server/permission-broker.test.ts b/server/permission-broker.test.ts
 new file mode 100644
-index 0000000..9f5d79f
+index 0000000..e0c939a
 --- /dev/null
 +++ b/server/permission-broker.test.ts
-@@ -0,0 +1,480 @@
+@@ -0,0 +1,520 @@
 +import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 +import { realpathSync } from "node:fs";
 +import { tmpdir } from "node:os";
@@ -340,6 +340,20 @@ index 0000000..9f5d79f
 +    expect(verdicts["after-reload"]).toBe("notes-write");
 +  });
 +
++  it("lasts the agent's life: still sticky 31 days later, after other requests and a reload", async () => {
++    const s = await setup();
++    await writePermits(s.m);
++    await s.server.emit("agent.permission_resolved", { agent: agent(s.m, "crew-1"), requestId: "x", resolution: { behavior: "deny" } }, s.paseo);
++    s.wired.stop();
++    const later = T0 + 31 * 24 * 60 * 60 * 1000;
++    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => later });
++    await reloaded.ready;
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2", requestId: "other" }), s.paseo);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-1", requestId: "mine" }), s.paseo);
++    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]).toBeDefined();
++    expect((await s.lines()).find((line) => line.requestId === "mine")?.rule).toBe("never:after-refusal");
++  });
++
 +  it("is kept per agent: another crewmate is not sticky", async () => {
 +    const s = await setup();
 +    await writePermits(s.m);
@@ -421,6 +435,32 @@ index 0000000..9f5d79f
 +    await writePermits(s.m);
 +    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "b" }), s.paseo);
 +    expect((await s.lines()).map((line) => line.rule)).toEqual(["never:no-permits", "notes-write"]);
++  });
++});
++
++// ---------------------------------------------------------------------------
++// The private never-auto supplement (spec amendment 2026-10-09)
++// ---------------------------------------------------------------------------
++
++describe("the never-auto supplement", () => {
++  const supplementPath = (m: Machine) => join(m.home, "data", "permissions", "never-auto-extra.json");
++  const fixture = () => readFile(join(import.meta.dirname, "permit-fixtures", "never-auto-extra.json"));
++
++  it("is read on every request: missing or invalid relays every exec statement, and a listed name relays as hardware", async () => {
++    const s = await setup();
++    await writePermits(s.m, { exec: [{ in: "scratch", prefix: ["npm.cmd", "test"] }, { in: "scratch", prefix: ["hwb"] }] });
++    const ask = (script: string, requestId: string) =>
++      s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId, cwd: s.m.scratch, id: "crew-2" }), s.paseo);
++    await ask("npm.cmd test", "missing");
++    await writeFile(supplementPath(s.m), await fixture());
++    await ask("npm.cmd test", "present");
++    await ask("hwb inspect", "listed");
++    await ask(ALLOWED_SCRIPT(s.m), "notes");
++    await writeFile(supplementPath(s.m), "{ not json");
++    await ask("npm.cmd test", "invalid");
++    const rules = Object.fromEntries((await s.lines()).map((line) => [line.requestId, line.rule]));
++    expect(rules).toEqual({ missing: "never:hardware", present: "exec", listed: "never:hardware", notes: "notes-write", invalid: "never:hardware" });
++    expect(JSON.stringify(await s.lines())).not.toContain("hwtool-a");
 +  });
 +});
 +
@@ -544,10 +584,10 @@ index 0000000..9f5d79f
 +});
 diff --git a/server/permission-broker.ts b/server/permission-broker.ts
 new file mode 100644
-index 0000000..86d3957
+index 0000000..c31ad47
 --- /dev/null
 +++ b/server/permission-broker.ts
-@@ -0,0 +1,455 @@
+@@ -0,0 +1,467 @@
 +/**
 + * The permission broker, shadow mode: checks every crew permission request against its task's permits
 + * and the never-auto list, and logs the answer it would give and the answer people gave. It never
@@ -587,7 +627,7 @@ index 0000000..86d3957
 +import { parseCrewReport } from "./crew-report";
 +import { pluginDir } from "./data-dir";
 +import type { PaseoApi } from "./host-types";
-+import { match, neverId, taskIdOk, type MatchResult } from "./permit-match";
++import { match, neverId, parseNeverAutoExtra, taskIdOk, type MatchResult } from "./permit-match";
 +import { neverAuto, STICKY_IDS } from "./permit-rules";
 +import { closingText } from "./report-cache";
 +import { serialized } from "./serialize";
@@ -596,9 +636,8 @@ index 0000000..86d3957
 +export const PLAN_LABEL = "firstmate.plan";
 +/** The most of a command a log line keeps. */
 +export const MAX_LOGGED_COMMAND = 2000;
-+/** How many crewmates' labels are kept, and how long a sticky mark or an allow time is. */
++/** How many crewmates' labels are kept, and how long an allow time is. */
 +const MAX_AGENTS = 2000;
-+const STICKY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 +const HOUR_MS = 60 * 60 * 1000;
 +const STUCK_TURN_STATES: ReadonlySet<string> = new Set(["blocked", "needs-decision", "failed"]);
 +
@@ -730,6 +769,7 @@ index 0000000..86d3957
 +    const mode = config.permissionBroker === "live" ? "live" : "shadow";
 +    const home = resolveHome(config);
 +    const permits = facts.task !== null && taskIdOk(facts.task) ? await this.readPermits(home, facts.task) : { raw: undefined, sha: null };
++    const extraHardware = await this.readSupplement(home);
 +    const state = await this.load();
 +    const now = this.now();
 +    const agentId = event.agent.id;
@@ -746,6 +786,7 @@ index 0000000..86d3957
 +        sticky: state.sticky[agentId] !== undefined,
 +        allowsLastHour: recent.length,
 +        realpath: this.realpath,
++        extraHardware,
 +      });
 +    } catch (error) {
 +      result = { verdict: "relay", rule: "error", tier: null, detail: error instanceof Error ? error.message : String(error) };
@@ -826,6 +867,19 @@ index 0000000..86d3957
 +    await this.persist(now);
 +  }
 +
++  /**
++   * The private never-auto supplement, `data/permissions/never-auto-extra.json` in the home (spec amendment
++   * 2026-10-09), read on every request. Null when it is missing, unreadable or invalid: then no exec
++   * statement is allowed. Its names are never logged.
++   */
++  private async readSupplement(home: string): Promise<string[] | null> {
++    try {
++      return parseNeverAutoExtra(JSON.parse(await readFile(join(home, "data", "permissions", "never-auto-extra.json"), "utf8")));
++    } catch {
++      return null;
++    }
++  }
++
 +  private async readPermits(home: string, task: string): Promise<{ raw: unknown; sha: string | null }> {
 +    let bytes: Buffer;
 +    try {
@@ -868,9 +922,7 @@ index 0000000..86d3957
 +  private async persist(now: number): Promise<void> {
 +    const state = this.state;
 +    if (state === null) return;
-+    for (const [agentId, mark] of Object.entries(state.sticky)) {
-+      if (Date.parse(mark.at) <= now - STICKY_TTL_MS) delete state.sticky[agentId];
-+    }
++    // Sticky marks are never pruned by age: an agent stays sticky for its whole life (spec 3.7).
 +    for (const [agentId, times] of Object.entries(state.allows)) {
 +      const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
 +      if (recent.length === 0) delete state.allows[agentId];
@@ -1003,12 +1055,296 @@ index 0000000..86d3957
 +    },
 +  };
 +}
+diff --git a/server/permit-bypass.test.ts b/server/permit-bypass.test.ts
+new file mode 100644
+index 0000000..1a85851
+--- /dev/null
++++ b/server/permit-bypass.test.ts
+@@ -0,0 +1,264 @@
++/**
++ * The review's bypass hunt (round 1), kept as regression tests: 47 commands that a maximal permits file
++ * must still relay. Each case gets an exec entry in every place for the first word of each of its
++ * statements, so only the never-auto list, the grammar and the rule shapes can stop it. Synthetic only;
++ * the two hardware tool names the review used are replaced by generic stand-ins.
++ *
++ * The two hardware names come from a private supplement in the home (spec amendment 2026-10-09); here a
++ * synthetic one, `permit-fixtures/never-auto-extra.json`. The -NoProfile wrapper and the extra read-only
++ * local-read switches (attempts 42 and 44) are accepted by the same amendment and must allow.
++ */
++import { readFileSync } from "node:fs";
++
++import { describe, expect, it } from "vitest";
++
++import { LOCAL_READ_FORMS, match, parseNeverAutoExtra, parseScript, type MatchContext, type Permits } from "./permit-match";
++
++const USER = String.raw`C:\Users\example`;
++const HOME = `${USER}\\.paseo\\plugin-data\\firstmate\\home`;
++const WORKTREE = String.raw`C:\Work\demo`;
++const SCRATCH = String.raw`C:\Scratch\demo`;
++const NOTES = `${HOME}\\data\\demo`;
++const REPO = String.raw`C:\Review\demo`;
++const SHIM = `${USER}\\.codex\\tmp\\arg0\\codex-arg0Ab12\\apply_patch.bat`;
++
++/** Every path exists, except under a junction `<notes>\jx`, which leads to C:\Outside. */
++function realpath(path: string): string | null {
++  const lower = path.toLowerCase();
++  if (lower === `${NOTES.toLowerCase()}\\jx`) return String.raw`C:\Outside`;
++  return lower.includes("\\jx\\") ? null : path;
++}
++
++const CONTEXT: MatchContext = {
++  crew: true,
++  task: "demo",
++  mode: "shadow",
++  home: HOME,
++  userHome: USER,
++  worktree: WORKTREE,
++  sticky: false,
++  allowsLastHour: 0,
++  realpath,
++  extraHardware: parseNeverAutoExtra(JSON.parse(readFileSync(new URL("./permit-fixtures/never-auto-extra.json", import.meta.url), "utf8"))),
++};
++
++const patch = (header: string, shim = SHIM) => `$p = @'\n*** Begin Patch\n${header}\n+x\n*** End Patch\n'@\n& '${shim}' $p`;
++
++interface Attempt {
++  name: string;
++  script: string;
++  /** A flag before -Command in the wrapper. */
++  wrapper?: string;
++  /** The exec prefix to permit instead of each statement's first word. */
++  prefix?: string[];
++  /** Accepted by the spec amendment of 2026-10-09: allows. */
++  accepted?: string;
++}
++
++const ATTEMPTS: Attempt[] = [
++  { name: "1 quoted git push", script: "git 'push' origin topic" },
++  { name: "2 escaped quote", script: "git commit -m 'x''; git push'" },
++  { name: "3 comma sources, one outside", script: `Copy-Item -LiteralPath '${WORKTREE}\\a','C:\\Outside\\b' -Destination '${NOTES}\\x'` },
++  { name: "4 alias ri", script: `ri '${NOTES}\\x'` },
++  { name: "5 alias mi", script: `mi '${NOTES}\\x' '${NOTES}\\y'` },
++  { name: "6 git.exe reset", script: "git.exe -C C:\\Work\\demo reset --hard" },
++  { name: "7 path gh, attached method", script: `& '${SCRATCH}\\gh.exe' api repos/octo/example/issues -XPOST` },
++  { name: "8 path curl, attached data", script: `& '${SCRATCH}\\curl.exe' -dvalue` },
++  { name: "9 path git, output file", script: `& '${SCRATCH}\\git.exe' --no-optional-locks diff --output=result.txt` },
++  { name: "10 path git, other repo", script: `& '${SCRATCH}\\git.exe' -C 'C:\\Outside\\repo' status` },
++  { name: "11 path npm install", script: `& '${SCRATCH}\\npm.cmd' install left-pad@1.3.0 --ignore-scripts` },
++  { name: "12 mixed-case Remove-Item", script: "rEmOvE-iTeM x" },
++  { name: "13 fullwidth rm", script: "\uff52\uff4d x" },
++  { name: "14 *> redirection", script: `Get-Content -LiteralPath '${NOTES}\\a' *> '${NOTES}\\b'` },
++  { name: "15 > redirection", script: `Get-Content -LiteralPath '${NOTES}\\a' > '${NOTES}\\b'` },
++  { name: "16 stop-parsing token", script: "git --% reset --hard" },
++  { name: "17 PATH set, PATH permitted", script: `$env:PATH='${SCRATCH}'; node x.js` },
++  { name: "18 junction", script: `New-Item -ItemType Directory -Path '${NOTES}\\jx\\x'` },
++  { name: "19 apply_patch Delete File", script: patch(`*** Delete File: ${NOTES}/x`) },
++  { name: "20 apply_patch Move to", script: patch(`*** Update File: ${NOTES}/x\n*** Move to: ${NOTES}/y`) },
++  { name: "21 apply_patch shim in scratch", script: patch(`*** Add File: ${NOTES}/x`, `${SCRATCH}\\apply_patch.bat`) },
++  { name: "22 apply_patch into data/permissions", script: patch(`*** Add File: ${HOME}/data/permissions/x`) },
++  { name: "23 git -c alias", script: "git -c alias.x=push --no-optional-locks x" },
++  { name: "24 git -C read repo reset", script: `git -C '${REPO}' reset --hard` },
++  { name: "25 gh attached method", script: "gh api repos/octo/example/issues -XPOST" },
++  { name: "26 gh --method=POST", script: "gh api repos/octo/example/issues --method=POST" },
++  { name: "27 curl attached data", script: "curl.exe -dvalue" },
++  { name: "28 path pwsh -Command", script: `& '${SCRATCH}\\pwsh.exe' -NoProfile -Command 'Get-Date'` },
++  { name: "29 path powershell -Command", script: `& '${SCRATCH}\\powershell.exe' -Command 'Get-Date'` },
++  { name: "30 omitted hardware A, bare", script: "hwtool-a inspect" },
++  { name: "31 omitted hardware B, bare", script: "hwb inspect" },
++  { name: "32 omitted hardware A.exe", script: "hwtool-a.exe inspect" },
++  { name: "33 omitted hardware B.exe by path", script: `& '${SCRATCH}\\hwb.exe' inspect` },
++  { name: "34 node of a file in C:\\Windows", script: "node 'C:\\Windows\\x.js'" },
++  { name: "35 node of AGENTS.md", script: `node '${WORKTREE}\\AGENTS.md'` },
++  { name: "36 long argument, then git push", script: `node '${SCRATCH}\\x.js' '${"a".repeat(16000)}'; git push` },
++  { name: "37 path rm.exe", script: `& '${SCRATCH}\\rm.exe' x` },
++  { name: "38 path ssh.exe", script: `& '${SCRATCH}\\ssh.exe' host.example.org` },
++  { name: "39 Select-String positional path", script: `Get-Content -LiteralPath '${NOTES}\\a' | Select-String 'x' 'C:\\Outside\\b'` },
++  { name: "40 Select-String credential word", script: `Get-Content -LiteralPath '${NOTES}\\a' | Select-String 'password'` },
++  { name: "41 git diff of an outside path", script: "git --no-optional-locks diff -- C:/Outside/a" },
++  { name: "42 -NoProfile wrapper", script: `Get-Content -LiteralPath '${NOTES}\\a'`, wrapper: "-NoProfile", accepted: "S2" },
++  { name: "43 -NoLogo wrapper", script: `Get-Content -LiteralPath '${NOTES}\\a'`, wrapper: "-NoLogo" },
++  { name: "44 local read with -Raw", script: `Get-Content -LiteralPath '${NOTES}\\a' -Raw`, accepted: "S3" },
++  { name: "45 NODE under prefix node", script: "NODE x.js", prefix: ["node"] },
++  { name: "46 python -b under prefix python -B", script: "python -b x.py", prefix: ["python", "-B"] },
++  { name: "47 Select-String abbreviated -Pa", script: `Get-Content -LiteralPath '${NOTES}\\a' | Select-String -Pattern x -Pa 'C:\\Outside\\b'` },
++];
++
++function permitsFor(attempt: Attempt): Permits {
++  const parsed = parseScript(attempt.script);
++  const firsts = parsed.ok ? parsed.statements.flatMap((statement) => (statement.kind === "command" ? [statement.words[0]?.value ?? ""] : [])) : [];
++  const prefixes = attempt.prefix !== undefined ? [attempt.prefix] : firsts.map((word) => [word]);
++  return {
++    version: 1,
++    task: "demo",
++    live: true,
++    writeDirs: ["data/demo"],
++    scratchDirs: [SCRATCH],
++    readRepos: [REPO],
++    netRead: { githubRepos: ["octo/example"], hosts: ["registry.npmjs.org"] },
++    gitLocal: true,
++    exec: prefixes.flatMap((prefix) => (["scratch", "notes", "worktree"] as const).map((place) => ({ in: place, prefix }))),
++    envNames: ["PATH"],
++  };
++}
++
++function judge(attempt: Attempt) {
++  const wrapper = attempt.wrapper === undefined ? "" : ` ${attempt.wrapper}`;
++  const command = `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"${wrapper} -Command '${attempt.script.replace(/'/g, "''")}'`;
++  return match({ provider: "codex", name: "CodexBash", kind: "tool", input: { command, cwd: WORKTREE } }, permitsFor(attempt), CONTEXT);
++}
++
++describe("the review's bypass hunt, round 1", () => {
++  for (const attempt of ATTEMPTS.filter((candidate) => candidate.accepted === undefined)) {
++    it(`relays ${attempt.name}`, () => {
++      const result = judge(attempt);
++      expect(result.verdict, `${result.rule}: ${result.detail}`).toBe("relay");
++    });
++  }
++  for (const attempt of ATTEMPTS.filter((candidate) => candidate.accepted !== undefined)) {
++    it(`allows ${attempt.name} (accepted widening ${attempt.accepted}, spec amendment 2026-10-09)`, () => {
++      expect(judge(attempt).verdict).toBe("allow");
++    });
++  }
++
++  it("has all 47 attempts", () => {
++    expect(ATTEMPTS).toHaveLength(47);
++  });
++});
++
++describe("round 1 fixes", () => {
++  const exec = (prefix: string[], place: "scratch" | "notes" | "worktree" = "worktree"): Permits => ({
++    ...permitsFor({ name: "", script: "Get-Date" }),
++    exec: prefix.length === 0 ? [] : [{ in: place, prefix }],
++  });
++  const run = (script: string, permits: Permits) =>
++    match(
++      { provider: "codex", name: "CodexBash", kind: "tool", input: { command: `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '${script.replace(/'/g, "''")}'`, cwd: WORKTREE } },
++      permits,
++      CONTEXT,
++    );
++
++  it("B1: takes attached and bundled write flags of gh and curl as outward", () => {
++    expect(run("gh api repos/octo/example/issues -XPOST", exec(["gh"])).rule).toBe("never:outward");
++    expect(run("gh api repos/octo/example/issues -ftitle=x", exec(["gh"])).rule).toBe("never:outward");
++    expect(run("curl.exe -dvalue", exec(["curl.exe"])).rule).toBe("never:outward");
++    expect(run("curl.exe -fLd value https://registry.npmjs.org/x", exec(["curl.exe"])).rule).toBe("never:outward");
++    expect(run(`& '${SCRATCH}\\curl.exe' -sXPOST https://registry.npmjs.org/x`, exec([`${SCRATCH}\\curl.exe`])).rule).toBe("never:outward");
++  });
++
++  it("B1: sends a git, gh or npm run by path through its own policy, and through exec as well", () => {
++    const gitPath = `${SCRATCH}\\git.exe`;
++    expect(run(`& '${gitPath}' --no-optional-locks diff --output=result.txt`, exec([gitPath])).rule).toBe("never:project-repo");
++    // Its own policy allows it, and the binary runs from the roots under an exec prefix: tier 2.
++    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject({ verdict: "allow", rule: "exec", tier: 2 });
++    // Its own policy allows it, but no exec prefix names the binary: relayed.
++    expect(run(`& '${gitPath}' --no-optional-locks status`, exec(["node"])).verdict).toBe("relay");
++    const ghPath = `${SCRATCH}\\gh.exe`;
++    expect(run(`& '${ghPath}' api repos/octo/unlisted/pulls`, exec([ghPath])).rule).toBe("never:non-get");
++    const npmPath = `${SCRATCH}\\npm.cmd`;
++    expect(run(`& '${npmPath}' install left-pad@1.3.0 --ignore-scripts`, exec([npmPath])).rule).toBe("no-rule");
++  });
++
++  it("B2: takes a native destructive program with .exe or a path as destructive", () => {
++    expect(run(`& '${SCRATCH}\\rm.exe' x`, exec([`${SCRATCH}\\rm.exe`])).rule).toBe("never:destructive");
++    expect(run("rm.exe x", exec(["rm.exe"])).rule).toBe("never:destructive");
++    expect(run(`& '${SCRATCH}\\rmdir.exe' x`, exec([`${SCRATCH}\\rmdir.exe`])).rule).toBe("never:destructive");
++  });
++
++  it("B4: lets Select-String only filter the pipe, not read a file", () => {
++    const read = `Get-Content -LiteralPath '${NOTES}\\a'`;
++    expect(run(`${read} | Select-String x`, exec([])).verdict).toBe("allow");
++    expect(run(`${read} | Select-String -Pattern x -SimpleMatch -Context 2`, exec([])).verdict).toBe("allow");
++    for (const tail of ["Select-String x y", "Select-String -Pattern x y", "Select-String -Pattern x -Path y", "Select-String -Pattern x -LiteralPath y", "Select-String -Pattern x -Pa y", "Select-String -Pattern x -Encoding utf8"]) {
++      expect(run(`${read} | ${tail}`, exec([])).rule, tail).toBe("never:unparsed");
++    }
++  });
++
++  it("B3: relays a supplement hardware name bare, with .exe, by path, in any case, or named by a prefix", () => {
++    for (const [script, prefix] of [
++      ["hwtool-a inspect", ["hwtool-a"]],
++      ["HWTOOL-A.EXE inspect", ["HWTOOL-A.EXE"]],
++      [`& '${SCRATCH}\\hwb.exe' inspect`, [`${SCRATCH}\\hwb.exe`]],
++      ["uv run hwtool-a inspect", ["uv", "run", "hwtool-a"]],
++    ] as const) {
++      expect(run(script, exec([...prefix])).rule, script).toBe("never:hardware");
++    }
++  });
++
++  it("B3: relays every exec statement when the supplement is missing or invalid, and nothing else", () => {
++    const failClosed = (extraHardware: MatchContext["extraHardware"]) =>
++      match(
++        { provider: "codex", name: "CodexBash", kind: "tool", input: { command: `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command 'node x.js'`, cwd: WORKTREE } },
++        exec(["node"]),
++        { ...CONTEXT, extraHardware },
++      );
++    expect(failClosed(null)).toMatchObject({ verdict: "relay", rule: "never:hardware" });
++    expect(failClosed([]).verdict).toBe("allow");
++    const notes = match(
++      { provider: "codex", name: "CodexBash", kind: "tool", input: { command: `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command 'New-Item -ItemType Directory -Path ''${NOTES}\\x'''`, cwd: WORKTREE } },
++      exec(["node"]),
++      { ...CONTEXT, extraHardware: null },
++    );
++    expect(notes.verdict).toBe("allow");
++  });
++
++  it("B3: reads only a valid version 1 supplement, case-folded and without .exe", () => {
++    expect(parseNeverAutoExtra({ version: 1, neverAuto: { hardware: { commandBasenames: ["Tool.EXE", "b"] } } })).toEqual(["tool", "b"]);
++    for (const bad of [null, {}, { version: 2, neverAuto: { hardware: { commandBasenames: [] } } }, { version: 1, neverAuto: { hardware: { commandBasenames: "x" } } }, { version: 1, neverAuto: { hardware: { commandBasenames: [""] } } }]) {
++      expect(parseNeverAutoExtra(bad)).toBeNull();
++    }
++  });
++
++  it("S3: accepts exactly the listed local-read switches (spec amendment 2026-10-09)", () => {
++    expect(LOCAL_READ_FORMS).toEqual({
++      "get-content": { valued: ["-literalpath", "-path", "-tail", "-totalcount", "-encoding"], switches: ["-raw"] },
++      "get-item": { valued: ["-literalpath", "-path"], switches: [] },
++      "get-childitem": { valued: ["-literalpath", "-path", "-depth"], switches: ["-recurse", "-file", "-directory", "-name"] },
++      "test-path": { valued: ["-literalpath", "-path", "-pathtype"], switches: [] },
++    });
++    const at = `'${NOTES}\\a'`;
++    for (const script of [
++      `Get-Content -LiteralPath ${at} -Raw`,
++      `Get-Content -LiteralPath ${at} -Tail 5`,
++      `Get-Content -LiteralPath ${at} -TotalCount 5`,
++      `Get-Content -LiteralPath ${at} -Encoding utf8`,
++      `Get-ChildItem -LiteralPath ${at} -Recurse -File -Depth 2`,
++      `Get-ChildItem -LiteralPath ${at} -Directory -Name`,
++      `Test-Path -LiteralPath ${at} -PathType Leaf`,
++    ]) {
++      expect(run(script, exec([])).verdict, script).toBe("allow");
++    }
++    expect(run(`Get-Content -LiteralPath ${at} -Stream x`, exec([])).verdict).toBe("relay");
++  });
++
++  it("S1: compares exec prefix tokens exactly, except an absolute program path", () => {
++    expect(run("node x.js", exec(["node"])).verdict).toBe("allow");
++    expect(run("NODE x.js", exec(["node"])).verdict).toBe("relay");
++    expect(run("python -b x.py", exec(["python", "-B"])).verdict).toBe("relay");
++    expect(run("python -B x.py", exec(["python", "-B"])).verdict).toBe("allow");
++    expect(run("uv run --project tools\\check python", exec(["uv", "run", "--project", "tools/check"])).verdict).toBe("relay");
++    // An absolute program path names the same file in any case and with either slash.
++    expect(run(`& '${SCRATCH.toUpperCase()}/tool.exe' x`, exec([`${SCRATCH}\\tool.exe`]))).toMatchObject({ verdict: "allow", rule: "exec" });
++  });
++});
+diff --git a/server/permit-fixtures/never-auto-extra.json b/server/permit-fixtures/never-auto-extra.json
+new file mode 100644
+index 0000000..6138386
+--- /dev/null
++++ b/server/permit-fixtures/never-auto-extra.json
+@@ -0,0 +1,8 @@
++{
++  "version": 1,
++  "neverAuto": {
++    "hardware": {
++      "commandBasenames": ["hwtool-a", "hwb"]
++    }
++  }
++}
 diff --git a/server/permit-match.test.ts b/server/permit-match.test.ts
 new file mode 100644
-index 0000000..d4a8dbf
+index 0000000..354f583
 --- /dev/null
 +++ b/server/permit-match.test.ts
-@@ -0,0 +1,934 @@
+@@ -0,0 +1,935 @@
 +import { describe, expect, it } from "vitest";
 +
 +import {
@@ -1148,6 +1484,7 @@ index 0000000..d4a8dbf
 +    sticky: false,
 +    allowsLastHour: 0,
 +    realpath,
++    extraHardware: [],
 +    ...overrides,
 +  };
 +}
@@ -1945,10 +2282,10 @@ index 0000000..d4a8dbf
 +});
 diff --git a/server/permit-match.ts b/server/permit-match.ts
 new file mode 100644
-index 0000000..f9f9dea
+index 0000000..438ffac
 --- /dev/null
 +++ b/server/permit-match.ts
-@@ -0,0 +1,1314 @@
+@@ -0,0 +1,1403 @@
 +/**
 + * The permission broker's matcher: would a crewmate's permission request be answered `allow` under its
 + * task's permits, or relayed to a person? Pure: no I/O but the injected `realpath`, no clock.
@@ -2054,6 +2391,23 @@ index 0000000..f9f9dea
 +  };
 +}
 +
++/**
++ * The private never-auto supplement (`data/permissions/never-auto-extra.json` in the home, spec amendment
++ * 2026-10-09): hardware command names kept out of this public repository. Its basenames lowercase and
++ * without `.exe`, or null when the file is not a valid version 1 supplement.
++ */
++export function parseNeverAutoExtra(raw: unknown): string[] | null {
++  if (typeof raw !== "object" || raw === null || (raw as { version?: unknown }).version !== 1) return null;
++  const names = (raw as { neverAuto?: { hardware?: { commandBasenames?: unknown } } }).neverAuto?.hardware?.commandBasenames;
++  if (!Array.isArray(names) || !names.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))) return null;
++  return names.map((name: string) => baseName(name));
++}
++
++/** A command word's basename as the supplement compares it: last path part, lowercase, without `.exe`. */
++function baseName(word: string): string {
++  return (word.replace(/\//g, "\\").split("\\").pop() ?? word).toLowerCase().replace(/\.exe$/, "");
++}
++
 +// ---------------------------------------------------------------------------
 +// The request and the answer
 +// ---------------------------------------------------------------------------
@@ -2084,6 +2438,8 @@ index 0000000..f9f9dea
 +  allowsLastHour: number;
 +  /** The real path of an existing path, null when it does not exist. */
 +  realpath: (path: string) => string | null;
++  /** The supplement's hardware basenames (`parseNeverAutoExtra`); null when it is missing or invalid, which relays every exec statement. */
++  extraHardware: readonly string[] | null;
 +}
 +
 +export type Verdict = "allow" | "relay";
@@ -2126,7 +2482,8 @@ index 0000000..f9f9dea
 +
 +/**
 + * The script inside `"<dir>\pwsh.exe" -Command '<script>'` (or `-NoProfile -Command`, which Codex also
-+ * sends and which only runs less), or null when the line is not exactly that.
++ * sends and which only runs less; accepted by the spec amendment of 2026-10-09), or null when the line is
++ * not exactly that.
 + */
 +export function unwrapCommand(command: string, userHome: string): string | null {
 +  const match = /^"([^"]+)\\pwsh\.exe" (?:-NoProfile )?-Command '([\s\S]*)'$/i.exec(command);
@@ -2281,6 +2638,38 @@ index 0000000..f9f9dea
 +  return { call, segments };
 +}
 +
++/**
++ * Select-String reads files given by -Path, -LiteralPath (or any abbreviation) or a second positional
++ * argument. In a pipe it may only filter: its pattern, by -Pattern or as the one positional argument, and
++ * these switches and valued parameters, spelled in full.
++ */
++const SELECT_STRING = {
++  valued: ["-pattern", "-context"],
++  switches: ["-simplematch", "-casesensitive", "-notmatch", "-allmatches", "-quiet", "-list", "-raw"],
++};
++
++function selectStringFilters(args: readonly Word[]): boolean {
++  let pattern = false;
++  for (let index = 0; index < args.length; index += 1) {
++    const word = args[index];
++    if (word === undefined) return false;
++    const value = word.value.toLowerCase();
++    if (!word.quoted && value.startsWith("-")) {
++      if (SELECT_STRING.switches.includes(value)) continue;
++      if (!SELECT_STRING.valued.includes(value) || args[index + 1] === undefined) return false;
++      if (value === "-pattern") {
++        if (pattern) return false;
++        pattern = true;
++      }
++      index += 1;
++      continue;
++    }
++    if (pattern) return false;
++    pattern = true;
++  }
++  return true;
++}
++
 +function parseCommand(text: string): Statement | { reason: string } {
 +  const tokens = tokenize(text);
 +  if ("reason" in tokens) return tokens;
@@ -2310,6 +2699,7 @@ index 0000000..f9f9dea
 +      return { reason: `a pipe into ${name?.value ?? "nothing"}` };
 +    }
 +    if (rest.some((word) => /^-(?:literal)?path$/i.test(word.value))) return { reason: "a pipe that reads a file" };
++    if (name.value.toLowerCase() === "select-string" && !selectStringFilters(rest)) return { reason: "a Select-String that may read a file" };
 +  }
 +  return { kind: "command", call: tokens.call, words, pipes, text };
 +}
@@ -2619,7 +3009,7 @@ index 0000000..f9f9dea
 +  return base === "npm" || base === "npm.cmd" || base === "npm.exe";
 +}
 +
-+function statementHit(statement: Statement): Hit | null {
++function statementHit(statement: Statement, extraHardware: readonly string[] | null): Hit | null {
 +  if (statement.kind === "env") {
 +    if (DANGEROUS_ENV.test(statement.name)) return { id: "system", detail: `sets $env:${statement.name}` };
 +    return null;
@@ -2632,8 +3022,15 @@ index 0000000..f9f9dea
 +  const program = programOf(words);
 +  const values = words.map((word) => word.value.toLowerCase());
 +  const lower = (index: number) => values[index] ?? "";
++  // A native program by path or with .exe is the same program: rm.exe is rm.
++  const native = program.base.replace(/\.(?:exe|com)$/, "");
 +  for (const [id, names] of Object.entries(COMMANDS) as Array<[keyof typeof COMMANDS, ReadonlySet<string>]>) {
-+    if (names.has(program.name) || (program.path && names.has(program.base))) return { id, detail: `runs ${program.base}` };
++    if (names.has(program.name) || names.has(program.base) || names.has(native)) return { id, detail: `runs ${program.base}` };
++  }
++  // The private supplement's hardware names, as any word: bare, with .exe, by path, or run through another program.
++  if (extraHardware !== null) {
++    const listed = words.flatMap((word) => word.parts).find((part) => extraHardware.includes(baseName(part)));
++    if (listed !== undefined) return { id: "hardware", detail: "a hardware tool the never-auto supplement names" };
 +  }
 +  // destructive
 +  const newDirectory =
@@ -2660,7 +3057,8 @@ index 0000000..f9f9dea
 +  if (program.base === "gh" || program.base === "gh.exe") {
 +    const sub = lower(1);
 +    if (sub === "api") {
-+      const writes = values.slice(2).some((value) => /^(?:-x|--method|-f|--field|--raw-field|--input)(?:=|$)/.test(value));
++      // -X and -f/-F take their value attached too (-XPOST, -ftitle=x).
++      const writes = values.slice(2).some((value) => /^-[xf]|^(?:--method|--field|--raw-field|--input)(?:=|$)/.test(value));
 +      if (writes) return { id: "outward", detail: "gh api with a method or fields" };
 +    } else if (!(sub === "pr" && lower(2) === "view")) {
 +      return { id: "outward", detail: `gh ${sub}` };
@@ -2669,7 +3067,8 @@ index 0000000..f9f9dea
 +  if (program.base === "curl" || program.base === "curl.exe") {
 +    const writes = words
 +      .slice(1)
-+      .some((word) => /^(?:-X|--request|-d|--data[\w-]*|-F|--form[\w-]*|-T|--upload-file|--json)(?:=|$)/.test(word.value));
++      // Short options bundle and take their value attached: -dvalue, -XPOST, -fLd value.
++      .some((word) => /^-[A-Za-z]*[XdFT]|^(?:--request|--data[\w-]*|--form[\w-]*|--upload-file|--json)(?:=|$)/.test(word.value));
 +    if (writes) return { id: "outward", detail: "curl with a method or data" };
 +  }
 +  if (["invoke-restmethod", "irm", "invoke-webrequest", "iwr"].includes(program.name)) {
@@ -2774,6 +3173,7 @@ index 0000000..f9f9dea
 +interface RuleContext {
 +  roots: Roots;
 +  permits: Permits;
++  extraHardware: readonly string[] | null;
 +  cwd: string;
 +  cwdRaw: string;
 +}
@@ -2844,15 +3244,21 @@ index 0000000..f9f9dea
 +  return checked.ok ? allow("notes-write", `apply_patch into ${checked.paths.join(", ")}`) : checked.result;
 +}
 +
++/**
++ * The local-read cmdlets and every parameter they may carry. Beyond -LiteralPath and -Path (spec 3.5),
++ * the read-only switches -Raw, -Tail, -TotalCount, -Encoding, -Recurse, -File, -Directory, -Name, -Depth
++ * and -PathType are accepted by the spec amendment of 2026-10-09.
++ */
++export const LOCAL_READ_FORMS: Readonly<Record<string, { valued: string[]; switches: string[] }>> = {
++  "get-content": { valued: ["-literalpath", "-path", "-tail", "-totalcount", "-encoding"], switches: ["-raw"] },
++  "get-item": { valued: ["-literalpath", "-path"], switches: [] },
++  "get-childitem": { valued: ["-literalpath", "-path", "-depth"], switches: ["-recurse", "-file", "-directory", "-name"] },
++  "test-path": { valued: ["-literalpath", "-path", "-pathtype"], switches: [] },
++};
++
 +function localRead(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult | null {
 +  const name = statement.words[0]?.value.toLowerCase() ?? "";
-+  const forms: Record<string, { valued: string[]; switches: string[] }> = {
-+    "get-content": { valued: ["-literalpath", "-path", "-tail", "-totalcount", "-encoding"], switches: ["-raw"] },
-+    "get-item": { valued: ["-literalpath", "-path"], switches: [] },
-+    "get-childitem": { valued: ["-literalpath", "-path", "-depth"], switches: ["-recurse", "-file", "-directory", "-name"] },
-+    "test-path": { valued: ["-literalpath", "-path", "-pathtype"], switches: [] },
-+  };
-+  const form = forms[name];
++  const form = LOCAL_READ_FORMS[name];
 +  if (form === undefined) return null;
 +  const params = cmdletParams(statement.words, form.valued, form.switches);
 +  if (params === null) return noRule(`${name} with other parameters`);
@@ -3101,14 +3507,24 @@ index 0000000..f9f9dea
 +  return { path: candidate };
 +}
 +
++/**
++ * An exec prefix token matches its word exactly: flags, module names and values keep their case. The one
++ * exception is an absolute path, which names the same file in any case and with either slash.
++ */
++function prefixToken(token: string, word: string | undefined): boolean {
++  if (word === undefined) return false;
++  return ABSOLUTE.test(token) ? canon(token) === canon(word) : token === word;
++}
++
 +function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
 +  const words = statement.words;
 +  const roots = rc.roots;
 +  const toolPaths = [roots.homeTools.fmpy, roots.homeTools.privacyCheck];
++  if (rc.extraHardware === null) return refuse("hardware", "the never-auto supplement is missing or invalid, so no exec statement is allowed");
 +  let refusal: StatementResult | null = null;
 +  for (const entry of rc.permits.exec) {
 +    if (entry.prefix.length > words.length) continue;
-+    if (!entry.prefix.every((token, index) => canon(token) === canon(words[index]?.value ?? ""))) continue;
++    if (!entry.prefix.every((token, index) => prefixToken(token, words[index]?.value))) continue;
 +    const place = entry.in === "scratch" ? roots.scratch : entry.in === "worktree" ? [roots.worktree] : roots.writes;
 +    if (!roots.inAny(rc.cwd, place)) {
 +      refusal ??= noRule(`exec ${entry.prefix.join(" ")} outside its ${entry.in} folder`);
@@ -3186,6 +3602,16 @@ index 0000000..f9f9dea
 +    const resolved = rc.roots.resolve(program.name, rc.cwdRaw);
 +    const inRoots = resolved.ok && rc.roots.inAny(resolved.path, [rc.roots.worktree, ...rc.roots.writes, ...rc.roots.scratch]);
 +    if (!inRoots) return refuse("outside", `runs ${program.name}, outside the permitted folders`);
++    // A git, gh, curl or npm install from the roots answers to its own policy first, then runs as exec.
++    const own =
++      program.base === "git" || program.base === "git.exe"
++        ? gitRule(rc, statement)
++        : NETWORK.has(program.base)
++          ? netRead(rc, statement)
++          : isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())
++            ? packageRule(rc, statement)
++            : null;
++    if (own !== null && !own.ok) return own;
 +    return execRule(rc, statement);
 +  }
 +  if (program.base === "git" || program.base === "git.exe") return gitRule(rc, statement);
@@ -3235,7 +3661,7 @@ index 0000000..f9f9dea
 +  if (script === null) return never("unparsed", "not exactly \"<pwsh>\" -Command '<script>'");
 +  if (parsed === null || !parsed.ok) return never("unparsed", parsed?.reason ?? "unparsed");
 +  for (const statement of parsed.statements) {
-+    const hit = statementHit(statement);
++    const hit = statementHit(statement, context.extraHardware);
 +    if (hit !== null) return never(hit.id, hit.detail);
 +  }
 +
@@ -3248,7 +3674,7 @@ index 0000000..f9f9dea
 +  const roots = new Roots(context, permits);
 +  const cwd = roots.cwd(cwdRaw);
 +  if (!cwd.ok) return never(cwd.id, cwd.reason);
-+  const rc: RuleContext = { roots, permits, cwd: cwd.path, cwdRaw };
++  const rc: RuleContext = { roots, permits, extraHardware: context.extraHardware, cwd: cwd.path, cwdRaw };
 +  const results = parsed.statements.map((statement) => ruleFor(rc, statement));
 +  const refused = results.find((result) => !result.ok && result.rule.startsWith("never:")) ?? results.find((result) => !result.ok);
 +  if (refused !== undefined && !refused.ok) {
@@ -3265,10 +3691,10 @@ index 0000000..f9f9dea
 +}
 diff --git a/server/permit-replay.test.ts b/server/permit-replay.test.ts
 new file mode 100644
-index 0000000..603fc8a
+index 0000000..80ece20
 --- /dev/null
 +++ b/server/permit-replay.test.ts
-@@ -0,0 +1,193 @@
+@@ -0,0 +1,203 @@
 +/**
 + * The private replay (spec 3.11 item 8): every command of a labelled corpus of real permission requests
 + * through the matcher under maximal permits. Skipped unless `PERMIT_REPLAY` names the corpus, a JSON
@@ -3294,7 +3720,7 @@ index 0000000..603fc8a
 +
 +import { describe, expect, it } from "vitest";
 +
-+import { match, parseScript, unwrapCommand, type MatchResult, type Permits } from "./permit-match";
++import { match, parseNeverAutoExtra, parseScript, unwrapCommand, type MatchResult, type Permits } from "./permit-match";
 +
 +const CORPUS = process.env.PERMIT_REPLAY ?? "";
 +const FORBIDDEN = /hardware|wsl|destructive|outward|credential/i;
@@ -3404,6 +3830,14 @@ index 0000000..603fc8a
 +  }
 +}
 +
++function readSupplement(home: string): string[] | null {
++  try {
++    return parseNeverAutoExtra(JSON.parse(readFileSync(join(home, "data", "permissions", "never-auto-extra.json"), "utf8")));
++  } catch {
++    return null;
++  }
++}
++
 +function realpath(path: string): string | null {
 +  try {
 +    return realpathSync.native(path);
@@ -3420,6 +3854,8 @@ index 0000000..603fc8a
 +    const userHome = homedir();
 +    const entries = readCorpus(CORPUS);
 +    const permits = maximalPermits(entries, home, userHome);
++    // The home's private supplement, as the broker reads it; never printed.
++    const extraHardware = readSupplement(home);
 +    const byLabel = new Map<string, { total: number; allowed: number; rules: Map<string, number> }>();
 +    const wrong: string[] = [];
 +    let tagged = 0;
@@ -3431,7 +3867,7 @@ index 0000000..603fc8a
 +        result = match(
 +          { provider: "codex", name: "CodexBash", kind: "tool", input: { command, cwd: entry.cwd } },
 +          permits,
-+          { crew: true, task: "replay", mode: "shadow", home, userHome, worktree: entry.cwd, sticky: false, allowsLastHour: 0, realpath },
++          { crew: true, task: "replay", mode: "shadow", home, userHome, worktree: entry.cwd, sticky: false, allowsLastHour: 0, realpath, extraHardware },
 +        );
 +      } catch (error) {
 +        result = { verdict: "relay", rule: "error", tier: null, detail: String(error) };

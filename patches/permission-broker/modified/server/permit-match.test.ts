@@ -137,6 +137,7 @@ function context(overrides: Partial<MatchContext> = {}): MatchContext {
     sticky: false,
     allowsLastHour: 0,
     realpath,
+    extraHardware: [],
     ...overrides,
   };
 }

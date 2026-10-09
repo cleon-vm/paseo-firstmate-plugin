@@ -103,6 +103,23 @@ export function parsePermits(raw: unknown): Permits | null {
   };
 }
 
+/**
+ * The private never-auto supplement (`data/permissions/never-auto-extra.json` in the home, spec amendment
+ * 2026-10-09): hardware command names kept out of this public repository. Its basenames lowercase and
+ * without `.exe`, or null when the file is not a valid version 1 supplement.
+ */
+export function parseNeverAutoExtra(raw: unknown): string[] | null {
+  if (typeof raw !== "object" || raw === null || (raw as { version?: unknown }).version !== 1) return null;
+  const names = (raw as { neverAuto?: { hardware?: { commandBasenames?: unknown } } }).neverAuto?.hardware?.commandBasenames;
+  if (!Array.isArray(names) || !names.every((name) => typeof name === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name))) return null;
+  return names.map((name: string) => baseName(name));
+}
+
+/** A command word's basename as the supplement compares it: last path part, lowercase, without `.exe`. */
+function baseName(word: string): string {
+  return (word.replace(/\//g, "\\").split("\\").pop() ?? word).toLowerCase().replace(/\.exe$/, "");
+}
+
 // ---------------------------------------------------------------------------
 // The request and the answer
 // ---------------------------------------------------------------------------
@@ -133,6 +150,8 @@ export interface MatchContext {
   allowsLastHour: number;
   /** The real path of an existing path, null when it does not exist. */
   realpath: (path: string) => string | null;
+  /** The supplement's hardware basenames (`parseNeverAutoExtra`); null when it is missing or invalid, which relays every exec statement. */
+  extraHardware: readonly string[] | null;
 }
 
 export type Verdict = "allow" | "relay";
@@ -175,7 +194,8 @@ function canon(path: string): string {
 
 /**
  * The script inside `"<dir>\pwsh.exe" -Command '<script>'` (or `-NoProfile -Command`, which Codex also
- * sends and which only runs less), or null when the line is not exactly that.
+ * sends and which only runs less; accepted by the spec amendment of 2026-10-09), or null when the line is
+ * not exactly that.
  */
 export function unwrapCommand(command: string, userHome: string): string | null {
   const match = /^"([^"]+)\\pwsh\.exe" (?:-NoProfile )?-Command '([\s\S]*)'$/i.exec(command);
@@ -330,6 +350,38 @@ function tokenize(text: string): { call: boolean; segments: Word[][] } | { reaso
   return { call, segments };
 }
 
+/**
+ * Select-String reads files given by -Path, -LiteralPath (or any abbreviation) or a second positional
+ * argument. In a pipe it may only filter: its pattern, by -Pattern or as the one positional argument, and
+ * these switches and valued parameters, spelled in full.
+ */
+const SELECT_STRING = {
+  valued: ["-pattern", "-context"],
+  switches: ["-simplematch", "-casesensitive", "-notmatch", "-allmatches", "-quiet", "-list", "-raw"],
+};
+
+function selectStringFilters(args: readonly Word[]): boolean {
+  let pattern = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const word = args[index];
+    if (word === undefined) return false;
+    const value = word.value.toLowerCase();
+    if (!word.quoted && value.startsWith("-")) {
+      if (SELECT_STRING.switches.includes(value)) continue;
+      if (!SELECT_STRING.valued.includes(value) || args[index + 1] === undefined) return false;
+      if (value === "-pattern") {
+        if (pattern) return false;
+        pattern = true;
+      }
+      index += 1;
+      continue;
+    }
+    if (pattern) return false;
+    pattern = true;
+  }
+  return true;
+}
+
 function parseCommand(text: string): Statement | { reason: string } {
   const tokens = tokenize(text);
   if ("reason" in tokens) return tokens;
@@ -359,6 +411,7 @@ function parseCommand(text: string): Statement | { reason: string } {
       return { reason: `a pipe into ${name?.value ?? "nothing"}` };
     }
     if (rest.some((word) => /^-(?:literal)?path$/i.test(word.value))) return { reason: "a pipe that reads a file" };
+    if (name.value.toLowerCase() === "select-string" && !selectStringFilters(rest)) return { reason: "a Select-String that may read a file" };
   }
   return { kind: "command", call: tokens.call, words, pipes, text };
 }
@@ -668,7 +721,7 @@ function isNpm(base: string): boolean {
   return base === "npm" || base === "npm.cmd" || base === "npm.exe";
 }
 
-function statementHit(statement: Statement): Hit | null {
+function statementHit(statement: Statement, extraHardware: readonly string[] | null): Hit | null {
   if (statement.kind === "env") {
     if (DANGEROUS_ENV.test(statement.name)) return { id: "system", detail: `sets $env:${statement.name}` };
     return null;
@@ -681,8 +734,15 @@ function statementHit(statement: Statement): Hit | null {
   const program = programOf(words);
   const values = words.map((word) => word.value.toLowerCase());
   const lower = (index: number) => values[index] ?? "";
+  // A native program by path or with .exe is the same program: rm.exe is rm.
+  const native = program.base.replace(/\.(?:exe|com)$/, "");
   for (const [id, names] of Object.entries(COMMANDS) as Array<[keyof typeof COMMANDS, ReadonlySet<string>]>) {
-    if (names.has(program.name) || (program.path && names.has(program.base))) return { id, detail: `runs ${program.base}` };
+    if (names.has(program.name) || names.has(program.base) || names.has(native)) return { id, detail: `runs ${program.base}` };
+  }
+  // The private supplement's hardware names, as any word: bare, with .exe, by path, or run through another program.
+  if (extraHardware !== null) {
+    const listed = words.flatMap((word) => word.parts).find((part) => extraHardware.includes(baseName(part)));
+    if (listed !== undefined) return { id: "hardware", detail: "a hardware tool the never-auto supplement names" };
   }
   // destructive
   const newDirectory =
@@ -709,7 +769,8 @@ function statementHit(statement: Statement): Hit | null {
   if (program.base === "gh" || program.base === "gh.exe") {
     const sub = lower(1);
     if (sub === "api") {
-      const writes = values.slice(2).some((value) => /^(?:-x|--method|-f|--field|--raw-field|--input)(?:=|$)/.test(value));
+      // -X and -f/-F take their value attached too (-XPOST, -ftitle=x).
+      const writes = values.slice(2).some((value) => /^-[xf]|^(?:--method|--field|--raw-field|--input)(?:=|$)/.test(value));
       if (writes) return { id: "outward", detail: "gh api with a method or fields" };
     } else if (!(sub === "pr" && lower(2) === "view")) {
       return { id: "outward", detail: `gh ${sub}` };
@@ -718,7 +779,8 @@ function statementHit(statement: Statement): Hit | null {
   if (program.base === "curl" || program.base === "curl.exe") {
     const writes = words
       .slice(1)
-      .some((word) => /^(?:-X|--request|-d|--data[\w-]*|-F|--form[\w-]*|-T|--upload-file|--json)(?:=|$)/.test(word.value));
+      // Short options bundle and take their value attached: -dvalue, -XPOST, -fLd value.
+      .some((word) => /^-[A-Za-z]*[XdFT]|^(?:--request|--data[\w-]*|--form[\w-]*|--upload-file|--json)(?:=|$)/.test(word.value));
     if (writes) return { id: "outward", detail: "curl with a method or data" };
   }
   if (["invoke-restmethod", "irm", "invoke-webrequest", "iwr"].includes(program.name)) {
@@ -823,6 +885,7 @@ function valueOf(params: Map<string, Word | true>, name: string): Word | null {
 interface RuleContext {
   roots: Roots;
   permits: Permits;
+  extraHardware: readonly string[] | null;
   cwd: string;
   cwdRaw: string;
 }
@@ -893,15 +956,21 @@ function applyPatch(rc: RuleContext, statement: Extract<Statement, { kind: "patc
   return checked.ok ? allow("notes-write", `apply_patch into ${checked.paths.join(", ")}`) : checked.result;
 }
 
+/**
+ * The local-read cmdlets and every parameter they may carry. Beyond -LiteralPath and -Path (spec 3.5),
+ * the read-only switches -Raw, -Tail, -TotalCount, -Encoding, -Recurse, -File, -Directory, -Name, -Depth
+ * and -PathType are accepted by the spec amendment of 2026-10-09.
+ */
+export const LOCAL_READ_FORMS: Readonly<Record<string, { valued: string[]; switches: string[] }>> = {
+  "get-content": { valued: ["-literalpath", "-path", "-tail", "-totalcount", "-encoding"], switches: ["-raw"] },
+  "get-item": { valued: ["-literalpath", "-path"], switches: [] },
+  "get-childitem": { valued: ["-literalpath", "-path", "-depth"], switches: ["-recurse", "-file", "-directory", "-name"] },
+  "test-path": { valued: ["-literalpath", "-path", "-pathtype"], switches: [] },
+};
+
 function localRead(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult | null {
   const name = statement.words[0]?.value.toLowerCase() ?? "";
-  const forms: Record<string, { valued: string[]; switches: string[] }> = {
-    "get-content": { valued: ["-literalpath", "-path", "-tail", "-totalcount", "-encoding"], switches: ["-raw"] },
-    "get-item": { valued: ["-literalpath", "-path"], switches: [] },
-    "get-childitem": { valued: ["-literalpath", "-path", "-depth"], switches: ["-recurse", "-file", "-directory", "-name"] },
-    "test-path": { valued: ["-literalpath", "-path", "-pathtype"], switches: [] },
-  };
-  const form = forms[name];
+  const form = LOCAL_READ_FORMS[name];
   if (form === undefined) return null;
   const params = cmdletParams(statement.words, form.valued, form.switches);
   if (params === null) return noRule(`${name} with other parameters`);
@@ -1150,14 +1219,24 @@ function pathPart(value: string): { path: string } | { url: true } | { attached:
   return { path: candidate };
 }
 
+/**
+ * An exec prefix token matches its word exactly: flags, module names and values keep their case. The one
+ * exception is an absolute path, which names the same file in any case and with either slash.
+ */
+function prefixToken(token: string, word: string | undefined): boolean {
+  if (word === undefined) return false;
+  return ABSOLUTE.test(token) ? canon(token) === canon(word) : token === word;
+}
+
 function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
   const words = statement.words;
   const roots = rc.roots;
   const toolPaths = [roots.homeTools.fmpy, roots.homeTools.privacyCheck];
+  if (rc.extraHardware === null) return refuse("hardware", "the never-auto supplement is missing or invalid, so no exec statement is allowed");
   let refusal: StatementResult | null = null;
   for (const entry of rc.permits.exec) {
     if (entry.prefix.length > words.length) continue;
-    if (!entry.prefix.every((token, index) => canon(token) === canon(words[index]?.value ?? ""))) continue;
+    if (!entry.prefix.every((token, index) => prefixToken(token, words[index]?.value))) continue;
     const place = entry.in === "scratch" ? roots.scratch : entry.in === "worktree" ? [roots.worktree] : roots.writes;
     if (!roots.inAny(rc.cwd, place)) {
       refusal ??= noRule(`exec ${entry.prefix.join(" ")} outside its ${entry.in} folder`);
@@ -1235,6 +1314,16 @@ function ruleFor(rc: RuleContext, statement: Statement): StatementResult {
     const resolved = rc.roots.resolve(program.name, rc.cwdRaw);
     const inRoots = resolved.ok && rc.roots.inAny(resolved.path, [rc.roots.worktree, ...rc.roots.writes, ...rc.roots.scratch]);
     if (!inRoots) return refuse("outside", `runs ${program.name}, outside the permitted folders`);
+    // A git, gh, curl or npm install from the roots answers to its own policy first, then runs as exec.
+    const own =
+      program.base === "git" || program.base === "git.exe"
+        ? gitRule(rc, statement)
+        : NETWORK.has(program.base)
+          ? netRead(rc, statement)
+          : isNpm(program.base) && NPM_INSTALL.has((words[1]?.value ?? "").toLowerCase())
+            ? packageRule(rc, statement)
+            : null;
+    if (own !== null && !own.ok) return own;
     return execRule(rc, statement);
   }
   if (program.base === "git" || program.base === "git.exe") return gitRule(rc, statement);
@@ -1284,7 +1373,7 @@ export function match(request: PermitRequest, permitsRaw: unknown, context: Matc
   if (script === null) return never("unparsed", "not exactly \"<pwsh>\" -Command '<script>'");
   if (parsed === null || !parsed.ok) return never("unparsed", parsed?.reason ?? "unparsed");
   for (const statement of parsed.statements) {
-    const hit = statementHit(statement);
+    const hit = statementHit(statement, context.extraHardware);
     if (hit !== null) return never(hit.id, hit.detail);
   }
 
@@ -1297,7 +1386,7 @@ export function match(request: PermitRequest, permitsRaw: unknown, context: Matc
   const roots = new Roots(context, permits);
   const cwd = roots.cwd(cwdRaw);
   if (!cwd.ok) return never(cwd.id, cwd.reason);
-  const rc: RuleContext = { roots, permits, cwd: cwd.path, cwdRaw };
+  const rc: RuleContext = { roots, permits, extraHardware: context.extraHardware, cwd: cwd.path, cwdRaw };
   const results = parsed.statements.map((statement) => ruleFor(rc, statement));
   const refused = results.find((result) => !result.ok && result.rule.startsWith("never:")) ?? results.find((result) => !result.ok);
   if (refused !== undefined && !refused.ok) {
