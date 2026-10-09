@@ -222,6 +222,10 @@ export type Fleet = z.infer<typeof FleetSchema>;
 // The daemon's own file: what handlers act on
 // ---------------------------------------------------------------------------
 
+export const PERMISSION_BROKER_MODES = ["off", "shadow", "live"] as const;
+export const PermissionBrokerModeSchema = z.enum(PERMISSION_BROKER_MODES);
+export type PermissionBrokerMode = z.infer<typeof PermissionBrokerModeSchema>;
+
 export const FirstmateConfigSchema = z.object({
   /** The first mate's home; empty means `$PASEO_HOME/plugin-data/firstmate/home`. */
   home: z.string().default(""),
@@ -235,6 +239,12 @@ export const FirstmateConfigSchema = z.object({
   crewModeId: z.string().default(""),
   /** Watch scripts the captain has switched off on the board, by file name. */
   disabledWatches: z.array(z.string()).default([]),
+  /**
+   * What the permission broker does with crew permission requests (server/permission-broker.ts): `off`
+   * registers nothing; `shadow` logs the answer it would give and the one people gave. In this build
+   * `live` answers nothing either; it logs as shadow does, as live mode would judge.
+   */
+  permissionBroker: PermissionBrokerModeSchema.default("off"),
 });
 export type FirstmateConfig = z.infer<typeof FirstmateConfigSchema>;
 
