@@ -58,7 +58,7 @@ diff --git a/server/permission-broker.test.ts b/server/permission-broker.test.ts
 new file mode 100644
 --- /dev/null
 +++ b/server/permission-broker.test.ts
-@@ -0,0 +1,799 @@
+@@ -0,0 +1,929 @@
 +import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
 +import { readFileSync, realpathSync } from "node:fs";
 +import { tmpdir } from "node:os";
@@ -67,7 +67,7 @@ new file mode 100644
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +
 +import type { FirstmateConfig } from "../shared/fleet";
-+import { MAX_LOGGED_COMMAND, readBrokerState, redact, registerPermissionBroker } from "./permission-broker";
++import { MAX_LOGGED_COMMAND, PermissionBroker, readBrokerState, redact, registerPermissionBroker, type BrokerState } from "./permission-broker";
 +import { NEVER_AUTO } from "./permit-rules";
 +
 +// A synthetic machine inside a temporary folder: every name and repository here is made up.
@@ -430,6 +430,136 @@ new file mode 100644
 +// ---------------------------------------------------------------------------
 +
 +describe("round 1 review regressions", () => {
++  it.each([
++    ["python '-cprint(1)'", "python"],
++    ["python '-Icprint(1)'", "python"],
++    ["node '-econsole.log(1)'", "node"],
++  ])("never sends allow for the hunter's attached inline form %s", async (script, interpreter) => {
++    const s = await setup("live");
++    await writePermits(s.m, { live: true, exec: [{ in: "worktree", prefix: [interpreter] }] });
++    await writeFile(join(s.m.home, "data", "permissions", "never-auto-extra.json"), await readFile(join(import.meta.dirname, "permit-fixtures", "never-auto-extra.json")));
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, `${interpreter} example.js`, { requestId: "control" }), s.paseo);
++    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["control"]);
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: "inline" }), s.paseo);
++    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["control"]);
++    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "relay", answered: false });
++  });
++
++  it.each([
++    "git add -- example.txt", "git branch example",
++    "git --no-optional-locks status", "git --no-optional-locks diff",
++    "git --no-optional-locks log", "git --no-optional-locks show",
++    "git --no-optional-locks rev-parse HEAD",
++  ])("relays repository-controlled execution in live: %s", async (script) => {
++    const s = await setup("live");
++    await writePermits(s.m, { live: true, exec: [{ in: "worktree", prefix: ["git"] }] });
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script), s.paseo);
++    expect(s.daemon.answers).toEqual([]);
++    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "relay", answered: false });
++    s.config.current = { ...s.config.current, permissionBroker: "shadow" };
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: "shadow" }), s.paseo);
++    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "allow", rule: "git-local", answered: false });
++  });
++
++  it.each(["log", "diff", "show", "rev-parse", "status", "archive"])("relays %s in a read repo in live, retaining its shadow judgment", async (verb) => {
++    const s = await setup("live");
++    const repo = join(s.m.root, "review-repo");
++    await mkdir(repo);
++    await writePermits(s.m, { live: true, readRepos: [repo] });
++    const args = verb === "archive" ? `HEAD --output='${s.m.notes}\\example.zip'` : "HEAD";
++    const script = `git --no-optional-locks -C '${repo}' ${verb} ${args}`;
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script), s.paseo);
++    expect(s.daemon.answers).toEqual([]);
++    s.config.current = { ...s.config.current, permissionBroker: "shadow" };
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: "shadow" }), s.paseo);
++    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "allow", rule: "git-read", answered: false });
++  });
++
++  it.each(["duplicate", "rate", "agents"])("coordinates overlapping file-store instances for %s", async (kind) => {
++    const s = await setup("live");
++    await writePermits(s.m, { live: true });
++    if (kind === "rate") {
++      await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
++      await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: { "crew-1": Array(119).fill(new Date(T0 - 1).toISOString()) } }));
++    }
++    const other = registerPermissionBroker(new FakeServer() as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0, host: { labels: async () => s.daemon.labels.get("crew-1")! } });
++    await other.ready;
++    await Promise.all([s.wired.broker.snapshot(), other.broker.snapshot()]);
++    const first = permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "first" });
++    const second = permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: kind === "duplicate" ? "first" : "second", id: kind === "agents" ? "crew-2" : "crew-1" });
++    await Promise.all([
++      s.server.emit("agent.permission_requested", first, s.paseo),
++      other.broker.onPermissionRequested(second as never, s.paseo as never),
++    ]);
++    expect(s.daemon.answers).toHaveLength(kind === "agents" ? 2 : 1);
++    const state = await readBrokerState(s.m.stateFile);
++    expect(state.allows["crew-1"]).toHaveLength(kind === "rate" ? 120 : 1);
++    expect(state.attempts?.["crew-1"]).toEqual(["first"]);
++    if (kind === "agents") {
++      expect(state.allows["crew-2"]).toHaveLength(1);
++      expect(state.attempts?.["crew-2"]).toEqual(["second"]);
++    }
++    other.stop();
++  });
++
++  it("invalidates an in-flight request on stop before its SDK call", async () => {
++    let s: Setup;
++    let stopped = false;
++    s = await setup("live", { realpath: (path) => {
++      if (!stopped && path.endsWith("review-scratch-1")) {
++        stopped = true;
++        s.wired.stop();
++      }
++      try { return realpathSync.native(path); } catch { return null; }
++    } });
++    await writePermits(s.m, { live: true });
++    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
++    expect(stopped).toBe(true);
++    expect(s.daemon.answers).toEqual([]);
++    expect((await s.lines()).at(-1)).toMatchObject({ rule: "stopped", answered: false });
++  });
++
++  it.each(["duplicate", "rate"])("coordinates %s across reloaded modules wrapping the same custom store", async (kind) => {
++    const s = await setup("live");
++    await writePermits(s.m, { live: true });
++    let saved: BrokerState = { sticky: {}, allows: kind === "rate" ? { "crew-1": Array(119).fill(new Date(T0 - 1).toISOString()) } : {} };
++    const options = () => ({
++      host: { labels: async () => s.daemon.labels.get("crew-1")! },
++      store: { load: async () => structuredClone(saved), save: async (state: BrokerState) => { saved = structuredClone(state); } },
++      readConfig: async () => s.config.current, userHome: s.m.user, now: () => T0,
++      append: async () => undefined,
++    });
++    const old = new PermissionBroker(options());
++    vi.resetModules();
++    const { PermissionBroker: ReloadedBroker } = await import("./permission-broker");
++    const reloaded = new ReloadedBroker(options());
++    await Promise.all([old.snapshot(), reloaded.snapshot()]);
++    await Promise.all([
++      old.onPermissionRequested(permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "first" }) as never, s.paseo as never),
++      reloaded.onPermissionRequested(permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: kind === "duplicate" ? "first" : "second" }) as never, s.paseo as never),
++    ]);
++    expect(s.daemon.answers).toHaveLength(1);
++    expect(saved.allows["crew-1"]).toHaveLength(kind === "rate" ? 120 : 1);
++    expect(saved.attempts?.["crew-1"]).toEqual(["first"]);
++  });
++
++  it("invalidates queued work on stop while an already-sent SDK call reaches its deadline", async () => {
++    const s = await setup("live");
++    await writePermits(s.m, { live: true });
++    s.daemon.answerPending = true;
++    const started = new Promise<void>((resolve) => s.daemon.answerStarted.mockImplementation(resolve));
++    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
++    const first = s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "sent" }), s.paseo);
++    await started;
++    const queued = s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "queued" }), s.paseo);
++    s.wired.stop();
++    await vi.advanceTimersByTimeAsync(10_000);
++    await Promise.all([first, queued]);
++    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["sent"]);
++    expect((await s.lines()).map((line) => line.requestId)).toEqual(["sent"]);
++    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toEqual(["sent"]);
++  });
++
 +  it.each(["missing", "live:false", "invalid", "other-task"])("keeps destructive stickiness under %s permits through reload", async (initial) => {
 +    const s = await setup("live");
 +    if (initial === "live:false") await writePermits(s.m);
@@ -862,7 +992,7 @@ diff --git a/server/permission-broker.ts b/server/permission-broker.ts
 new file mode 100644
 --- /dev/null
 +++ b/server/permission-broker.ts
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,607 @@
 +/**
 + * The permission broker checks crew requests against task permits and the never-auto list. Shadow
 + * logs without answering. Live, with live permits, reserves the request durably, repeats every gate
@@ -892,7 +1022,7 @@ new file mode 100644
 +import { realpathSync } from "node:fs";
 +import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 +import { homedir } from "node:os";
-+import { dirname, join } from "node:path";
++import { dirname, join, resolve } from "node:path";
 +
 +import type { PluginLifecycleEvents, PluginLifecycleRegistration } from "@getpaseo/plugin/server";
 +
@@ -933,6 +1063,8 @@ new file mode 100644
 +}
 +
 +export interface BrokerStore {
++  /** Stable storage identity across reloads. Custom stores without a key share one conservative queue. */
++  key?: string;
 +  load(): Promise<BrokerState>;
 +  save(state: BrokerState): Promise<void>;
 +}
@@ -995,6 +1127,16 @@ new file mode 100644
 +  }
 +}
 +
++interface BrokerCoordination {
++  run: typeof serialized;
++  pendingSticky: Map<string, Map<string, { at: string; reason: string }>>;
++}
++
++// Retain the first queue function even when a plugin reload evaluates another copy of this module.
++const COORDINATION = Symbol.for("firstmate.permission-broker.coordination");
++const coordination = (globalThis as typeof globalThis & { [key: symbol]: BrokerCoordination | undefined })[COORDINATION]
++  ??= { run: serialized, pendingSticky: new Map() };
++
 +/** The SDK has no per-call timeout or cancellation; stop waiting, never resend. */
 +async function answerOnce(paseo: PaseoApi, agentId: string, requestId: string): Promise<void> {
 +  let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1017,10 +1159,9 @@ new file mode 100644
 +}
 +
 +export class PermissionBroker {
-+  private readonly queueKey = randomUUID();
++  private readonly queueKey: string;
++  private stopped = false;
 +  private readonly sent = new Map<string, number>();
-+  private state: BrokerState | null = null;
-+  private loading: Promise<BrokerState> | null = null;
 +  private readonly crew = new Map<string, CrewFacts | null>();
 +  private lastLogError = Number.NEGATIVE_INFINITY;
 +  private readonly host: BrokerHost;
@@ -1032,6 +1173,7 @@ new file mode 100644
 +  private readonly userHome: string;
 +
 +  constructor(options: PermissionBrokerOptions) {
++    this.queueKey = `permission-broker:${options.store.key ?? "custom-stores"}`;
 +    this.host = options.host;
 +    this.store = options.store;
 +    this.readConfig = options.readConfig;
@@ -1061,10 +1203,16 @@ new file mode 100644
 +  }
 +
 +  async onPermissionRequested(event: PluginLifecycleEvents["agent.permission_requested"], paseo?: PaseoApi): Promise<void> {
-+    return serialized(`${this.queueKey}:${event.agent.id}`, () => this.request(event, paseo));
++    return coordination.run(this.queueKey, () => this.request(event, paseo));
++  }
++
++  /** Invalidates queued and in-flight work before an answer; an SDK call already sent cannot be recalled. */
++  stop(): void {
++    this.stopped = true;
 +  }
 +
 +  private async request(event: PluginLifecycleEvents["agent.permission_requested"], paseo?: PaseoApi): Promise<void> {
++    if (this.stopped) return;
 +    const found = await this.crewmate(event.agent.id);
 +    if (found === null) return;
 +    const { config, facts } = found;
@@ -1090,7 +1238,7 @@ new file mode 100644
 +      home,
 +      userHome: this.userHome,
 +      worktree: event.agent.cwd,
-+      sticky: state.sticky[agentId] !== undefined,
++      sticky: state.sticky[agentId] !== undefined || this.pendingSticky(agentId),
 +      allowsLastHour: recent.length,
 +      realpath: mode === "live" ? recordPath : this.realpath,
 +      extraHardware,
@@ -1131,7 +1279,7 @@ new file mode 100644
 +      state.attempts[agentId] = [...(state.attempts[agentId] ?? []), event.request.id];
 +      if (state.attempts[agentId]!.length >= MAX_ATTEMPTS_PER_AGENT) state.attempts[agentId] = null;
 +    }
-+    const saved = await this.persist(now);
++    const saved = await this.persist(state, now);
 +    if (!saved && mode === "live" && result.verdict === "allow") {
 +      result = { verdict: "relay", rule: "state-error", tier: null, detail: "the answer reservation could not be saved" };
 +    }
@@ -1149,7 +1297,7 @@ new file mode 100644
 +        try {
 +          result = match(event.request, fresh.raw, {
 +            crew: true, task: facts.task, mode: "live", home, userHome: this.userHome,
-+            worktree: event.agent.cwd, sticky: state.sticky[agentId] !== undefined,
++            worktree: event.agent.cwd, sticky: state.sticky[agentId] !== undefined || this.pendingSticky(agentId),
 +            allowsLastHour: recent.length, extraHardware: hardware,
 +            realpath: (path) => {
 +              const real = this.realpath(path);
@@ -1165,6 +1313,7 @@ new file mode 100644
 +
 +    let answered = false;
 +    let answerError: string | undefined;
++    if (this.stopped) result = { verdict: "relay", rule: "stopped", tier: null, detail: "the broker stopped before answering" };
 +    if (mode === "live" && result.verdict === "allow") {
 +      try {
 +        if (paseo === undefined) throw new Error("Paseo unavailable");
@@ -1237,10 +1386,23 @@ new file mode 100644
 +  }
 +
 +  private async makeSticky(agentId: string, at: string, reason: string, now: number): Promise<void> {
-+    const state = await this.load();
-+    if (state.sticky[agentId] !== undefined) return;
-+    state.sticky[agentId] = { at, reason };
-+    await this.persist(now);
++    const pending = coordination.pendingSticky.get(this.queueKey) ?? new Map();
++    coordination.pendingSticky.set(this.queueKey, pending);
++    const mark = pending.get(agentId) ?? { at, reason };
++    pending.set(agentId, mark);
++    // A refusal must be visible to a request holding the queue before its durable write can run.
++    await coordination.run(this.queueKey, async () => {
++      const state = await this.load();
++      state.sticky[agentId] ??= mark;
++      if (await this.persist(state, now)) {
++        if (pending.get(agentId) === mark) pending.delete(agentId);
++        if (pending.size === 0 && coordination.pendingSticky.get(this.queueKey) === pending) coordination.pendingSticky.delete(this.queueKey);
++      }
++    });
++  }
++
++  private pendingSticky(agentId: string): boolean {
++    return coordination.pendingSticky.get(this.queueKey)?.has(agentId) ?? false;
 +  }
 +
 +  /**
@@ -1287,17 +1449,10 @@ new file mode 100644
 +  }
 +
 +  private load(): Promise<BrokerState> {
-+    if (this.state !== null) return Promise.resolve(this.state);
-+    this.loading ??= this.store.load().then((state) => {
-+      this.state = state;
-+      return state;
-+    });
-+    return this.loading;
++    return this.store.load();
 +  }
 +
-+  private async persist(now: number): Promise<boolean> {
-+    const state = this.state;
-+    if (state === null) return false;
++  private async persist(state: BrokerState, now: number): Promise<boolean> {
 +    // Sticky marks are never pruned by age: an agent stays sticky for its whole life (spec 3.7).
 +    for (const [agentId, times] of Object.entries(state.allows)) {
 +      const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
@@ -1352,7 +1507,9 @@ new file mode 100644
 +
 +/** `permission-broker.json`, written whole to a temporary file and renamed into place. */
 +export function brokerFileStore(path: string): BrokerStore {
++  const absolute = resolve(path);
 +  return {
++    key: process.platform === "win32" ? absolute.toLowerCase() : absolute,
 +    load: () => readBrokerState(path),
 +    save: (state) =>
 +      serialized(path, async () => {
@@ -1437,6 +1594,7 @@ new file mode 100644
 +    ready,
 +    stop() {
 +      stopped = true;
++      broker.stop();
 +      offs.forEach((off) => off());
 +      offs = [];
 +    },
@@ -1446,7 +1604,7 @@ diff --git a/server/permit-bypass.test.ts b/server/permit-bypass.test.ts
 new file mode 100644
 --- /dev/null
 +++ b/server/permit-bypass.test.ts
-@@ -0,0 +1,325 @@
+@@ -0,0 +1,328 @@
 +/**
 + * The review's bypass hunt (round 1), kept as regression tests: 47 commands that a maximal permits file
 + * must still relay. Each case gets an exec entry in every place for the first word of each of its
@@ -1661,8 +1819,11 @@ new file mode 100644
 +  it("B1: sends a git, gh or npm run by path through its own policy, and through exec as well", () => {
 +    const gitPath = `${SCRATCH}\\git.exe`;
 +    expect(run(`& '${gitPath}' --no-optional-locks diff --output=result.txt`, exec([gitPath])).rule).toBe("never:project-repo");
-+    // Its own policy allows it, and the binary runs from the roots under an exec prefix: tier 2.
-+    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject({ verdict: "allow", rule: "exec", tier: 2 });
++    // Shadow judges the rooted binary's exact prefix as tier 2. Live requires a person for
++    // repository-controlled helpers even when an exec prefix names the binary.
++    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject(mode === "live"
++      ? { verdict: "relay", rule: "no-rule", tier: null }
++      : { verdict: "allow", rule: "exec", tier: 2 });
 +    // Its own policy allows it, but no exec prefix names the binary: relayed.
 +    expect(run(`& '${gitPath}' --no-optional-locks status`, exec(["node"])).verdict).toBe("relay");
 +    const ghPath = `${SCRATCH}\\gh.exe`;
@@ -2729,7 +2890,7 @@ diff --git a/server/permit-match.ts b/server/permit-match.ts
 new file mode 100644
 --- /dev/null
 +++ b/server/permit-match.ts
-@@ -0,0 +1,1413 @@
+@@ -0,0 +1,1418 @@
 +/**
 + * The permission broker's matcher: would a crewmate's permission request be answered `allow` under its
 + * task's permits, or relayed to a person? Pure: no I/O but the injected `realpath`, no clock.
@@ -3859,6 +4020,11 @@ new file mode 100644
 +  if (git.other.some((option) => /^--(?:git-dir|work-tree)/.test(option))) return refuse("project-repo", "git with --git-dir or --work-tree");
 +  if (["fetch", "pull", "ls-remote", "submodule"].includes(git.sub)) return refuse("non-get", `git ${git.sub}`);
 +  if (git.sub === "clone") return gitClone(rc, git);
++  // Read verbs can run fsmonitor, external diff or archive helpers; add/branch can run filters
++  // and reference hooks. Optional-lock suppression does not disable repository-controlled code.
++  const repositoryAllow = (rule: "git-local" | "git-read", detail: string): StatementResult => rc.mode === "live"
++    ? noRule("git repository hooks and helpers require a person in live mode")
++    : allow(rule, detail);
 +  const roots = rc.roots;
 +  if (git.dir !== null) {
 +    const dir = roots.resolve(git.dir, rc.cwdRaw);
@@ -3869,7 +4035,7 @@ new file mode 100644
 +    if (!git.noOptionalLocks || git.other.length > 0) return refuse("project-repo", "git -C without --no-optional-locks alone");
 +    if (READ_VERBS.has(git.sub)) {
 +      const bad = gitReadArgs(rc, git, repo, git.dir);
-+      return bad ?? allow("git-read", `git ${git.sub} in ${repo}`);
++      return bad ?? repositoryAllow("git-read", `git ${git.sub} in ${repo}`);
 +    }
 +    if (git.sub === "archive") {
 +      let output: string | null = null;
@@ -3887,7 +4053,7 @@ new file mode 100644
 +      }
 +      if (output === null || rev === null) return refuse("project-repo", "git archive without a rev and -o");
 +      const checked = checkAll(rc, [output], "write");
-+      return checked.ok ? allow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
++      return checked.ok ? repositoryAllow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
 +    }
 +    return refuse("project-repo", `git ${git.sub} in the read-only ${repo}`);
 +  }
@@ -3899,14 +4065,14 @@ new file mode 100644
 +  const args = git.args.map((word) => word.value);
 +  if (git.noOptionalLocks && git.other.length === 0 && READ_VERBS.has(git.sub)) {
 +    const bad = gitReadArgs(rc, git, roots.worktree, rc.cwdRaw);
-+    return bad ?? allow("git-local", `git ${git.sub}`);
++    return bad ?? repositoryAllow("git-local", `git ${git.sub}`);
 +  }
 +  if (git.other.length > 0 || git.noOptionalLocks) return noRule(`git ${git.other.join(" ")} ${git.sub}`);
 +  if (git.sub === "add") {
 +    const rest = args[0] === "--dry-run" ? args.slice(1) : args;
 +    if (rest[0] !== "--" || rest.length < 2) return noRule("git add other than [--dry-run] -- <paths>");
 +    const checked = checkAll(rc, rest.slice(1), "read", [roots.worktree]);
-+    return checked.ok ? allow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
++    return checked.ok ? repositoryAllow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
 +  }
 +  if (git.sub === "commit") {
 +    if (rc.mode === "live") return noRule("git commit may execute crew-controlled hooks; requires a person in live mode");
@@ -3921,7 +4087,7 @@ new file mode 100644
 +      return noRule("git branch other than <name> [<rev>]");
 +    }
 +    if (args.some((arg) => arg.includes(".."))) return noRule("git branch with ..");
-+    return allow("git-local", `git branch ${args[0]}`);
++    return repositoryAllow("git-local", `git branch ${args[0]}`);
 +  }
 +  return noRule(`git ${git.sub}`);
 +}

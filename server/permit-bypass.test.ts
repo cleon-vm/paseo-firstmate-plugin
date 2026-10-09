@@ -212,8 +212,11 @@ describe.each(["shadow", "live"] as const)("round 1 fixes (%s)", (mode) => {
   it("B1: sends a git, gh or npm run by path through its own policy, and through exec as well", () => {
     const gitPath = `${SCRATCH}\\git.exe`;
     expect(run(`& '${gitPath}' --no-optional-locks diff --output=result.txt`, exec([gitPath])).rule).toBe("never:project-repo");
-    // Its own policy allows it, and the binary runs from the roots under an exec prefix: tier 2.
-    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject({ verdict: "allow", rule: "exec", tier: 2 });
+    // Shadow judges the rooted binary's exact prefix as tier 2. Live requires a person for
+    // repository-controlled helpers even when an exec prefix names the binary.
+    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject(mode === "live"
+      ? { verdict: "relay", rule: "no-rule", tier: null }
+      : { verdict: "allow", rule: "exec", tier: 2 });
     // Its own policy allows it, but no exec prefix names the binary: relayed.
     expect(run(`& '${gitPath}' --no-optional-locks status`, exec(["node"])).verdict).toBe("relay");
     const ghPath = `${SCRATCH}\\gh.exe`;

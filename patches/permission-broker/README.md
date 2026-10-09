@@ -36,11 +36,14 @@ matching request once with `allow`. It never denies a request or sends a message
   retain its identity. A change during broker I/O relays. There is no await between those final path
   checks and sending allow. Paseo cannot lock paths through the command's eventual execution; a path
   replacement after the SDK call remains a limitation of this API.
-  Live relays `git commit` because crew-controlled hooks can execute arbitrary code, and inline interpreter
+  Live relays repository Git operations (`add`, `branch`, `commit`, the read verbs and `archive`) because
+  hooks, filters, fsmonitor, external diff and archive helpers can execute repository-controlled code.
+  `--no-optional-locks` does not disable those helpers. Shadow retains those judgments. Live also relays inline interpreter
   switches such as `-c`, `-e`, `-p`, attached code and bundled short forms, `--eval`, and `deno eval`
   (including through a launcher or with global options); shadow still logs them. Named script/test
-  exec prefixes and pinned package installs remain opt-in tier 2. Read-only git remains confined to
-  literal `readRepos`. D2(a) and D3(a) were accepted; neither rule kind is disabled wholesale.
+  exec prefixes and pinned package installs remain opt-in tier 2. Shadow read-only git remains confined to
+  literal `readRepos`. D2(a) and D3(a) were accepted; the live Git forms above now require a person
+  pending an invocation proven to disable implicit execution. The existing permit-scoped clone rule remains.
 - **The never-auto list** (`server/permit-rules.ts`) is data: each entry has an id, a reason, its
   patterns and command names, and the cases that prove it. It is checked before any rule, against the
   script and against each statement: `not-crew`, `no-permits`, `not-v1`, `destructive`, `outward`,
@@ -68,12 +71,17 @@ matching request once with `allow`. It never denies a request or sends a message
   most once an hour and changes nothing else. `answered` records SDK success; a failure records
   `answered: false` and `answerError` with only the error class. Resolution `byBroker` requires an allow
   sent for that agent/request in the preceding thirty seconds.
-- **Live answering.** Crew/task, live permits, never-auto, then rule matching, in that order. A per-agent
-  queue reserves each matching request in durable state before the SDK call; duplicate deliveries,
+- **Live answering.** Crew/task, live permits, never-auto, then rule matching, in that order. A per-state
+  queue shared by the state path loads fresh state and reserves each matching request durably before the SDK call; duplicate deliveries,
   failures and reloads never retry that request. A failed reservation write leaves it pending. The SDK
   has no per-call timeout/cancellation; the broker stops waiting after ten seconds and logs `TimeoutError`.
   That does not cancel an SDK call already sent, which may complete later. The rate cap reserves at most
   120 allows per agent/hour even for concurrent hooks, and sticky checks are repeated before answering.
+  The queue survives module reloads in the same daemon process and covers all agents sharing that state,
+  including overlapping old/new instances. Custom stores can supply a stable `key`; those without one
+  share a conservative queue. Pending refusals are visible while their writes wait behind a request.
+  Stopping a broker invalidates queued/in-flight work before sending; an SDK call already sent cannot
+  be recalled. A slow SDK call can hold the shared queue until the ten-second deadline.
   Attempt history retains at most 4095 request IDs per agent. Reserving the 4096th compacts it into a
   durable exhausted marker (`attempts[agentId]: null`); that final call may proceed, and every later
   request from that agent relays as `attempt-cap`, including after reload. Older full ledgers compact

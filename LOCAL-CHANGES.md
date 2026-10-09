@@ -80,7 +80,7 @@ and logs the verdict beside the answer a person or the broker gave. Shadow never
 live answers only with task `live: true`, once per request, with a ten-second deadline and no retry.
 It is off by default (`permissionBroker: "off"`). The kill switch is setting it to `"shadow"` or
 `"off"`, effective without a reload. D2(a) and D3(a) keep opt-in tier 2 and literal read-repo git
-enabled; live relays git commits with uncontrolled hooks and inline interpreter code. Path identities
+enabled in shadow; live relays repository Git operations with uncontrolled hooks/helpers and inline interpreter code. Path identities
 are rechecked immediately before answering, but the SDK cannot lock them until command execution.
 It records changes to `index.server.ts`, `server/config.ts`, `shared/fleet.ts` and
 `templates/data/charter.md` (say nothing about a permission request that is no longer pending), and adds the broker, the
@@ -95,6 +95,10 @@ Its state (sticky crewmates, the last hour's allows, and requests reserved for a
 compacts after 4096 reservations per agent; later requests from that agent relay permanently, so
 history stays bounded without allowing old failed calls to retry. It adds no package dependency of its own; the Paseo requirement is
 upstream's `>=0.11.0`.
+
+Reloading brokers share a state-path queue in the daemon process and load fresh state before each
+reservation, keeping attempts and rate counts atomic across instances. Pending refusals are visible
+before their durable writes run. Stopping an instance invalidates work before it sends an answer.
 
 ## Where the plugin lives
 

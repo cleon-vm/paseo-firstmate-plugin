@@ -1127,6 +1127,11 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
   if (git.other.some((option) => /^--(?:git-dir|work-tree)/.test(option))) return refuse("project-repo", "git with --git-dir or --work-tree");
   if (["fetch", "pull", "ls-remote", "submodule"].includes(git.sub)) return refuse("non-get", `git ${git.sub}`);
   if (git.sub === "clone") return gitClone(rc, git);
+  // Read verbs can run fsmonitor, external diff or archive helpers; add/branch can run filters
+  // and reference hooks. Optional-lock suppression does not disable repository-controlled code.
+  const repositoryAllow = (rule: "git-local" | "git-read", detail: string): StatementResult => rc.mode === "live"
+    ? noRule("git repository hooks and helpers require a person in live mode")
+    : allow(rule, detail);
   const roots = rc.roots;
   if (git.dir !== null) {
     const dir = roots.resolve(git.dir, rc.cwdRaw);
@@ -1137,7 +1142,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
     if (!git.noOptionalLocks || git.other.length > 0) return refuse("project-repo", "git -C without --no-optional-locks alone");
     if (READ_VERBS.has(git.sub)) {
       const bad = gitReadArgs(rc, git, repo, git.dir);
-      return bad ?? allow("git-read", `git ${git.sub} in ${repo}`);
+      return bad ?? repositoryAllow("git-read", `git ${git.sub} in ${repo}`);
     }
     if (git.sub === "archive") {
       let output: string | null = null;
@@ -1155,7 +1160,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
       }
       if (output === null || rev === null) return refuse("project-repo", "git archive without a rev and -o");
       const checked = checkAll(rc, [output], "write");
-      return checked.ok ? allow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
+      return checked.ok ? repositoryAllow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
     }
     return refuse("project-repo", `git ${git.sub} in the read-only ${repo}`);
   }
@@ -1167,14 +1172,14 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
   const args = git.args.map((word) => word.value);
   if (git.noOptionalLocks && git.other.length === 0 && READ_VERBS.has(git.sub)) {
     const bad = gitReadArgs(rc, git, roots.worktree, rc.cwdRaw);
-    return bad ?? allow("git-local", `git ${git.sub}`);
+    return bad ?? repositoryAllow("git-local", `git ${git.sub}`);
   }
   if (git.other.length > 0 || git.noOptionalLocks) return noRule(`git ${git.other.join(" ")} ${git.sub}`);
   if (git.sub === "add") {
     const rest = args[0] === "--dry-run" ? args.slice(1) : args;
     if (rest[0] !== "--" || rest.length < 2) return noRule("git add other than [--dry-run] -- <paths>");
     const checked = checkAll(rc, rest.slice(1), "read", [roots.worktree]);
-    return checked.ok ? allow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
+    return checked.ok ? repositoryAllow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
   }
   if (git.sub === "commit") {
     if (rc.mode === "live") return noRule("git commit may execute crew-controlled hooks; requires a person in live mode");
@@ -1189,7 +1194,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
       return noRule("git branch other than <name> [<rev>]");
     }
     if (args.some((arg) => arg.includes(".."))) return noRule("git branch with ..");
-    return allow("git-local", `git branch ${args[0]}`);
+    return repositoryAllow("git-local", `git branch ${args[0]}`);
   }
   return noRule(`git ${git.sub}`);
 }

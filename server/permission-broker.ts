@@ -27,7 +27,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { PluginLifecycleEvents, PluginLifecycleRegistration } from "@getpaseo/plugin/server";
 
@@ -68,6 +68,8 @@ export function emptyBrokerState(): BrokerState {
 }
 
 export interface BrokerStore {
+  /** Stable storage identity across reloads. Custom stores without a key share one conservative queue. */
+  key?: string;
   load(): Promise<BrokerState>;
   save(state: BrokerState): Promise<void>;
 }
@@ -130,6 +132,16 @@ function defaultRealpath(path: string): string | null {
   }
 }
 
+interface BrokerCoordination {
+  run: typeof serialized;
+  pendingSticky: Map<string, Map<string, { at: string; reason: string }>>;
+}
+
+// Retain the first queue function even when a plugin reload evaluates another copy of this module.
+const COORDINATION = Symbol.for("firstmate.permission-broker.coordination");
+const coordination = (globalThis as typeof globalThis & { [key: symbol]: BrokerCoordination | undefined })[COORDINATION]
+  ??= { run: serialized, pendingSticky: new Map() };
+
 /** The SDK has no per-call timeout or cancellation; stop waiting, never resend. */
 async function answerOnce(paseo: PaseoApi, agentId: string, requestId: string): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -152,10 +164,9 @@ async function defaultAppend(path: string, text: string): Promise<void> {
 }
 
 export class PermissionBroker {
-  private readonly queueKey = randomUUID();
+  private readonly queueKey: string;
+  private stopped = false;
   private readonly sent = new Map<string, number>();
-  private state: BrokerState | null = null;
-  private loading: Promise<BrokerState> | null = null;
   private readonly crew = new Map<string, CrewFacts | null>();
   private lastLogError = Number.NEGATIVE_INFINITY;
   private readonly host: BrokerHost;
@@ -167,6 +178,7 @@ export class PermissionBroker {
   private readonly userHome: string;
 
   constructor(options: PermissionBrokerOptions) {
+    this.queueKey = `permission-broker:${options.store.key ?? "custom-stores"}`;
     this.host = options.host;
     this.store = options.store;
     this.readConfig = options.readConfig;
@@ -196,10 +208,16 @@ export class PermissionBroker {
   }
 
   async onPermissionRequested(event: PluginLifecycleEvents["agent.permission_requested"], paseo?: PaseoApi): Promise<void> {
-    return serialized(`${this.queueKey}:${event.agent.id}`, () => this.request(event, paseo));
+    return coordination.run(this.queueKey, () => this.request(event, paseo));
+  }
+
+  /** Invalidates queued and in-flight work before an answer; an SDK call already sent cannot be recalled. */
+  stop(): void {
+    this.stopped = true;
   }
 
   private async request(event: PluginLifecycleEvents["agent.permission_requested"], paseo?: PaseoApi): Promise<void> {
+    if (this.stopped) return;
     const found = await this.crewmate(event.agent.id);
     if (found === null) return;
     const { config, facts } = found;
@@ -225,7 +243,7 @@ export class PermissionBroker {
       home,
       userHome: this.userHome,
       worktree: event.agent.cwd,
-      sticky: state.sticky[agentId] !== undefined,
+      sticky: state.sticky[agentId] !== undefined || this.pendingSticky(agentId),
       allowsLastHour: recent.length,
       realpath: mode === "live" ? recordPath : this.realpath,
       extraHardware,
@@ -266,7 +284,7 @@ export class PermissionBroker {
       state.attempts[agentId] = [...(state.attempts[agentId] ?? []), event.request.id];
       if (state.attempts[agentId]!.length >= MAX_ATTEMPTS_PER_AGENT) state.attempts[agentId] = null;
     }
-    const saved = await this.persist(now);
+    const saved = await this.persist(state, now);
     if (!saved && mode === "live" && result.verdict === "allow") {
       result = { verdict: "relay", rule: "state-error", tier: null, detail: "the answer reservation could not be saved" };
     }
@@ -284,7 +302,7 @@ export class PermissionBroker {
         try {
           result = match(event.request, fresh.raw, {
             crew: true, task: facts.task, mode: "live", home, userHome: this.userHome,
-            worktree: event.agent.cwd, sticky: state.sticky[agentId] !== undefined,
+            worktree: event.agent.cwd, sticky: state.sticky[agentId] !== undefined || this.pendingSticky(agentId),
             allowsLastHour: recent.length, extraHardware: hardware,
             realpath: (path) => {
               const real = this.realpath(path);
@@ -300,6 +318,7 @@ export class PermissionBroker {
 
     let answered = false;
     let answerError: string | undefined;
+    if (this.stopped) result = { verdict: "relay", rule: "stopped", tier: null, detail: "the broker stopped before answering" };
     if (mode === "live" && result.verdict === "allow") {
       try {
         if (paseo === undefined) throw new Error("Paseo unavailable");
@@ -372,10 +391,23 @@ export class PermissionBroker {
   }
 
   private async makeSticky(agentId: string, at: string, reason: string, now: number): Promise<void> {
-    const state = await this.load();
-    if (state.sticky[agentId] !== undefined) return;
-    state.sticky[agentId] = { at, reason };
-    await this.persist(now);
+    const pending = coordination.pendingSticky.get(this.queueKey) ?? new Map();
+    coordination.pendingSticky.set(this.queueKey, pending);
+    const mark = pending.get(agentId) ?? { at, reason };
+    pending.set(agentId, mark);
+    // A refusal must be visible to a request holding the queue before its durable write can run.
+    await coordination.run(this.queueKey, async () => {
+      const state = await this.load();
+      state.sticky[agentId] ??= mark;
+      if (await this.persist(state, now)) {
+        if (pending.get(agentId) === mark) pending.delete(agentId);
+        if (pending.size === 0 && coordination.pendingSticky.get(this.queueKey) === pending) coordination.pendingSticky.delete(this.queueKey);
+      }
+    });
+  }
+
+  private pendingSticky(agentId: string): boolean {
+    return coordination.pendingSticky.get(this.queueKey)?.has(agentId) ?? false;
   }
 
   /**
@@ -422,17 +454,10 @@ export class PermissionBroker {
   }
 
   private load(): Promise<BrokerState> {
-    if (this.state !== null) return Promise.resolve(this.state);
-    this.loading ??= this.store.load().then((state) => {
-      this.state = state;
-      return state;
-    });
-    return this.loading;
+    return this.store.load();
   }
 
-  private async persist(now: number): Promise<boolean> {
-    const state = this.state;
-    if (state === null) return false;
+  private async persist(state: BrokerState, now: number): Promise<boolean> {
     // Sticky marks are never pruned by age: an agent stays sticky for its whole life (spec 3.7).
     for (const [agentId, times] of Object.entries(state.allows)) {
       const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
@@ -487,7 +512,9 @@ export async function readBrokerState(path: string): Promise<BrokerState> {
 
 /** `permission-broker.json`, written whole to a temporary file and renamed into place. */
 export function brokerFileStore(path: string): BrokerStore {
+  const absolute = resolve(path);
   return {
+    key: process.platform === "win32" ? absolute.toLowerCase() : absolute,
     load: () => readBrokerState(path),
     save: (state) =>
       serialized(path, async () => {
@@ -572,6 +599,7 @@ export function registerPermissionBroker(
     ready,
     stop() {
       stopped = true;
+      broker.stop();
       offs.forEach((off) => off());
       offs = [];
     },
