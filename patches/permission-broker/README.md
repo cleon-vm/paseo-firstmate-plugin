@@ -32,7 +32,7 @@ matching request once with `allow`. It never denies a request or sends a message
   rule first, then to `exec`. Paths are normalized, refused with `..`, `~`, `%`,
   `$`, wildcards, UNC or device forms, colons past the drive, or names ending in a dot or space, and
   resolved through `realpath` at the nearest existing folder. Live repeats matching after reserving the
-  request and rereading config, permits and the supplement; every checked path, including roots, must
+  request and rereading config, permits, the supplement and finally the state; every checked path, including roots, must
   retain its identity. A change during broker I/O relays. There is no await between those final path
   checks and sending allow. Paseo cannot lock paths through the command's eventual execution; a path
   replacement after the SDK call remains a limitation of this API.
@@ -40,7 +40,7 @@ matching request once with `allow`. It never denies a request or sends a message
   hooks, filters, fsmonitor, external diff and archive helpers can execute repository-controlled code.
   `--no-optional-locks` does not disable those helpers. Shadow retains those judgments. Live also relays inline interpreter
   switches such as `-c`, `-e`, `-p`, attached code and bundled short forms, `--eval`, and `deno eval`
-  (including through a launcher or with global options); shadow still logs them. Named script/test
+  (including numeric bundles and `py`, `pythonw` and versioned `pypy` launchers); shadow still logs them. Named script/test
   exec prefixes and pinned package installs remain opt-in tier 2. Shadow read-only git remains confined to
   literal `readRepos`. D2(a) and D3(a) were accepted; the live Git forms above now require a person
   pending an invocation proven to disable implicit execution. The existing permit-scoped clone rule remains.
@@ -89,7 +89,9 @@ matching request once with `allow`. It never denies a request or sends a message
   entire life. Expiring old IDs by time would permit retries; other agents keep their own budgets.
   A missing state file starts fresh. Every other read/parse failure or malformed ledger marks state
   broken: live requests relay as `state-error`, and no mode saves over the broken file. File saves
-  check again for corruption introduced during matching. Pending refusals remain in memory and are
+  check again for corruption introduced during matching. State is reloaded after the final config
+  reread, before the synchronous checks and SDK call; new read/parse failures relay without another save.
+  Pending refusals remain in memory and are
   durably carried into the next successful save after valid repair. Missing-file recovery cannot
   distinguish a first run from a removed ledger; preserve the original state when recovering it.
 - **Guarded.** Every hook catches its own errors and writes them to stderr: a failure costs that event's

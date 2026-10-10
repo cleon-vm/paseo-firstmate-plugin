@@ -1233,9 +1233,9 @@ function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "comman
   const words = statement.words;
   // A prefix naming an interpreter flag does not name the program it will run. Keep these visible in
   // shadow, but require a person for inline code (including bundled short flags) in live mode.
-  const bundledInterpreter = words.some((word) => /^(?:python(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(programOf([word]).native));
+  const bundledInterpreter = words.some((word) => /^(?:py|(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(programOf([word]).native));
   const inlineFlag = bundledInterpreter
-    ? /^-[A-Za-z]*[cepE]|^--(?:eval|print|command)(?:=|$)/
+    ? /^-[A-Za-z0-9]*[cepE]|^--(?:eval|print|command)(?:=|$)/
     : /^-[bBdiIOqsSuUvVxX]*[cep]|^--(?:eval|print|command)(?:=|$)/;
   if (rc.mode === "live" && (words.some((word) => inlineFlag.test(word.value))
     || words.some((word, index) => programOf([word]).native === "deno"

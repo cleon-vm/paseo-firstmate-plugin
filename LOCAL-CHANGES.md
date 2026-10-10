@@ -82,6 +82,8 @@ It is off by default (`permissionBroker: "off"`). The kill switch is setting it 
 `"off"`, effective without a reload. D2(a) and D3(a) keep opt-in tier 2 and literal read-repo git
 enabled in shadow; live relays repository Git operations with uncontrolled hooks/helpers and inline interpreter code. Path identities
 are rechecked immediately before answering, but the SDK cannot lock them until command execution.
+Live also rejects numeric inline-code bundles and Python launcher aliases, and reloads state after
+the final config reread so corruption during that await relays without overwriting the ledger.
 It records changes to `index.server.ts`, `server/config.ts`, `shared/fleet.ts` and
 `templates/data/charter.md` (say nothing about a permission request that is no longer pending), and adds the broker, the
 matcher, the never-auto list and their tests. Its `original/` captures those files after

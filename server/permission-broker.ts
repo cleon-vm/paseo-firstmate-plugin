@@ -302,13 +302,16 @@ export class PermissionBroker {
       const fresh = await this.readPermits(home, facts.task as string);
       const hardware = await this.readSupplement(home);
       const current = await this.readConfig();
-      if (current.permissionBroker !== "live" || resolveHome(current) !== home || current.mateAgentId.trim() === agentId || fresh.sha !== permits.sha) {
+      const finalState = await this.load();
+      if (finalState.broken) {
+        result = { verdict: "relay", rule: "state-error", tier: null, detail: "the broker state became broken before answering" };
+      } else if (current.permissionBroker !== "live" || resolveHome(current) !== home || current.mateAgentId.trim() === agentId || fresh.sha !== permits.sha) {
         result = { verdict: "relay", rule: "changed", tier: null, detail: "the config or permits changed before answering" };
       } else {
         try {
           result = match(event.request, fresh.raw, {
             crew: true, task: facts.task, mode: "live", home, userHome: this.userHome,
-            worktree: event.agent.cwd, sticky: state.sticky[agentId] !== undefined || this.pendingSticky(agentId),
+            worktree: event.agent.cwd, sticky: finalState.sticky[agentId] !== undefined || this.pendingSticky(agentId),
             allowsLastHour: recent.length, extraHardware: hardware,
             realpath: (path) => {
               const real = this.realpath(path);
