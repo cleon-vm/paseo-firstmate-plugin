@@ -1,8 +1,8 @@
 /**
- * The permission broker, shadow mode: checks every crew permission request against its task's permits
- * and the never-auto list, and logs the answer it would give and the answer people gave. It never
- * answers. Nothing here calls the SDK's permission answer or sends anything to an agent, in any mode; `live`
- * logs as live mode will judge (a permits file with `"live": false` relays) and answers nothing either.
+ * The permission broker checks crew requests against task permits and the never-auto list. Shadow
+ * logs without answering. Live, with live permits, reserves the request durably, repeats every gate
+ * immediately before sending one allow, and logs the outcome. Failures and timeouts are never retried.
+ * No mode sends messages or denies a request.
  *
  * - **Which requests.** Only an agent labelled `firstmate.role=crew`, not the first mate itself. A
  *   crewmate's labels are looked up once, through the crew relay's lookup, and kept for its life. An agent
@@ -27,7 +27,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { PluginLifecycleEvents, PluginLifecycleRegistration } from "@getpaseo/plugin/server";
 
@@ -37,7 +37,7 @@ import { isCrew, paseoRelayHost } from "./crew-relay";
 import { parseCrewReport } from "./crew-report";
 import { pluginDir } from "./data-dir";
 import type { PaseoApi } from "./host-types";
-import { match, neverId, parseNeverAutoExtra, taskIdOk, type MatchResult } from "./permit-match";
+import { match, neverId, parseNeverAutoExtra, taskIdOk, type MatchContext, type MatchResult } from "./permit-match";
 import { neverAuto, STICKY_IDS } from "./permit-rules";
 import { closingText } from "./report-cache";
 import { serialized } from "./serialize";
@@ -49,13 +49,20 @@ export const MAX_LOGGED_COMMAND = 2000;
 /** How many crewmates' labels are kept, and how long an allow time is. */
 const MAX_AGENTS = 2000;
 const HOUR_MS = 60 * 60 * 1000;
+const ANSWER_TIMEOUT_MS = 10_000;
+const RESOLUTION_WINDOW_MS = 30_000;
+const MAX_ATTEMPTS_PER_AGENT = 4096;
 const STUCK_TURN_STATES: ReadonlySet<string> = new Set(["blocked", "needs-decision", "failed"]);
 
 export interface BrokerState {
+  /** Read/parse/schema failure; never answer live or save this state over the file. */
+  broken?: boolean;
   /** Crewmates that may not be answered any more, with when and why. */
   sticky: Record<string, { at: string; reason: string }>;
   /** When each crewmate's requests were judged `allow` in the last hour (ISO). */
   allows: Record<string, string[]>;
+  /** Live calls reserved before sending. Null is an exhausted ledger: relay for the agent's life. */
+  attempts?: Record<string, string[] | null>;
 }
 
 export function emptyBrokerState(): BrokerState {
@@ -63,6 +70,8 @@ export function emptyBrokerState(): BrokerState {
 }
 
 export interface BrokerStore {
+  /** Stable storage identity across reloads. Custom stores without a key share one conservative queue. */
+  key?: string;
   load(): Promise<BrokerState>;
   save(state: BrokerState): Promise<void>;
 }
@@ -125,14 +134,41 @@ function defaultRealpath(path: string): string | null {
   }
 }
 
+interface BrokerCoordination {
+  run: typeof serialized;
+  pendingSticky: Map<string, Map<string, { at: string; reason: string }>>;
+}
+
+// Retain the first queue function even when a plugin reload evaluates another copy of this module.
+const COORDINATION = Symbol.for("firstmate.permission-broker.coordination");
+const coordination = (globalThis as typeof globalThis & { [key: symbol]: BrokerCoordination | undefined })[COORDINATION]
+  ??= { run: serialized, pendingSticky: new Map() };
+
+/** The SDK has no per-call timeout or cancellation; stop waiting, never resend. */
+async function answerOnce(paseo: PaseoApi, agentId: string, requestId: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new DOMException("Permission answer timed out", "TimeoutError")), ANSWER_TIMEOUT_MS);
+    });
+    await Promise.race([
+      paseo.agents.ref(agentId).respondToPermission({ requestId, response: { behavior: "allow" } }),
+      deadline,
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function defaultAppend(path: string, text: string): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   await appendFile(path, text, "utf8");
 }
 
 export class PermissionBroker {
-  private state: BrokerState | null = null;
-  private loading: Promise<BrokerState> | null = null;
+  private readonly queueKey: string;
+  private stopped = false;
+  private readonly sent = new Map<string, number>();
   private readonly crew = new Map<string, CrewFacts | null>();
   private lastLogError = Number.NEGATIVE_INFINITY;
   private readonly host: BrokerHost;
@@ -144,6 +180,7 @@ export class PermissionBroker {
   private readonly userHome: string;
 
   constructor(options: PermissionBrokerOptions) {
+    this.queueKey = `permission-broker:${options.store.key ?? "custom-stores"}`;
     this.host = options.host;
     this.store = options.store;
     this.readConfig = options.readConfig;
@@ -172,7 +209,17 @@ export class PermissionBroker {
     return facts === null ? null : { config, facts };
   }
 
-  async onPermissionRequested(event: PluginLifecycleEvents["agent.permission_requested"]): Promise<void> {
+  async onPermissionRequested(event: PluginLifecycleEvents["agent.permission_requested"], paseo?: PaseoApi): Promise<void> {
+    return coordination.run(this.queueKey, () => this.request(event, paseo));
+  }
+
+  /** Invalidates queued and in-flight work before an answer; an SDK call already sent cannot be recalled. */
+  stop(): void {
+    this.stopped = true;
+  }
+
+  private async request(event: PluginLifecycleEvents["agent.permission_requested"], paseo?: PaseoApi): Promise<void> {
+    if (this.stopped) return;
     const found = await this.crewmate(event.agent.id);
     if (found === null) return;
     const { config, facts } = found;
@@ -184,32 +231,114 @@ export class PermissionBroker {
     const now = this.now();
     const agentId = event.agent.id;
     const recent = (state.allows[agentId] ?? []).filter((at) => Date.parse(at) > now - HOUR_MS);
+    const paths = new Map<string, string | null>();
+    const recordPath = (path: string): string | null => {
+      const real = this.realpath(path);
+      if (paths.has(path) && paths.get(path) !== real) throw new Error("A path changed during matching");
+      paths.set(path, real);
+      return real;
+    };
+    const context: MatchContext = {
+      crew: true,
+      task: facts.task,
+      mode,
+      home,
+      userHome: this.userHome,
+      worktree: event.agent.cwd,
+      sticky: state.sticky[agentId] !== undefined || this.pendingSticky(agentId),
+      allowsLastHour: recent.length,
+      realpath: mode === "live" ? recordPath : this.realpath,
+      extraHardware,
+    };
     let result: MatchResult;
     try {
-      result = match(event.request, permits.raw, {
-        crew: true,
-        task: facts.task,
-        mode,
-        home,
-        userHome: this.userHome,
-        worktree: event.agent.cwd,
-        sticky: state.sticky[agentId] !== undefined,
-        allowsLastHour: recent.length,
-        realpath: this.realpath,
-        extraHardware,
-      });
+      result = match(event.request, permits.raw, context);
     } catch (error) {
       result = { verdict: "relay", rule: "error", tier: null, detail: error instanceof Error ? error.message : String(error) };
     }
 
     const at = new Date(now).toISOString();
+    // Permits stay the first verdict gate in live. Never-auto observations still make a crew
+    // member sticky even while permits are missing or not live; shadow can never send an answer.
+    let stickyId = neverId(result);
+    if (mode === "live" && result.rule === "never:no-permits") {
+      try {
+        stickyId = neverId(match(event.request, permits.raw, { ...context, mode: "shadow" }));
+      } catch {
+        // The live verdict already relays; an incomplete observation cannot authorize anything.
+      }
+    }
+    if (stickyId !== null && STICKY_IDS.has(stickyId) && state.sticky[agentId] === undefined) {
+      state.sticky[agentId] = { at, reason: `never:${stickyId}` };
+      if (state.broken) this.rememberSticky(agentId, at, `never:${stickyId}`);
+    }
+    const attempts = state.attempts?.[agentId];
+    if (mode === "live" && attempts?.includes(event.request.id)) {
+      result = { verdict: "relay", rule: "already-attempted", tier: null, detail: "a live answer was already attempted for this request" };
+    }
+    if (mode === "live" && (attempts === null || (attempts?.length ?? 0) >= MAX_ATTEMPTS_PER_AGENT)) {
+      state.attempts![agentId] = null;
+      result = { verdict: "relay", rule: "attempt-cap", tier: null, detail: "the agent's live attempt ledger is exhausted; relay for its remaining life" };
+    }
+    if (mode === "live" && state.broken) {
+      result = { verdict: "relay", rule: "state-error", tier: null, detail: "the broker state is broken; repair it before live answering" };
+    }
     if (result.verdict === "allow") state.allows[agentId] = [...recent, at];
     else if (recent.length !== (state.allows[agentId] ?? []).length) state.allows[agentId] = recent;
-    const id = neverId(result);
-    if (id !== null && STICKY_IDS.has(id) && state.sticky[agentId] === undefined) {
-      state.sticky[agentId] = { at, reason: result.rule };
+    if (mode === "live" && result.verdict === "allow") {
+      state.attempts ??= {};
+      state.attempts[agentId] = [...(state.attempts[agentId] ?? []), event.request.id];
+      if (state.attempts[agentId]!.length >= MAX_ATTEMPTS_PER_AGENT) state.attempts[agentId] = null;
     }
-    await this.persist(now);
+    const saved = await this.persist(state, now);
+    if (!saved && mode === "live" && result.verdict === "allow") {
+      result = { verdict: "relay", rule: "state-error", tier: null, detail: "the answer reservation could not be saved" };
+    }
+
+    // Config and permits may have changed during file I/O; repeat the complete check order. Path
+    // identities must match the first pass, including the roots themselves. No await separates the
+    // final realpath checks from sending allow. The SDK cannot lock paths through command execution.
+    if (mode === "live" && result.verdict === "allow") {
+      const fresh = await this.readPermits(home, facts.task as string);
+      const hardware = await this.readSupplement(home);
+      const current = await this.readConfig();
+      const finalState = await this.load();
+      if (finalState.broken) {
+        result = { verdict: "relay", rule: "state-error", tier: null, detail: "the broker state became broken before answering" };
+      } else if (current.permissionBroker !== "live" || resolveHome(current) !== home || current.mateAgentId.trim() === agentId || fresh.sha !== permits.sha) {
+        result = { verdict: "relay", rule: "changed", tier: null, detail: "the config or permits changed before answering" };
+      } else {
+        try {
+          result = match(event.request, fresh.raw, {
+            crew: true, task: facts.task, mode: "live", home, userHome: this.userHome,
+            worktree: event.agent.cwd, sticky: finalState.sticky[agentId] !== undefined || this.pendingSticky(agentId),
+            allowsLastHour: recent.length, extraHardware: hardware,
+            realpath: (path) => {
+              const real = this.realpath(path);
+              if (!paths.has(path) || paths.get(path) !== real) throw new Error("A path changed before answering");
+              return real;
+            },
+          });
+        } catch {
+          result = { verdict: "relay", rule: "changed", tier: null, detail: "a path changed before answering" };
+        }
+      }
+    }
+
+    let answered = false;
+    let answerError: string | undefined;
+    if (this.stopped) result = { verdict: "relay", rule: "stopped", tier: null, detail: "the broker stopped before answering" };
+    if (mode === "live" && result.verdict === "allow") {
+      try {
+        if (paseo === undefined) throw new Error("Paseo unavailable");
+        for (const [key, at] of this.sent) if (this.now() - at > RESOLUTION_WINDOW_MS) this.sent.delete(key);
+        this.sent.set(JSON.stringify([agentId, event.request.id]), this.now());
+        await answerOnce(paseo, agentId, event.request.id);
+        answered = true;
+      } catch (error) {
+        answerError = error instanceof DOMException ? error.name : error instanceof Error ? error.constructor.name : "UnknownError";
+      }
+    }
 
     const input = (typeof event.request.input === "object" && event.request.input !== null ? event.request.input : {}) as Record<string, unknown>;
     const command = typeof input.command === "string" ? clip(redact(input.command), MAX_LOGGED_COMMAND) : null;
@@ -233,8 +362,8 @@ export class PermissionBroker {
       tier: result.tier,
       detail: clip(redact(result.detail), 500),
       permitsSha256: permits.sha,
-      // Shadow: nothing is ever answered.
-      answered: false,
+      answered,
+      ...(answerError === undefined ? {} : { answerError }),
     });
   }
 
@@ -251,8 +380,8 @@ export class PermissionBroker {
       agentId: event.agent.id,
       requestId: event.requestId,
       behavior: event.resolution.behavior,
-      // The broker sent no answer, so none of these is its own.
-      byBroker: false,
+      byBroker: event.resolution.behavior === "allow" && this.sent.has(JSON.stringify([event.agent.id, event.requestId])) &&
+        now - (this.sent.get(JSON.stringify([event.agent.id, event.requestId])) ?? 0) <= RESOLUTION_WINDOW_MS,
     });
   }
 
@@ -271,10 +400,25 @@ export class PermissionBroker {
   }
 
   private async makeSticky(agentId: string, at: string, reason: string, now: number): Promise<void> {
-    const state = await this.load();
-    if (state.sticky[agentId] !== undefined) return;
-    state.sticky[agentId] = { at, reason };
-    await this.persist(now);
+    const mark = this.rememberSticky(agentId, at, reason);
+    // A refusal must be visible to a request holding the queue before its durable write can run.
+    await coordination.run(this.queueKey, async () => {
+      const state = await this.load();
+      state.sticky[agentId] ??= mark;
+      await this.persist(state, now);
+    });
+  }
+
+  private rememberSticky(agentId: string, at: string, reason: string): { at: string; reason: string } {
+    const pending = coordination.pendingSticky.get(this.queueKey) ?? new Map();
+    coordination.pendingSticky.set(this.queueKey, pending);
+    const mark = pending.get(agentId) ?? { at, reason };
+    pending.set(agentId, mark);
+    return mark;
+  }
+
+  private pendingSticky(agentId: string): boolean {
+    return coordination.pendingSticky.get(this.queueKey)?.has(agentId) ?? false;
   }
 
   /**
@@ -321,25 +465,27 @@ export class PermissionBroker {
   }
 
   private load(): Promise<BrokerState> {
-    if (this.state !== null) return Promise.resolve(this.state);
-    this.loading ??= this.store.load().then((state) => {
-      this.state = state;
-      return state;
-    });
-    return this.loading;
+    return this.store.load();
   }
 
-  private async persist(now: number): Promise<void> {
-    const state = this.state;
-    if (state === null) return;
+  private async persist(state: BrokerState, now: number): Promise<boolean> {
+    if (state.broken) return false;
+    const pending = coordination.pendingSticky.get(this.queueKey);
+    const marks = [...(pending?.entries() ?? [])];
+    for (const [agentId, mark] of marks) state.sticky[agentId] ??= mark;
     // Sticky marks are never pruned by age: an agent stays sticky for its whole life (spec 3.7).
     for (const [agentId, times] of Object.entries(state.allows)) {
       const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
       if (recent.length === 0) delete state.allows[agentId];
       else state.allows[agentId] = recent;
     }
-    await this.store.save(state).catch((error: unknown) => {
+    return this.store.save(state).then(() => {
+      for (const [agentId, mark] of marks) if (pending?.get(agentId) === mark) pending.delete(agentId);
+      if (pending?.size === 0 && coordination.pendingSticky.get(this.queueKey) === pending) coordination.pendingSticky.delete(this.queueKey);
+      return true;
+    }).catch((error: unknown) => {
       console.error("[firstmate] could not save the permission broker's state:", error);
+      return false;
     });
   }
 }
@@ -348,37 +494,55 @@ export class PermissionBroker {
 // The file, and Paseo
 // ---------------------------------------------------------------------------
 
-/** The saved state, leniently: anything it cannot read starts afresh. */
+function stateRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Only a missing file starts fresh. A broken ledger is left intact for recovery. */
 export async function readBrokerState(path: string): Promise<BrokerState> {
-  let raw: unknown;
   try {
-    raw = JSON.parse(await readFile(path, "utf8"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`[firstmate] ${path} could not be read, starting afresh:`, error);
-    return emptyBrokerState();
-  }
-  const object = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const state = emptyBrokerState();
-  if (typeof object.sticky === "object" && object.sticky !== null) {
+    const object: unknown = JSON.parse(await readFile(path, "utf8"));
+    const invalid = (): never => { throw new Error("Invalid permission broker state"); };
+    if (!stateRecord(object) || object.broken || !stateRecord(object.sticky) || !stateRecord(object.allows)) return invalid();
+    const state = emptyBrokerState();
     for (const [agentId, mark] of Object.entries(object.sticky)) {
-      const { at, reason } = (mark ?? {}) as { at?: unknown; reason?: unknown };
-      if (typeof at === "string" && typeof reason === "string") state.sticky[agentId] = { at, reason };
+      if (!stateRecord(mark) || typeof mark.at !== "string" || !Number.isFinite(Date.parse(mark.at)) || typeof mark.reason !== "string") return invalid();
+      state.sticky[agentId] = { at: mark.at, reason: mark.reason };
     }
-  }
-  if (typeof object.allows === "object" && object.allows !== null) {
     for (const [agentId, times] of Object.entries(object.allows)) {
-      if (Array.isArray(times)) state.allows[agentId] = times.filter((at): at is string => typeof at === "string");
+      if (!Array.isArray(times) || !times.every((at) => typeof at === "string" && Number.isFinite(Date.parse(at)))) return invalid();
+      state.allows[agentId] = times;
     }
+    if (object.attempts !== undefined) {
+      if (!stateRecord(object.attempts)) return invalid();
+      state.attempts = {};
+      for (const [agentId, ids] of Object.entries(object.attempts)) {
+        if (ids === null) state.attempts[agentId] = null;
+        else if (Array.isArray(ids)) {
+          if (!ids.every((id) => typeof id === "string")) return invalid();
+          state.attempts[agentId] = ids.length >= MAX_ATTEMPTS_PER_AGENT ? null : ids;
+        } else return invalid();
+      }
+    }
+    return state;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyBrokerState();
+    console.error(`[firstmate] ${path} could not be read; leaving the broker state unchanged:`, error);
+    return { ...emptyBrokerState(), broken: true };
   }
-  return state;
 }
 
 /** `permission-broker.json`, written whole to a temporary file and renamed into place. */
 export function brokerFileStore(path: string): BrokerStore {
+  const absolute = resolve(path);
   return {
+    key: process.platform === "win32" ? absolute.toLowerCase() : absolute,
     load: () => readBrokerState(path),
     save: (state) =>
       serialized(path, async () => {
+        // A hand edit may have broken the file after the request loaded it. Never replace known
+        // broken bytes, including when shadow or a pending refusal tries to save.
+        if (state.broken || (await readBrokerState(path)).broken) throw new Error("Refusing to replace broken permission broker state");
         await mkdir(dirname(path), { recursive: true });
         const temporary = `${path}.${randomUUID()}.tmp`;
         await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
@@ -428,11 +592,11 @@ export function registerPermissionBroker(
     ...(options.userHome === undefined ? {} : { userHome: options.userHome }),
   });
   const guard =
-    <E>(name: string, run: (event: E) => Promise<void>) =>
+    <E>(name: string, run: (event: E, api: PaseoApi) => Promise<void>) =>
     async (event: E, context: { paseo: PaseoApi }) => {
       try {
         paseo = context.paseo;
-        await run(event);
+        await run(event, context.paseo);
       } catch (error) {
         console.error(`[firstmate] permission broker could not handle ${name}:`, error);
       }
@@ -443,7 +607,7 @@ export function registerPermissionBroker(
       offs = [
         server.on(
           "agent.permission_requested",
-          guard<PluginLifecycleEvents["agent.permission_requested"]>("a permission request", (event) => broker.onPermissionRequested(event)),
+          guard<PluginLifecycleEvents["agent.permission_requested"]>("a permission request", (event, api) => broker.onPermissionRequested(event, api)),
         ),
         server.on(
           "agent.permission_resolved",
@@ -460,6 +624,7 @@ export function registerPermissionBroker(
     ready,
     stop() {
       stopped = true;
+      broker.stop();
       offs.forEach((off) => off());
       offs = [];
     },

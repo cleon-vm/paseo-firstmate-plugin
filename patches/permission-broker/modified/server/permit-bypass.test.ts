@@ -123,22 +123,90 @@ function permitsFor(attempt: Attempt): Permits {
   };
 }
 
-function judge(attempt: Attempt) {
+function judge(attempt: Attempt, mode: MatchContext["mode"] = "shadow") {
   const wrapper = attempt.wrapper === undefined ? "" : ` ${attempt.wrapper}`;
   const command = `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"${wrapper} -Command '${attempt.script.replace(/'/g, "''")}'`;
-  return match({ provider: "codex", name: "CodexBash", kind: "tool", input: { command, cwd: WORKTREE } }, permitsFor(attempt), CONTEXT);
+  return match({ provider: "codex", name: "CodexBash", kind: "tool", input: { command, cwd: WORKTREE } }, permitsFor(attempt), { ...CONTEXT, mode });
 }
 
-describe("the review's bypass hunt, round 1", () => {
+describe("live execution follow-ups", () => {
+  it.each([
+    ["python -Ec 'print(1)'", ["python"]],
+    ["python '-Ecprint(1)'", ["python"]],
+    ["python -Pc 'print(1)'", ["python"]],
+    ["python -Rc 'print(1)'", ["python"]],
+    ["python -hc 'print(1)'", ["python"]],
+    ["perl -E 'say 1'", ["perl"]],
+    ["perl -we 'print 1'", ["perl"]],
+    ["perl -lne 'print'", ["perl"]],
+    ["ruby -we 'puts 1'", ["ruby"]],
+    ["uv run --offline python -Ec 'print(1)'", ["uv", "run"]],
+  ] as Array<[string, string[]]>)("relays round-2 bundled inline form %s", (script, prefix) => {
+    const attempt = { name: "round-2 inline", script, prefix };
+    expect(judge(attempt, "live").verdict).toBe("relay");
+    expect(judge(attempt, "shadow").verdict).toBe("allow");
+  });
+
+  it.each([
+    ["python -X utf8 -B -m unittest", ["python"]],
+    ["uv run --offline --no-project python example.py", ["uv", "run"]],
+    ["perl -w example.pl", ["perl"]],
+    ["ruby -w example.rb", ["ruby"]],
+  ] as Array<[string, string[]]>)("keeps named-script/module control %s live", (script, prefix) => {
+    expect(judge({ name: "named program", script, prefix }, "live").verdict).toBe("allow");
+  });
+
+  it.each([
+    ["python '-cprint(1)'", ["python"]],
+    ["python '-Bcprint(1)'", ["python"]],
+    ["node -p '1+1'", ["node"]],
+    ["deno eval 'console.log(1)'", ["deno"]],
+    ["deno --quiet eval 'console.log(1)'", ["deno"]],
+    ["uv run deno eval 'console.log(1)'", ["uv", "run"]],
+  ] as Array<[string, string[]]>)("relays inline code form %s in live", (script, prefix) => {
+    const attempt = { name: "inline code", script, prefix };
+    expect(judge(attempt, "live").verdict).toBe("relay");
+    expect(judge(attempt, "shadow").verdict).toBe("allow");
+  });
+
+  it("checks task and live permits before never-auto and rules", () => {
+    const request = { provider: "codex", name: "CodexBash", kind: "tool", input: { command: '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command \'git push\'', cwd: WORKTREE } };
+    const permits = permitsFor({ name: "order", script: "git push" });
+    expect(match(request, { ...permits, live: false }, { ...CONTEXT, mode: "live" }).rule).toBe("never:no-permits");
+    expect(match(request, permits, { ...CONTEXT, mode: "live", task: "permissions" }).rule).toBe("never:not-crew");
+    expect(match(request, permits, { ...CONTEXT, mode: "live" }).rule).toBe("never:outward");
+  });
+  it("leaves git commits to a person because crew-controlled hooks can execute outside the brief", () => {
+    const attempt = { name: "git hooks", script: "git commit -m 'example'" };
+    expect(judge(attempt, "shadow").verdict).toBe("allow");
+    expect(judge(attempt, "live").verdict).toBe("relay");
+  });
+
+  it("relays inline interpreter code in live mode even with an exact matching exec prefix", () => {
+    for (const [script, prefix] of [
+      ["python -c 'print(1)'", ["python", "-c"]],
+      ["uv run --offline python -Ic 'print(1)'", ["uv", "run", "--offline", "python", "-Ic"]],
+      ["node --eval 'console.log(1)'", ["node", "--eval"]],
+      ["node -e 'console.log(1)'", ["node", "-e"]],
+      ["node -pe '1'", ["node", "-pe"]],
+    ] as Array<[string, string[]]>) {
+      const attempt = { name: "inline code", script, prefix };
+      expect(judge(attempt, "shadow").verdict, script).toBe("allow");
+      expect(judge(attempt, "live").verdict, script).toBe("relay");
+    }
+  });
+});
+
+describe.each(["shadow", "live"] as const)("the review's bypass hunt, round 1 (%s)", (mode) => {
   for (const attempt of ATTEMPTS.filter((candidate) => candidate.accepted === undefined)) {
     it(`relays ${attempt.name}`, () => {
-      const result = judge(attempt);
+      const result = judge(attempt, mode);
       expect(result.verdict, `${result.rule}: ${result.detail}`).toBe("relay");
     });
   }
   for (const attempt of ATTEMPTS.filter((candidate) => candidate.accepted !== undefined)) {
     it(`allows ${attempt.name} (accepted widening ${attempt.accepted}, spec amendment 2026-10-09)`, () => {
-      expect(judge(attempt).verdict).toBe("allow");
+      expect(judge(attempt, mode).verdict).toBe("allow");
     });
   }
 
@@ -147,7 +215,7 @@ describe("the review's bypass hunt, round 1", () => {
   });
 });
 
-describe("round 1 fixes", () => {
+describe.each(["shadow", "live"] as const)("round 1 fixes (%s)", (mode) => {
   const exec = (prefix: string[], place: "scratch" | "notes" | "worktree" = "worktree"): Permits => ({
     ...permitsFor({ name: "", script: "Get-Date" }),
     exec: prefix.length === 0 ? [] : [{ in: place, prefix }],
@@ -156,7 +224,7 @@ describe("round 1 fixes", () => {
     match(
       { provider: "codex", name: "CodexBash", kind: "tool", input: { command: `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command '${script.replace(/'/g, "''")}'`, cwd: WORKTREE } },
       permits,
-      CONTEXT,
+      { ...CONTEXT, mode },
     );
 
   it("B1: takes attached and bundled write flags of gh and curl as outward", () => {
@@ -170,8 +238,11 @@ describe("round 1 fixes", () => {
   it("B1: sends a git, gh or npm run by path through its own policy, and through exec as well", () => {
     const gitPath = `${SCRATCH}\\git.exe`;
     expect(run(`& '${gitPath}' --no-optional-locks diff --output=result.txt`, exec([gitPath])).rule).toBe("never:project-repo");
-    // Its own policy allows it, and the binary runs from the roots under an exec prefix: tier 2.
-    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject({ verdict: "allow", rule: "exec", tier: 2 });
+    // Shadow judges the rooted binary's exact prefix as tier 2. Live requires a person for
+    // repository-controlled helpers even when an exec prefix names the binary.
+    expect(run(`& '${gitPath}' --no-optional-locks status`, exec([gitPath]))).toMatchObject(mode === "live"
+      ? { verdict: "relay", rule: "no-rule", tier: null }
+      : { verdict: "allow", rule: "exec", tier: 2 });
     // Its own policy allows it, but no exec prefix names the binary: relayed.
     expect(run(`& '${gitPath}' --no-optional-locks status`, exec(["node"])).verdict).toBe("relay");
     const ghPath = `${SCRATCH}\\gh.exe`;
@@ -211,14 +282,14 @@ describe("round 1 fixes", () => {
       match(
         { provider: "codex", name: "CodexBash", kind: "tool", input: { command: `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command 'node x.js'`, cwd: WORKTREE } },
         exec(["node"]),
-        { ...CONTEXT, extraHardware },
+        { ...CONTEXT, mode, extraHardware },
       );
     expect(failClosed(null)).toMatchObject({ verdict: "relay", rule: "never:hardware" });
     expect(failClosed([]).verdict).toBe("allow");
     const notes = match(
       { provider: "codex", name: "CodexBash", kind: "tool", input: { command: `"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command 'New-Item -ItemType Directory -Path ''${NOTES}\\x'''`, cwd: WORKTREE } },
       exec(["node"]),
-      { ...CONTEXT, extraHardware: null },
+      { ...CONTEXT, mode, extraHardware: null },
     );
     expect(notes.verdict).toBe("allow");
   });

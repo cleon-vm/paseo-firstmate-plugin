@@ -888,6 +888,7 @@ function valueOf(params: Map<string, Word | true>, name: string): Word | null {
 }
 
 interface RuleContext {
+  mode: MatchContext["mode"];
   roots: Roots;
   permits: Permits;
   extraHardware: readonly string[] | null;
@@ -1126,6 +1127,11 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
   if (git.other.some((option) => /^--(?:git-dir|work-tree)/.test(option))) return refuse("project-repo", "git with --git-dir or --work-tree");
   if (["fetch", "pull", "ls-remote", "submodule"].includes(git.sub)) return refuse("non-get", `git ${git.sub}`);
   if (git.sub === "clone") return gitClone(rc, git);
+  // Read verbs can run fsmonitor, external diff or archive helpers; add/branch can run filters
+  // and reference hooks. Optional-lock suppression does not disable repository-controlled code.
+  const repositoryAllow = (rule: "git-local" | "git-read", detail: string): StatementResult => rc.mode === "live"
+    ? noRule("git repository hooks and helpers require a person in live mode")
+    : allow(rule, detail);
   const roots = rc.roots;
   if (git.dir !== null) {
     const dir = roots.resolve(git.dir, rc.cwdRaw);
@@ -1136,7 +1142,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
     if (!git.noOptionalLocks || git.other.length > 0) return refuse("project-repo", "git -C without --no-optional-locks alone");
     if (READ_VERBS.has(git.sub)) {
       const bad = gitReadArgs(rc, git, repo, git.dir);
-      return bad ?? allow("git-read", `git ${git.sub} in ${repo}`);
+      return bad ?? repositoryAllow("git-read", `git ${git.sub} in ${repo}`);
     }
     if (git.sub === "archive") {
       let output: string | null = null;
@@ -1154,7 +1160,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
       }
       if (output === null || rev === null) return refuse("project-repo", "git archive without a rev and -o");
       const checked = checkAll(rc, [output], "write");
-      return checked.ok ? allow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
+      return checked.ok ? repositoryAllow("git-read", `git archive of ${repo} into ${checked.paths[0]}`) : checked.result;
     }
     return refuse("project-repo", `git ${git.sub} in the read-only ${repo}`);
   }
@@ -1166,16 +1172,17 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
   const args = git.args.map((word) => word.value);
   if (git.noOptionalLocks && git.other.length === 0 && READ_VERBS.has(git.sub)) {
     const bad = gitReadArgs(rc, git, roots.worktree, rc.cwdRaw);
-    return bad ?? allow("git-local", `git ${git.sub}`);
+    return bad ?? repositoryAllow("git-local", `git ${git.sub}`);
   }
   if (git.other.length > 0 || git.noOptionalLocks) return noRule(`git ${git.other.join(" ")} ${git.sub}`);
   if (git.sub === "add") {
     const rest = args[0] === "--dry-run" ? args.slice(1) : args;
     if (rest[0] !== "--" || rest.length < 2) return noRule("git add other than [--dry-run] -- <paths>");
     const checked = checkAll(rc, rest.slice(1), "read", [roots.worktree]);
-    return checked.ok ? allow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
+    return checked.ok ? repositoryAllow("git-local", `git add ${rest.length - 1} path(s)`) : checked.result;
   }
   if (git.sub === "commit") {
+    if (rc.mode === "live") return noRule("git commit may execute crew-controlled hooks; requires a person in live mode");
     const rest = args[0] === "--dry-run" ? args.slice(1) : args;
     if (rest.length !== 2 || rest[0] !== "-m") return noRule("git commit other than [--dry-run] -m '<message>'");
     return allow("git-local", "git commit");
@@ -1187,7 +1194,7 @@ function gitRule(rc: RuleContext, statement: Extract<Statement, { kind: "command
       return noRule("git branch other than <name> [<rev>]");
     }
     if (args.some((arg) => arg.includes(".."))) return noRule("git branch with ..");
-    return allow("git-local", `git branch ${args[0]}`);
+    return repositoryAllow("git-local", `git branch ${args[0]}`);
   }
   return noRule(`git ${git.sub}`);
 }
@@ -1224,6 +1231,17 @@ function prefixToken(token: string, word: string | undefined): boolean {
 
 function execRule(rc: RuleContext, statement: Extract<Statement, { kind: "command" }>): StatementResult {
   const words = statement.words;
+  // A prefix naming an interpreter flag does not name the program it will run. Keep these visible in
+  // shadow, but require a person for inline code (including bundled short flags) in live mode.
+  const bundledInterpreter = words.some((word) => /^(?:py|(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(programOf([word]).native));
+  const inlineFlag = bundledInterpreter
+    ? /^-[A-Za-z0-9]*[cepE]|^--(?:eval|print|command)(?:=|$)/
+    : /^-[bBdiIOqsSuUvVxX]*[cep]|^--(?:eval|print|command)(?:=|$)/;
+  if (rc.mode === "live" && (words.some((word) => inlineFlag.test(word.value))
+    || words.some((word, index) => programOf([word]).native === "deno"
+      && words.slice(index + 1).some((argument) => argument.value === "eval")))) {
+    return noRule("inline interpreter code requires a person in live mode");
+  }
   const roots = rc.roots;
   const toolPaths = [roots.homeTools.fmpy, roots.homeTools.privacyCheck];
   if (rc.extraHardware === null) return refuse("hardware", "the never-auto supplement is missing or invalid, so no exec statement is allowed");
@@ -1349,6 +1367,13 @@ export function match(request: PermitRequest, permitsRaw: unknown, context: Matc
   if (!context.crew) return never("not-crew", "the agent has no crew label");
   if (context.task === null) return never("not-crew", "the agent has no task label");
   if (!taskIdOk(context.task)) return never("not-crew", `the task id ${JSON.stringify(context.task.slice(0, 80))} is reserved or not a slug`);
+  // Live answering must gate permits before any never-auto or allow rule (spec 3.8).
+  if (context.mode === "live") {
+    const livePermits = parsePermits(permitsRaw);
+    if (livePermits === null || livePermits.task !== context.task || !livePermits.live) {
+      return never("no-permits", "valid live permits for this task are required");
+    }
+  }
   if (request.provider !== "codex" || request.name !== "CodexBash" || request.kind !== "tool") {
     return never("not-v1", `${request.provider} ${request.name} ${request.kind}`);
   }
@@ -1380,7 +1405,7 @@ export function match(request: PermitRequest, permitsRaw: unknown, context: Matc
   const roots = new Roots(context, permits);
   const cwd = roots.cwd(cwdRaw);
   if (!cwd.ok) return never(cwd.id, cwd.reason);
-  const rc: RuleContext = { roots, permits, extraHardware: context.extraHardware, cwd: cwd.path, cwdRaw };
+  const rc: RuleContext = { roots, permits, mode: context.mode, extraHardware: context.extraHardware, cwd: cwd.path, cwdRaw };
   const results = parsed.statements.map((statement) => ruleFor(rc, statement));
   const refused = results.find((result) => !result.ok && result.rule.startsWith("never:")) ?? results.find((result) => !result.ok);
   if (refused !== undefined && !refused.ok) {
