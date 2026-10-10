@@ -99,6 +99,8 @@ upstream's `>=0.11.0`.
 Reloading brokers share a state-path queue in the daemon process and load fresh state before each
 reservation, keeping attempts and rate counts atomic across instances. Pending refusals are visible
 before their durable writes run. Stopping an instance invalidates work before it sends an answer.
+Only a missing broker state file starts fresh. Unreadable, unparsable or malformed state relays live
+requests as `state-error` and is never overwritten; pending refusals survive until a valid save.
 
 ## Where the plugin lives
 

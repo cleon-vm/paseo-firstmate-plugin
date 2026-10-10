@@ -131,6 +131,32 @@ function judge(attempt: Attempt, mode: MatchContext["mode"] = "shadow") {
 
 describe("live execution follow-ups", () => {
   it.each([
+    ["python -Ec 'print(1)'", ["python"]],
+    ["python '-Ecprint(1)'", ["python"]],
+    ["python -Pc 'print(1)'", ["python"]],
+    ["python -Rc 'print(1)'", ["python"]],
+    ["python -hc 'print(1)'", ["python"]],
+    ["perl -E 'say 1'", ["perl"]],
+    ["perl -we 'print 1'", ["perl"]],
+    ["perl -lne 'print'", ["perl"]],
+    ["ruby -we 'puts 1'", ["ruby"]],
+    ["uv run --offline python -Ec 'print(1)'", ["uv", "run"]],
+  ] as Array<[string, string[]]>)("relays round-2 bundled inline form %s", (script, prefix) => {
+    const attempt = { name: "round-2 inline", script, prefix };
+    expect(judge(attempt, "live").verdict).toBe("relay");
+    expect(judge(attempt, "shadow").verdict).toBe("allow");
+  });
+
+  it.each([
+    ["python -X utf8 -B -m unittest", ["python"]],
+    ["uv run --offline --no-project python example.py", ["uv", "run"]],
+    ["perl -w example.pl", ["perl"]],
+    ["ruby -w example.rb", ["ruby"]],
+  ] as Array<[string, string[]]>)("keeps named-script/module control %s live", (script, prefix) => {
+    expect(judge({ name: "named program", script, prefix }, "live").verdict).toBe("allow");
+  });
+
+  it.each([
     ["python '-cprint(1)'", ["python"]],
     ["python '-Bcprint(1)'", ["python"]],
     ["node -p '1+1'", ["node"]],

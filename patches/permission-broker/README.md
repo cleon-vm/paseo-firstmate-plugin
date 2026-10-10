@@ -87,6 +87,11 @@ matching request once with `allow`. It never denies a request or sends a message
   request from that agent relays as `attempt-cap`, including after reload. Older full ledgers compact
   on load. This bounds per-agent history while preserving never-retry for failures for the agent's
   entire life. Expiring old IDs by time would permit retries; other agents keep their own budgets.
+  A missing state file starts fresh. Every other read/parse failure or malformed ledger marks state
+  broken: live requests relay as `state-error`, and no mode saves over the broken file. File saves
+  check again for corruption introduced during matching. Pending refusals remain in memory and are
+  durably carried into the next successful save after valid repair. Missing-file recovery cannot
+  distinguish a first run from a removed ledger; preserve the original state when recovering it.
 - **Guarded.** Every hook catches its own errors and writes them to stderr: a failure costs that event's
   log line and nothing else.
 

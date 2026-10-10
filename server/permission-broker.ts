@@ -55,6 +55,8 @@ const MAX_ATTEMPTS_PER_AGENT = 4096;
 const STUCK_TURN_STATES: ReadonlySet<string> = new Set(["blocked", "needs-decision", "failed"]);
 
 export interface BrokerState {
+  /** Read/parse/schema failure; never answer live or save this state over the file. */
+  broken?: boolean;
   /** Crewmates that may not be answered any more, with when and why. */
   sticky: Record<string, { at: string; reason: string }>;
   /** When each crewmate's requests were judged `allow` in the last hour (ISO). */
@@ -268,6 +270,7 @@ export class PermissionBroker {
     }
     if (stickyId !== null && STICKY_IDS.has(stickyId) && state.sticky[agentId] === undefined) {
       state.sticky[agentId] = { at, reason: `never:${stickyId}` };
+      if (state.broken) this.rememberSticky(agentId, at, `never:${stickyId}`);
     }
     const attempts = state.attempts?.[agentId];
     if (mode === "live" && attempts?.includes(event.request.id)) {
@@ -276,6 +279,9 @@ export class PermissionBroker {
     if (mode === "live" && (attempts === null || (attempts?.length ?? 0) >= MAX_ATTEMPTS_PER_AGENT)) {
       state.attempts![agentId] = null;
       result = { verdict: "relay", rule: "attempt-cap", tier: null, detail: "the agent's live attempt ledger is exhausted; relay for its remaining life" };
+    }
+    if (mode === "live" && state.broken) {
+      result = { verdict: "relay", rule: "state-error", tier: null, detail: "the broker state is broken; repair it before live answering" };
     }
     if (result.verdict === "allow") state.allows[agentId] = [...recent, at];
     else if (recent.length !== (state.allows[agentId] ?? []).length) state.allows[agentId] = recent;
@@ -391,19 +397,21 @@ export class PermissionBroker {
   }
 
   private async makeSticky(agentId: string, at: string, reason: string, now: number): Promise<void> {
-    const pending = coordination.pendingSticky.get(this.queueKey) ?? new Map();
-    coordination.pendingSticky.set(this.queueKey, pending);
-    const mark = pending.get(agentId) ?? { at, reason };
-    pending.set(agentId, mark);
+    const mark = this.rememberSticky(agentId, at, reason);
     // A refusal must be visible to a request holding the queue before its durable write can run.
     await coordination.run(this.queueKey, async () => {
       const state = await this.load();
       state.sticky[agentId] ??= mark;
-      if (await this.persist(state, now)) {
-        if (pending.get(agentId) === mark) pending.delete(agentId);
-        if (pending.size === 0 && coordination.pendingSticky.get(this.queueKey) === pending) coordination.pendingSticky.delete(this.queueKey);
-      }
+      await this.persist(state, now);
     });
+  }
+
+  private rememberSticky(agentId: string, at: string, reason: string): { at: string; reason: string } {
+    const pending = coordination.pendingSticky.get(this.queueKey) ?? new Map();
+    coordination.pendingSticky.set(this.queueKey, pending);
+    const mark = pending.get(agentId) ?? { at, reason };
+    pending.set(agentId, mark);
+    return mark;
   }
 
   private pendingSticky(agentId: string): boolean {
@@ -458,13 +466,21 @@ export class PermissionBroker {
   }
 
   private async persist(state: BrokerState, now: number): Promise<boolean> {
+    if (state.broken) return false;
+    const pending = coordination.pendingSticky.get(this.queueKey);
+    const marks = [...(pending?.entries() ?? [])];
+    for (const [agentId, mark] of marks) state.sticky[agentId] ??= mark;
     // Sticky marks are never pruned by age: an agent stays sticky for its whole life (spec 3.7).
     for (const [agentId, times] of Object.entries(state.allows)) {
       const recent = times.filter((at) => Date.parse(at) > now - HOUR_MS);
       if (recent.length === 0) delete state.allows[agentId];
       else state.allows[agentId] = recent;
     }
-    return this.store.save(state).then(() => true).catch((error: unknown) => {
+    return this.store.save(state).then(() => {
+      for (const [agentId, mark] of marks) if (pending?.get(agentId) === mark) pending.delete(agentId);
+      if (pending?.size === 0 && coordination.pendingSticky.get(this.queueKey) === pending) coordination.pendingSticky.delete(this.queueKey);
+      return true;
+    }).catch((error: unknown) => {
       console.error("[firstmate] could not save the permission broker's state:", error);
       return false;
     });
@@ -475,39 +491,42 @@ export class PermissionBroker {
 // The file, and Paseo
 // ---------------------------------------------------------------------------
 
-/** The saved state, leniently: anything it cannot read starts afresh. */
+function stateRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Only a missing file starts fresh. A broken ledger is left intact for recovery. */
 export async function readBrokerState(path: string): Promise<BrokerState> {
-  let raw: unknown;
   try {
-    raw = JSON.parse(await readFile(path, "utf8"));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") console.error(`[firstmate] ${path} could not be read, starting afresh:`, error);
-    return emptyBrokerState();
-  }
-  const object = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const state = emptyBrokerState();
-  if (typeof object.sticky === "object" && object.sticky !== null) {
+    const object: unknown = JSON.parse(await readFile(path, "utf8"));
+    const invalid = (): never => { throw new Error("Invalid permission broker state"); };
+    if (!stateRecord(object) || object.broken || !stateRecord(object.sticky) || !stateRecord(object.allows)) return invalid();
+    const state = emptyBrokerState();
     for (const [agentId, mark] of Object.entries(object.sticky)) {
-      const { at, reason } = (mark ?? {}) as { at?: unknown; reason?: unknown };
-      if (typeof at === "string" && typeof reason === "string") state.sticky[agentId] = { at, reason };
+      if (!stateRecord(mark) || typeof mark.at !== "string" || !Number.isFinite(Date.parse(mark.at)) || typeof mark.reason !== "string") return invalid();
+      state.sticky[agentId] = { at: mark.at, reason: mark.reason };
     }
-  }
-  if (typeof object.allows === "object" && object.allows !== null) {
     for (const [agentId, times] of Object.entries(object.allows)) {
-      if (Array.isArray(times)) state.allows[agentId] = times.filter((at): at is string => typeof at === "string");
+      if (!Array.isArray(times) || !times.every((at) => typeof at === "string" && Number.isFinite(Date.parse(at)))) return invalid();
+      state.allows[agentId] = times;
     }
-  }
-  if (typeof object.attempts === "object" && object.attempts !== null) {
-    state.attempts = {};
-    for (const [agentId, ids] of Object.entries(object.attempts)) {
-      if (ids === null) state.attempts[agentId] = null;
-      else if (Array.isArray(ids)) {
-        const kept = ids.filter((id): id is string => typeof id === "string");
-        state.attempts[agentId] = kept.length >= MAX_ATTEMPTS_PER_AGENT ? null : kept;
+    if (object.attempts !== undefined) {
+      if (!stateRecord(object.attempts)) return invalid();
+      state.attempts = {};
+      for (const [agentId, ids] of Object.entries(object.attempts)) {
+        if (ids === null) state.attempts[agentId] = null;
+        else if (Array.isArray(ids)) {
+          if (!ids.every((id) => typeof id === "string")) return invalid();
+          state.attempts[agentId] = ids.length >= MAX_ATTEMPTS_PER_AGENT ? null : ids;
+        } else return invalid();
       }
     }
+    return state;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyBrokerState();
+    console.error(`[firstmate] ${path} could not be read; leaving the broker state unchanged:`, error);
+    return { ...emptyBrokerState(), broken: true };
   }
-  return state;
 }
 
 /** `permission-broker.json`, written whole to a temporary file and renamed into place. */
@@ -518,6 +537,9 @@ export function brokerFileStore(path: string): BrokerStore {
     load: () => readBrokerState(path),
     save: (state) =>
       serialized(path, async () => {
+        // A hand edit may have broken the file after the request loaded it. Never replace known
+        // broken bytes, including when shadow or a pending refusal tries to save.
+        if (state.broken || (await readBrokerState(path)).broken) throw new Error("Refusing to replace broken permission broker state");
         await mkdir(dirname(path), { recursive: true });
         const temporary = `${path}.${randomUUID()}.tmp`;
         await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
