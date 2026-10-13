@@ -1,12 +1,12 @@
 import { mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { FirstmateConfig } from "../shared/fleet";
-import { MAX_LOGGED_COMMAND, readBrokerState, redact, registerPermissionBroker } from "./permission-broker";
+import { MAX_LOGGED_COMMAND, PermissionBroker, readBrokerState, redact, registerPermissionBroker, type BrokerState } from "./permission-broker";
 import { NEVER_AUTO } from "./permit-rules";
 
 // A synthetic machine inside a temporary folder: every name and repository here is made up.
@@ -79,6 +79,10 @@ class FakeDaemon {
   labels = new Map<string, Record<string, string>>();
   writes: string[] = [];
   lookups = 0;
+  answers: Array<{ agentId: string; requestId: string; response: { behavior: string } }> = [];
+  answerError: Error | null = null;
+  answerPending = false;
+  answerStarted = vi.fn();
 
   api() {
     const record = (what: string) => async () => {
@@ -93,7 +97,13 @@ class FakeDaemon {
             if (labels === undefined) throw new Error(`Agent not found: ${id}`);
             return { agent: { id, labels, archivedAt: null, pendingPermissions: [] } };
           },
-          respondToPermission: record(`respondToPermission ${id}`),
+          respondToPermission: async (input: { requestId: string; response: { behavior: string } }) => {
+            this.writes.push(`respondToPermission ${id}`);
+            this.answers.push({ agentId: id, ...input });
+            this.answerStarted();
+            if (this.answerError !== null) throw this.answerError;
+            if (this.answerPending) await new Promise(() => undefined);
+          },
           send: record(`send ${id}`),
           interrupt: record(`interrupt ${id}`),
           archive: record(`archive ${id}`),
@@ -133,7 +143,7 @@ interface Setup {
   lines: () => Promise<Array<Record<string, unknown>>>;
 }
 
-async function setup(mode: FirstmateConfig["permissionBroker"] = "shadow", options: { append?: (path: string, text: string) => Promise<void> } = {}): Promise<Setup> {
+async function setup(mode: FirstmateConfig["permissionBroker"] = "shadow", options: { append?: (path: string, text: string) => Promise<void>; realpath?: (path: string) => string | null } = {}): Promise<Setup> {
   const m = await machine();
   const daemon = new FakeDaemon();
   daemon.labels.set("crew-1", { "firstmate.role": "crew", "firstmate.task": TASK, "firstmate.plan": "demo-plan" });
@@ -149,6 +159,7 @@ async function setup(mode: FirstmateConfig["permissionBroker"] = "shadow", optio
     userHome: m.user,
     now: () => T0,
     ...(options.append === undefined ? {} : { append: options.append }),
+    ...(options.realpath === undefined ? {} : { realpath: options.realpath }),
   });
   await wired.ready;
   const lines = async () => {
@@ -170,6 +181,7 @@ beforeEach(() => {
   errors = vi.spyOn(console, "error").mockImplementation(() => undefined);
 });
 afterEach(() => {
+  vi.useRealTimers();
   errors.mockRestore();
 });
 
@@ -178,7 +190,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("shadow never answers", () => {
-  it("makes no write to any agent across every fixture, in shadow and in live", async () => {
+  it("never answers in shadow and only answers matching live fixtures with allow", async () => {
     for (const mode of ["shadow", "live"] as const) {
       const s = await setup(mode);
       await writePermits(s.m, { live: true, exec: [{ in: "worktree", prefix: ["node"] }] });
@@ -195,19 +207,160 @@ describe("shadow never answers", () => {
         await s.server.emit("agent.permission_resolved", { agent: agent(s.m, "crew-2"), requestId: `permission-exec-${index}`, resolution: { behavior: "allow" } }, s.paseo);
       }
       const lines = await s.lines();
-      expect(s.daemon.writes).toEqual([]);
       expect(lines.filter((line) => line.event === "request")).toHaveLength(scripts.length);
-      expect(lines.every((line) => line.event !== "request" || line.answered === false)).toBe(true);
+      if (mode === "shadow") {
+        expect(s.daemon.writes).toEqual([]);
+        expect(lines.every((line) => line.event !== "request" || line.answered === false)).toBe(true);
+      } else {
+        const requests = lines.filter((line) => line.event === "request");
+        expect(s.daemon.answers).toHaveLength(requests.filter((line) => line.verdict === "allow").length);
+        expect(requests.every((line) => line.answered === (line.verdict === "allow"))).toBe(true);
+        expect(s.daemon.answers.every((answer) => answer.response.behavior === "allow")).toBe(true);
+        expect(s.daemon.writes.every((write) => write === "respondToPermission crew-2")).toBe(true);
+      }
       expect(lines.some((line) => line.verdict === "allow")).toBe(true);
     }
     // Every fixture through real file I/O, twice: about 4 s alone, more beside the rest of the suite.
   }, 30_000);
 
-  it("has no code path to an answer: no module of the broker names respondToPermission", async () => {
+  it("has no message path, and only the broker can name the answer SDK", async () => {
     for (const file of ["permission-broker.ts", "permit-match.ts", "permit-rules.ts"]) {
       const source = await readFile(join(import.meta.dirname, file), "utf8");
-      expect(source, file).not.toMatch(/respondToPermission|\.send\(|sendWithoutInterrupting/);
+      expect(source, file).not.toMatch(/\.send\(|sendWithoutInterrupting/);
+      if (file !== "permission-broker.ts") expect(source, file).not.toContain("respondToPermission");
     }
+  });
+});
+
+describe("live answers", () => {
+  it("answers a matching request once with allow", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    const event = permissionRequested(s.m, ALLOWED_SCRIPT(s.m));
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    expect(s.daemon.answers).toEqual([{ agentId: "crew-1", requestId: "permission-exec-1", response: { behavior: "allow" } }]);
+    expect((await s.lines())[0]).toMatchObject({ mode: "live", verdict: "allow", answered: true });
+    expect(s.daemon.writes).toEqual(["respondToPermission crew-1"]);
+  });
+
+  it("does not answer the same request twice, including concurrent hooks and a reload", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    const event = permissionRequested(s.m, ALLOWED_SCRIPT(s.m));
+    await Promise.all([s.server.emit("agent.permission_requested", event, s.paseo), s.server.emit("agent.permission_requested", event, s.paseo)]);
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    expect(s.daemon.answers).toHaveLength(1);
+    expect((await s.lines()).filter((line) => line.answered === true)).toHaveLength(1);
+  });
+
+  it("logs a failed SDK call by error class only and never retries or sends a message", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    s.daemon.answerError = new TypeError("private SDK detail must not be logged");
+    const event = permissionRequested(s.m, ALLOWED_SCRIPT(s.m));
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    const lines = await s.lines();
+    expect(lines[0]).toMatchObject({ answered: false, answerError: "TypeError" });
+    expect(JSON.stringify(lines)).not.toContain("private SDK detail");
+    expect(s.daemon.writes).toEqual(["respondToPermission crew-1"]);
+  });
+
+  it("times out a hanging SDK call after ten seconds and never retries", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    s.daemon.answerPending = true;
+    const started = new Promise<void>((resolve) => s.daemon.answerStarted.mockImplementation(resolve));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const event = permissionRequested(s.m, ALLOWED_SCRIPT(s.m));
+    const hook = s.server.emit("agent.permission_requested", event, s.paseo);
+    await started;
+    await vi.advanceTimersByTimeAsync(10_000);
+    await hook;
+    expect((await s.lines())[0]).toMatchObject({ answered: false, answerError: "TimeoutError" });
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    expect(s.daemon.answers).toHaveLength(1);
+  });
+
+  it("rechecks paths after saving the reservation and relays a changed junction", async () => {
+    let checks = 0;
+    const s = await setup("live", { realpath: (path) => {
+      if (path.endsWith("review-scratch-1")) return ++checks === 1 ? path : "C:\\Outside\\example";
+      return path;
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(checks).toBeGreaterThanOrEqual(2);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines())[0]).toMatchObject({ verdict: "relay", answered: false });
+  });
+
+  it.each(["shadow", "off"] as const)("honors switching live to %s during matching without reload", async (mode) => {
+    let s: Setup;
+    s = await setup("live", { realpath: (path) => {
+      s.config.current = { ...s.config.current, permissionBroker: mode };
+      return path;
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines())[0]).toMatchObject({ rule: "changed", answered: false });
+  });
+
+  it("never answers when the durable reservation cannot be saved", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(s.m.stateFile, { recursive: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines())[0]).toMatchObject({ rule: "state-error", answered: false });
+  });
+
+  it("attributes only an allow sent for this agent and request within thirty seconds", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    for (const [id, requestId, behavior] of [["crew-1", "permission-exec-1", "allow"], ["crew-2", "permission-exec-1", "allow"], ["crew-1", "other", "allow"], ["crew-1", "permission-exec-1", "deny"]]) {
+      await s.server.emit("agent.permission_resolved", { agent: agent(s.m, id), requestId, resolution: { behavior } }, s.paseo);
+    }
+    expect((await s.lines()).filter((line) => line.event === "resolved").map((line) => line.byBroker)).toEqual([true, false, false, false]);
+  });
+
+  it("never answers live:false or shadow even when the same command matches live:true", async () => {
+    for (const [mode, live, count] of [["live", true, 1], ["live", false, 0], ["shadow", true, 0]] as const) {
+      const s = await setup(mode);
+      await writePermits(s.m, { live });
+      await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+      expect(s.daemon.answers).toHaveLength(count);
+      expect((await s.lines())[0]?.answered).toBe(count === 1);
+    }
+  });
+
+  it("never exceeds the hourly rate limit when matching hooks arrive together", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: { "crew-1": Array.from({ length: 119 }, () => new Date(T0).toISOString()) } }));
+    await Promise.all(["a", "b"].map((requestId) => s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId }), s.paseo)));
+    expect(s.daemon.answers).toHaveLength(1);
+    expect((await s.lines()).map((line) => [line.rule, line.answered])).toEqual([["notes-write", true], ["never:rate", false]]);
+  });
+
+  it("demonstrates one allowed command answered and one never-auto command left pending", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "demo-allowed" }), s.paseo);
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, "Remove-Item x", { requestId: "demo-never" }), s.paseo);
+    const summary = (await s.lines()).map(({ requestId, verdict, rule, answered }) => ({ requestId, verdict, rule, answered }));
+    expect(summary).toEqual([
+      { requestId: "demo-allowed", verdict: "allow", rule: "notes-write", answered: true },
+      { requestId: "demo-never", verdict: "relay", rule: "never:destructive", answered: false },
+    ]);
+    expect(s.daemon.answers).toEqual([{ agentId: "crew-1", requestId: "demo-allowed", response: { behavior: "allow" } }]);
+    console.log(summary.map((line) => JSON.stringify(line)).join("\n"));
   });
 });
 
@@ -215,10 +368,351 @@ describe("shadow never answers", () => {
 // 5. Sticky
 // ---------------------------------------------------------------------------
 
+describe("round 2 review regressions", () => {
+  it("keeps a sticky agent unanswered after corruption and leaves the broken bytes intact", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "denied", resolution: { behavior: "deny" } }, s.paseo);
+    await writeFile(s.m.stateFile, "{");
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "state-error", answered: false });
+    expect(await readFile(s.m.stateFile, "utf8")).toBe("{");
+  });
+
+  it("never answers an attempted request twice after corruption, including reload", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    const event = permissionRequested(s.m, ALLOWED_SCRIPT(s.m));
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    await writeFile(s.m.stateFile, "not json");
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 1000 });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", event, s.paseo);
+    expect(s.daemon.answers).toHaveLength(1);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "state-error", answered: false });
+    expect(await readFile(s.m.stateFile, "utf8")).toBe("not json");
+  });
+
+  it.each(["live", "shadow"] as const)("does not overwrite broken state in %s, retaining a pending deny after repair", async (mode) => {
+    const s = await setup(mode);
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    await writeFile(s.m.stateFile, "{");
+    await s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "denied", resolution: { behavior: "deny" } }, s.paseo);
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(await readFile(s.m.stateFile, "utf8")).toBe("{");
+    expect(s.daemon.answers).toEqual([]);
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: {} }));
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "repaired" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]?.reason).toBe("deny");
+  });
+
+  it("starts fresh only when the state file is missing", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    expect(await readBrokerState(s.m.stateFile)).toEqual({ sticky: {}, allows: {} });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(s.daemon.answers).toHaveLength(1);
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toEqual(["permission-exec-1"]);
+  });
+
+  it("treats an unreadable state path as broken without replacing it", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(s.m.stateFile, { recursive: true });
+    expect((await readBrokerState(s.m.stateFile)).broken).toBe(true);
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "state-error", answered: false });
+    expect(await readdir(s.m.stateFile)).toEqual([]);
+  });
+
+  it.each([
+    "null", "[]", "{}", '{"sticky":{},"allows":[],"attempts":{}}',
+    '{"sticky":{"crew-1":null},"allows":{}}',
+    '{"sticky":{},"allows":{"crew-1":["bad-time"]}}',
+    '{"sticky":{},"allows":{},"attempts":{"crew-1":[42]}}',
+  ])("fails closed on malformed ledger shape %s without overwriting it", async (bytes) => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    await writeFile(s.m.stateFile, bytes);
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "state-error", answered: false });
+    expect(await readFile(s.m.stateFile, "utf8")).toBe(bytes);
+  });
+
+  it("does not save over corruption introduced during matching", async () => {
+    let s: Setup;
+    let corrupt: Promise<void> | undefined;
+    s = await setup("live", { realpath: (path) => {
+      if (corrupt === undefined && path.endsWith("review-scratch-1")) corrupt = writeFile(s.m.stateFile, "{");
+      try { return realpathSync.native(path); } catch { return null; }
+    } });
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: {} }));
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    await corrupt;
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "state-error", answered: false });
+    expect(await readFile(s.m.stateFile, "utf8")).toBe("{");
+  });
+});
+
+describe("round 1 review regressions", () => {
+  it.each([
+    ["python '-cprint(1)'", "python"],
+    ["python '-Icprint(1)'", "python"],
+    ["node '-econsole.log(1)'", "node"],
+  ])("never sends allow for the hunter's attached inline form %s", async (script, interpreter) => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true, exec: [{ in: "worktree", prefix: [interpreter] }] });
+    await writeFile(join(s.m.home, "data", "permissions", "never-auto-extra.json"), await readFile(join(import.meta.dirname, "permit-fixtures", "never-auto-extra.json")));
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, `${interpreter} example.js`, { requestId: "control" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["control"]);
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: "inline" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["control"]);
+    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "relay", answered: false });
+  });
+
+  it.each([
+    "git add -- example.txt", "git branch example",
+    "git --no-optional-locks status", "git --no-optional-locks diff",
+    "git --no-optional-locks log", "git --no-optional-locks show",
+    "git --no-optional-locks rev-parse HEAD",
+  ])("relays repository-controlled execution in live: %s", async (script) => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true, exec: [{ in: "worktree", prefix: ["git"] }] });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "relay", answered: false });
+    s.config.current = { ...s.config.current, permissionBroker: "shadow" };
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: "shadow" }), s.paseo);
+    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "allow", rule: "git-local", answered: false });
+  });
+
+  it.each(["log", "diff", "show", "rev-parse", "status", "archive"])("relays %s in a read repo in live, retaining its shadow judgment", async (verb) => {
+    const s = await setup("live");
+    const repo = join(s.m.root, "review-repo");
+    await mkdir(repo);
+    await writePermits(s.m, { live: true, readRepos: [repo] });
+    const args = verb === "archive" ? `HEAD --output='${s.m.notes}\\example.zip'` : "HEAD";
+    const script = `git --no-optional-locks -C '${repo}' ${verb} ${args}`;
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    s.config.current = { ...s.config.current, permissionBroker: "shadow" };
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script, { requestId: "shadow" }), s.paseo);
+    expect((await s.lines()).at(-1)).toMatchObject({ verdict: "allow", rule: "git-read", answered: false });
+  });
+
+  it.each(["duplicate", "rate", "agents"])("coordinates overlapping file-store instances for %s", async (kind) => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    if (kind === "rate") {
+      await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+      await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: { "crew-1": Array(119).fill(new Date(T0 - 1).toISOString()) } }));
+    }
+    const other = registerPermissionBroker(new FakeServer() as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0, host: { labels: async () => s.daemon.labels.get("crew-1")! } });
+    await other.ready;
+    await Promise.all([s.wired.broker.snapshot(), other.broker.snapshot()]);
+    const first = permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "first" });
+    const second = permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: kind === "duplicate" ? "first" : "second", id: kind === "agents" ? "crew-2" : "crew-1" });
+    await Promise.all([
+      s.server.emit("agent.permission_requested", first, s.paseo),
+      other.broker.onPermissionRequested(second as never, s.paseo as never),
+    ]);
+    expect(s.daemon.answers).toHaveLength(kind === "agents" ? 2 : 1);
+    const state = await readBrokerState(s.m.stateFile);
+    expect(state.allows["crew-1"]).toHaveLength(kind === "rate" ? 120 : 1);
+    expect(state.attempts?.["crew-1"]).toEqual(["first"]);
+    if (kind === "agents") {
+      expect(state.allows["crew-2"]).toHaveLength(1);
+      expect(state.attempts?.["crew-2"]).toEqual(["second"]);
+    }
+    other.stop();
+  });
+
+  it("invalidates an in-flight request on stop before its SDK call", async () => {
+    let s: Setup;
+    let stopped = false;
+    s = await setup("live", { realpath: (path) => {
+      if (!stopped && path.endsWith("review-scratch-1")) {
+        stopped = true;
+        s.wired.stop();
+      }
+      try { return realpathSync.native(path); } catch { return null; }
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(stopped).toBe(true);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "stopped", answered: false });
+  });
+
+  it.each(["duplicate", "rate"])("coordinates %s across reloaded modules wrapping the same custom store", async (kind) => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    let saved: BrokerState = { sticky: {}, allows: kind === "rate" ? { "crew-1": Array(119).fill(new Date(T0 - 1).toISOString()) } : {} };
+    const options = () => ({
+      host: { labels: async () => s.daemon.labels.get("crew-1")! },
+      store: { load: async () => structuredClone(saved), save: async (state: BrokerState) => { saved = structuredClone(state); } },
+      readConfig: async () => s.config.current, userHome: s.m.user, now: () => T0,
+      append: async () => undefined,
+    });
+    const old = new PermissionBroker(options());
+    vi.resetModules();
+    const { PermissionBroker: ReloadedBroker } = await import("./permission-broker");
+    const reloaded = new ReloadedBroker(options());
+    await Promise.all([old.snapshot(), reloaded.snapshot()]);
+    await Promise.all([
+      old.onPermissionRequested(permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "first" }) as never, s.paseo as never),
+      reloaded.onPermissionRequested(permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: kind === "duplicate" ? "first" : "second" }) as never, s.paseo as never),
+    ]);
+    expect(s.daemon.answers).toHaveLength(1);
+    expect(saved.allows["crew-1"]).toHaveLength(kind === "rate" ? 120 : 1);
+    expect(saved.attempts?.["crew-1"]).toEqual(["first"]);
+  });
+
+  it("invalidates queued work on stop while an already-sent SDK call reaches its deadline", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    s.daemon.answerPending = true;
+    const started = new Promise<void>((resolve) => s.daemon.answerStarted.mockImplementation(resolve));
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const first = s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "sent" }), s.paseo);
+    await started;
+    const queued = s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "queued" }), s.paseo);
+    s.wired.stop();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await Promise.all([first, queued]);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["sent"]);
+    expect((await s.lines()).map((line) => line.requestId)).toEqual(["sent"]);
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toEqual(["sent"]);
+  });
+
+  it.each(["missing", "live:false", "invalid", "other-task"])("keeps destructive stickiness under %s permits through reload", async (initial) => {
+    const s = await setup("live");
+    if (initial === "live:false") await writePermits(s.m);
+    if (initial === "invalid") await writePermits(s.m, { version: 99 });
+    if (initial === "other-task") await writePermits(s.m, { task: "demo-02-other" });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, "Remove-Item x", { requestId: "destructive" }), s.paseo);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "never:no-permits", answered: false });
+    await writePermits(s.m, { live: true });
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 1000 });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "later" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "never:after-refusal", answered: false });
+    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]?.reason).toBe("never:destructive");
+  });
+
+  it.each([
+    ["outward", "git push origin topic"],
+    ["credential", "Get-Content .env"],
+    ["system", "Set-ExecutionPolicy Unrestricted"],
+  ])("keeps %s stickiness even without live permits", async (reason, script) => {
+    const s = await setup("live");
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, script), s.paseo);
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "later" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]?.reason).toBe(`never:${reason}`);
+  });
+
+  it.each(["deny", "blocked"])("rechecks stickiness when %s lands during matching", async (trigger) => {
+    let s: Setup;
+    let refusal: Promise<void> | undefined;
+    s = await setup("live", { realpath: (path) => {
+      if (refusal === undefined && path.endsWith("review-scratch-1")) {
+        refusal = trigger === "deny"
+          ? s.server.emit("agent.permission_resolved", { agent: agent(s.m), requestId: "other", resolution: { behavior: "deny" } }, s.paseo)
+          : s.server.emit("agent.turn_ended", { agent: agent(s.m), turnId: "t1", outcome: { kind: "completed" }, timeline: [{ type: "assistant_message", text: "blocked: database unavailable" }] }, s.paseo);
+      }
+      try { return realpathSync.native(path); } catch { return null; }
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(refusal).toBeDefined();
+    await refusal;
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).find((line) => line.event === "request")).toMatchObject({ rule: "never:after-refusal", answered: false });
+  });
+
+  it("rejects changed permits bytes even when both versions allow the request", async () => {
+    let s: Setup;
+    let changed: Promise<void> | undefined;
+    s = await setup("live", { realpath: (path) => {
+      if (changed === undefined && path.endsWith("review-scratch-1")) {
+        changed = writePermits(s.m, { live: true, netRead: { githubRepos: ["octo/another"], hosts: [] } });
+      }
+      try { return realpathSync.native(path); } catch { return null; }
+    } });
+    await writePermits(s.m, { live: true });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m)), s.paseo);
+    expect(changed).toBeDefined();
+    await changed;
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "changed", answered: false });
+    // The replacement permits are valid and still authorize this command for another agent.
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2", requestId: "fresh" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["fresh"]);
+  });
+
+  it("reserves the final attempt before compacting, retaining failures across reload", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: {}, attempts: { "crew-1": Array.from({ length: 4095 }, (_, index) => `old-${index}`) } }));
+    s.daemon.answerError = new Error("daemon unavailable");
+    s.daemon.answerStarted.mockImplementation(() => {
+      // Even the final permitted call has its no-retry marker durably saved before sending.
+      expect(JSON.parse(readFileSync(s.m.stateFile, "utf8")).attempts["crew-1"]).toBeNull();
+    });
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "last" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["last"]);
+    expect((await s.lines()).at(-1)).toMatchObject({ answered: false, answerError: "Error" });
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toBeNull();
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 1000 });
+    await reloaded.ready;
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "last" }), s.paseo);
+    expect(s.daemon.answers).toHaveLength(1);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "attempt-cap", answered: false });
+  });
+
+  it("compacts a full attempt ledger and never retries an old ID after reload", async () => {
+    const s = await setup("live");
+    await writePermits(s.m, { live: true });
+    await mkdir(join(s.m.root, "plugin-data"), { recursive: true });
+    const ids = Array.from({ length: 4096 }, (_, index) => `old-${index}`);
+    await writeFile(s.m.stateFile, JSON.stringify({ sticky: {}, allows: {}, attempts: { "crew-1": ids } }));
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "overflow" }), s.paseo);
+    expect(s.daemon.answers).toEqual([]);
+    expect((await s.lines()).at(-1)).toMatchObject({ rule: "attempt-cap", answered: false });
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toBeNull();
+    s.wired.stop();
+    const reloaded = registerPermissionBroker(s.server as never, async () => s.config.current, { stateFile: s.m.stateFile, userHome: s.m.user, now: () => T0 + 31 * 24 * 60 * 60 * 1000 });
+    await reloaded.ready;
+    for (const requestId of ["old-0", "new-id"]) {
+      await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId }), s.paseo);
+    }
+    expect(s.daemon.answers).toEqual([]);
+    expect((await readBrokerState(s.m.stateFile)).attempts?.["crew-1"]).toBeNull();
+    await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { id: "crew-2", requestId: "other-agent" }), s.paseo);
+    expect(s.daemon.answers.map((answer) => answer.requestId)).toEqual(["other-agent"]);
+  });
+});
+
 describe("after a refusal", () => {
-  async function stickyAfter(trigger: (s: Setup) => Promise<void>) {
-    const s = await setup();
-    await writePermits(s.m);
+  async function stickyAfter(trigger: (s: Setup) => Promise<void>, mode: FirstmateConfig["permissionBroker"] = "shadow") {
+    const s = await setup(mode);
+    await writePermits(s.m, { live: true });
     await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "before" }), s.paseo);
     await trigger(s);
     await s.server.emit("agent.permission_requested", permissionRequested(s.m, ALLOWED_SCRIPT(s.m), { requestId: "after" }), s.paseo);
@@ -262,6 +756,16 @@ describe("after a refusal", () => {
     expect(verdicts["after-reload"]).toBe("never:after-refusal");
     expect((await readBrokerState(s.m.stateFile)).sticky["crew-1"]).toBeDefined();
     expect(s.daemon.writes).toEqual([]);
+  });
+
+  it.each(triggers)("never answers live after %s, including after reload", async (_name, trigger) => {
+    const { s, verdicts } = await stickyAfter(trigger, "live");
+    expect(verdicts.before).toBe("notes-write");
+    expect(verdicts.after).toBe("never:after-refusal");
+    expect(verdicts["after-reload"]).toBe("never:after-refusal");
+    expect(s.daemon.answers).toHaveLength(1);
+    expect(s.daemon.answers[0]?.requestId).toBe("before");
+    expect(s.daemon.writes).toEqual(["respondToPermission crew-1"]);
   });
 
   it("is not set by a turn that ends done, or by an allow", async () => {

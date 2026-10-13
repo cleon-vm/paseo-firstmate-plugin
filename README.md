@@ -24,8 +24,8 @@ This repository is a patched copy of FirstMate 0.3.4 from
 top: a quota pill, Windows watches, images in the Files view, a notification relay after a restart,
 Reveal in explorer, fixes for chat typing lag and steer-box clicks, responsive
 status-report reads, telling the first mate about a steer at once, and a permission broker that logs
-what it would answer for crew permission requests (shadow only: it answers nothing, and it is off
-unless `permissionBroker` is set). [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
+crew permission requests and, in live mode with per-task live permits, answers matching requests once
+with allow (off by default). [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
 describes each one and how to reapply or undo it.
 
 Moving from 0.2.1 to 0.3.4 brings upstream's sidebar crew count, folding long suggestions, its type

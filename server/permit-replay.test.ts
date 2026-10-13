@@ -14,6 +14,7 @@
  *
  * `PERMIT_REPLAY_DETAIL=1` also prints each relay's index, label, rule and detail (paths, no commands).
  *
+ * The never-auto supplement is the public synthetic fixture; the private supplement is never read.
  * `PERMIT_REPLAY_HOME` names the first mate's home; by default it is four folders above the corpus
  * (`<home>/data/<plan>/evidence/corpus.jsonl`).
  */
@@ -133,9 +134,9 @@ function safeList(dir: string): string[] {
   }
 }
 
-function readSupplement(home: string): string[] | null {
+function readSupplement(): string[] | null {
   try {
-    return parseNeverAutoExtra(JSON.parse(readFileSync(join(home, "data", "permissions", "never-auto-extra.json"), "utf8")));
+    return parseNeverAutoExtra(JSON.parse(readFileSync(new URL("./permit-fixtures/never-auto-extra.json", import.meta.url), "utf8")));
   } catch {
     return null;
   }
@@ -157,8 +158,7 @@ describe.skipIf(CORPUS === "")("private replay of real permission requests", () 
     const userHome = homedir();
     const entries = readCorpus(CORPUS);
     const permits = maximalPermits(entries, home, userHome);
-    // The home's private supplement, as the broker reads it; never printed.
-    const extraHardware = readSupplement(home);
+    const extraHardware = readSupplement();
     const byLabel = new Map<string, { total: number; allowed: number; rules: Map<string, number> }>();
     const wrong: string[] = [];
     let tagged = 0;
