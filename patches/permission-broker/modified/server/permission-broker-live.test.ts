@@ -75,6 +75,7 @@ describe("round 3 interpreter bundles", () => {
     ["pythonw '-Ec' 'print(1)'", "pythonw"],
     ["pypy3 '-Ec' 'print(1)'", "pypy3"],
     ["py -3 -Ec 'print(1)'", "py"],
+    ["pyw -Ec 'x'", "pyw"],
   ])("relays inline code %s without a fake allow", async (script, interpreter) => {
     const r = rig(script, [interpreter]);
     await r.run();
@@ -84,6 +85,7 @@ describe("round 3 interpreter bundles", () => {
 
   it.each([
     ["py -3 example.py", "py"],
+    ["pyw example.py", "pyw"],
     ["pythonw example.py", "pythonw"],
     ["pypy3 example.py", "pypy3"],
     ["perl -0777 example.pl", "perl"],

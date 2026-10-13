@@ -58,7 +58,7 @@ diff --git a/server/permission-broker-live.test.ts b/server/permission-broker-li
 new file mode 100644
 --- /dev/null
 +++ b/server/permission-broker-live.test.ts
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,126 @@
 +/** Round-3 hunt regressions: synthetic files and fake answers; no command executes. */
 +import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 +
@@ -136,6 +136,7 @@ new file mode 100644
 +    ["pythonw '-Ec' 'print(1)'", "pythonw"],
 +    ["pypy3 '-Ec' 'print(1)'", "pypy3"],
 +    ["py -3 -Ec 'print(1)'", "py"],
++    ["pyw -Ec 'x'", "pyw"],
 +  ])("relays inline code %s without a fake allow", async (script, interpreter) => {
 +    const r = rig(script, [interpreter]);
 +    await r.run();
@@ -145,6 +146,7 @@ new file mode 100644
 +
 +  it.each([
 +    ["py -3 example.py", "py"],
++    ["pyw example.py", "pyw"],
 +    ["pythonw example.py", "pythonw"],
 +    ["pypy3 example.py", "pypy3"],
 +    ["perl -0777 example.pl", "perl"],
@@ -4402,7 +4404,7 @@ new file mode 100644
 +  const words = statement.words;
 +  // A prefix naming an interpreter flag does not name the program it will run. Keep these visible in
 +  // shadow, but require a person for inline code (including bundled short flags) in live mode.
-+  const bundledInterpreter = words.some((word) => /^(?:py|(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(programOf([word]).native));
++  const bundledInterpreter = words.some((word) => /^(?:pyw?|(?:pythonw?|pypy)(?:\d+(?:\.\d+)*)?|perl|ruby)$/.test(programOf([word]).native));
 +  const inlineFlag = bundledInterpreter
 +    ? /^-[A-Za-z0-9]*[cepE]|^--(?:eval|print|command)(?:=|$)/
 +    : /^-[bBdiIOqsSuUvVxX]*[cep]|^--(?:eval|print|command)(?:=|$)/;
