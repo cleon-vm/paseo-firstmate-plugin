@@ -1,12 +1,14 @@
-# Notification relay (local patch to FirstMate 0.3.4)
+# Notification relay (local patch to FirstMate 0.4.0)
 
 | Files | Patch file |
 | --- | --- |
 | `client/transcript-rows.ts`, `index.server.ts`, `server/templates.ts`, `templates/data/charter.md`, `templates/messages/restart-note.md` modified; `server/crew-relay.ts`, `server/crew-relay.test.ts`, `templates/messages/crew-relay.md`, `crew-relay-dropped.md`, `crew-relay-earlier.md`, `crew-relay-permission.md` new | `notification-relay.patch` |
 
-`original/` holds the five files as they were before this patch (stock 0.3.4 plus the quota pill, Windows watches and files images patches, files images including the read-image fix); `modified/` holds every patched or new file.
+`original/` holds the five files as they were before this patch (stock 0.4.0 plus the quota pill, Windows watches and files images patches, files images including the read-image fix); `modified/` holds every patched or new file.
 
 **Re-cut on 0.3.4.** First cut on 0.2.1. Upstream 0.3.4 added durable suggestion dismissal: a `suggestionsDismissed` template name in `server/templates.ts`, and in the charter a row for `data/suggestions-dismissed.md` and a paragraph on reading it. Neither overlaps this patch's edits, so both are kept beside the relay's four template names and its §7 text; only the patch's context changed. The other three files were not changed upstream. On 0.3.4 the relay's tests pass, as extended later by the steer-notify overlay (45 in `server/crew-relay.test.ts`).
+
+**Re-cut on 0.4.0.** Upstream 0.4.0 added a paragraph on `(actions: …)` to the charter's §2 and the field to two template lines there, away from this patch's §7 edits. `git merge-file` merged them with no conflict; `original/templates/data/charter.md` is now stock 0.4.0's and `modified/` keeps upstream's lines beside the relay's. Only the patch's charter context changed. The other four files were not changed upstream.
 
 **Order matters.** This patch is based on the tree with all three earlier patches applied (`index.server.ts` is touched by the quota pill and files images too). On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay. The relay does not touch the files the read-image fix changes, so it would also apply over the first files images version, but that tree does not load (the daemon refuses the `readImage` RPC name); make sure the fix is in first.
 

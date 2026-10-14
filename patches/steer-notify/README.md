@@ -42,7 +42,7 @@ A crewmate the captain types into in its own Paseo tab is not covered. The plugi
 
 `original/` holds the nine files it changes as they were before this overlay (`index.server.ts` is the
 status-report overlay's result; `crew-relay*`, `templates.ts` and `charter.md` are the notification
-relay's; the rest are stock 0.3.4). `modified/` holds all eleven after it, including the new
+relay's; the rest are stock 0.4.0). `modified/` holds all eleven after it, including the new
 `templates/messages/crew-relay-steered.md` and `templates/messages/steer-relay-unsaved.md`. `steer-notify.patch` reproduces that snapshot.
 
 Run `sh patches/steer-notify/check.sh` to check reproduction and all eleven root files. Set
@@ -57,6 +57,8 @@ patch's context changed. `index.server.ts`, `server/crew.ts`, the relay and the 
 were not changed upstream. Upstream's `server/send.ts` now passes `activeTurnBehavior: "steer"`
 through the released typed SDK; it does not tell the first mate about a steer, so this overlay is still needed.
 On 0.3.4 the 45 tests in `server/crew-relay.test.ts` pass.
+
+**Re-cut on 0.4.0.** Upstream 0.4.0 changed only the charter among this overlay's files (the `(actions: …)` paragraph and template lines in §2). It is in `original/` through the notification relay's re-cut and kept in `modified/`; `git merge-file` reported no conflict, and only the patch's charter context changed. On 0.4.0 the 45 tests in `server/crew-relay.test.ts` pass.
 
 Check and apply from the plugin directory:
 

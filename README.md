@@ -19,7 +19,7 @@ workers are ordinary Paseo agents you can open, read and type into like any othe
 manages, and Paseo itself tells the first mate when a worker finishes, fails or asks for permission.
 There is nothing else to install.
 
-This repository is a patched copy of FirstMate 0.3.4 from
+This repository is a patched copy of FirstMate 0.4.0 from
 [gpambrozio/paseo-plugins](https://github.com/gpambrozio/paseo-plugins), with ten local patches on
 top: a quota pill, Windows watches, images in the Files view, a notification relay after a restart,
 Reveal in explorer, fixes for chat typing lag and steer-box clicks, responsive
@@ -28,8 +28,9 @@ crew permission requests and, in live mode with per-task live permits, answers m
 with allow (off by default). [LOCAL-CHANGES.md](LOCAL-CHANGES.md)
 describes each one and how to reapply or undo it.
 
-Moving from 0.2.1 to 0.3.4 brings upstream's sidebar crew count, folding long suggestions, its type
-scale (text a size up, at Paseo's default sizes) and suggestions that stay dismissed. It also **raises
+0.4.0 adds buttons and an Answer box on a card waiting on your call (see below). Moving from 0.2.1
+to 0.3.4 brought upstream's sidebar crew count, folding long suggestions, its type scale (text a
+size up, at Paseo's default sizes) and suggestions that stay dismissed. It also **raises
 the Paseo requirement from 0.9.0 to 0.11.0**: 0.3.4 uses Paseo 0.11's plugin API and does not load on
 0.10 or older. On an older Paseo, install tag `v1.0.0` (`--ref v1.0.0`), which is 0.2.1 with the
 same patches.
@@ -126,6 +127,11 @@ writes into the first mate's home — its charter, the records it starts with, t
   mate will not suggest it again, and the board hides it if it does. When something about it changes —
   a new pull request, say — the first mate can suggest it again in new words, and that shows. With no
   suggestions there is no card and no tab.
+- **Answering the captain's call** — a card waiting on your decision ("Captain's call: merge web#42?")
+  shows the first mate's likely answers to it as buttons under that line ("Merge", "Hold"). Pressing one
+  sends that answer to the first mate right away, the same way a suggestion does. Under them, every
+  waiting card has an Answer box: type what you want, in your own words, and Send; it reaches the first
+  mate with the task's name in front, so it knows which decision you mean.
 
 ## The board
 

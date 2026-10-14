@@ -806,10 +806,10 @@ index e11b991..c0fab2a 100644
    watchFailed: "messages/watch-failed.md",
    watchDropped: "messages/watch-dropped.md",
 diff --git a/templates/data/charter.md b/templates/data/charter.md
-index 6d4be84..c27e2b6 100644
+index 5575330..b99e88b 100644
 --- a/templates/data/charter.md
 +++ b/templates/data/charter.md
-@@ -332,12 +332,14 @@ Nothing needs you to poll. What wakes you:
+@@ -349,12 +349,14 @@ Nothing needs you to poll. What wakes you:
    status line — and, for a permission, the request to answer. Paseo sends it once per prompt, and only
    when `notifyOnFinish` was on, so keep it on for every `create_agent` and `send_agent_prompt`.
  - **A `<firstmate-crew>` note from FirstMate** — the same note, for a crewmate whose creator is gone, such

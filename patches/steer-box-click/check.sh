@@ -1,7 +1,7 @@
 #!/bin/sh
 # Applies steer-box-click.patch to a scratch copy of original/ with the documented
 # command and checks the result is byte-identical to modified/. original/ is
-# stock 0.3.4: no other overlay edits client/card.tsx.
+# stock 0.4.0: no other overlay edits client/card.tsx.
 # Then checks each file in modified/: where a later overlay edits it, against
 # that overlay's original/ (its base); otherwise against the repository root
 # (line endings ignored there, since a Windows checkout may have CRLF).
