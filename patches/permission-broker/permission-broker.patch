@@ -5225,7 +5225,7 @@ new file mode 100644
 diff --git a/shared/fleet.ts b/shared/fleet.ts
 --- a/shared/fleet.ts
 +++ b/shared/fleet.ts
-@@ -222,6 +222,10 @@ export type Fleet = z.infer<typeof FleetSchema>;
+@@ -234,6 +234,10 @@ export type Fleet = z.infer<typeof FleetSchema>;
  // The daemon's own file: what handlers act on
  // ---------------------------------------------------------------------------
  
@@ -5236,7 +5236,7 @@ diff --git a/shared/fleet.ts b/shared/fleet.ts
  export const FirstmateConfigSchema = z.object({
    /** The first mate's home; empty means `$PASEO_HOME/plugin-data/firstmate/home`. */
    home: z.string().default(""),
-@@ -235,6 +239,12 @@ export const FirstmateConfigSchema = z.object({
+@@ -247,6 +251,12 @@ export const FirstmateConfigSchema = z.object({
    crewModeId: z.string().default(""),
    /** Watch scripts the captain has switched off on the board, by file name. */
    disabledWatches: z.array(z.string()).default([]),
@@ -5252,7 +5252,7 @@ diff --git a/shared/fleet.ts b/shared/fleet.ts
 diff --git a/templates/data/charter.md b/templates/data/charter.md
 --- a/templates/data/charter.md
 +++ b/templates/data/charter.md
-@@ -385,6 +385,8 @@ Read the crewmate's **status line** — the last line of its last message:
+@@ -402,6 +402,8 @@ Read the crewmate's **status line** — the last line of its last message:
  A **permission request** from a crewmate (`list_pending_permissions`, `respond_to_permission`): allow
  routine actions inside its worktree; deny, with a one-line reason, anything outside it; escalate anything
  destructive, irreversible or security-sensitive.

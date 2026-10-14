@@ -53,7 +53,7 @@ afterEach(() => {
 });
 
 function mount(card: FleetCard): void {
-  const element = createElement(CrewCard, { card, theme, compact: false, opener: null, onChanged: () => {} });
+  const element = createElement(CrewCard, { card, theme, compact: false, opener: null, onChanged: () => {}, toMate: null });
   act(() => {
     if (renderer) renderer.update(element);
     else renderer = create(element);

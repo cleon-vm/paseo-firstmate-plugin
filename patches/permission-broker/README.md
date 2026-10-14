@@ -127,7 +127,7 @@ when the broker is off.
 
 `original/` holds the four files it changes as they were before this overlay (`index.server.ts` and
 `templates/data/charter.md` are the steer-notify overlay's result; `server/config.ts` and `shared/fleet.ts`
-are stock 0.3.4). `modified/`
+are stock 0.4.0). `modified/`
 holds them after it, and the eight new files: `server/permission-broker.ts`, `server/permit-match.ts`,
 `server/permit-rules.ts`, their tests `server/permission-broker.test.ts`, `server/permit-match.test.ts`,
 `server/permit-bypass.test.ts` and `server/permit-replay.test.ts`, and the synthetic supplement
@@ -135,6 +135,8 @@ holds them after it, and the eight new files: `server/permission-broker.ts`, `se
 `sh patches/permission-broker/check.sh` (with TMPDIR set to an allowed temporary folder; it keeps its
 scratch copy) to check reproduction and all twelve root files. Because this overlay
 edits `index.server.ts` and the charter, the steer-notify check compares those files with this overlay's `original/`.
+
+**Re-cut on 0.4.0.** First cut on 0.3.4. Upstream 0.4.0 added the `CardAction` type and `BacklogItem.actions` to `shared/fleet.ts`, and the `(actions: …)` paragraph and template lines to the charter's §2, all away from this overlay's edits. Each file was merged with `git merge-file` with no conflict; `original/` now has upstream's lines and `modified/` keeps them. Only the patch's context (hunk line numbers) changed.
 
 Check and apply from the plugin directory:
 

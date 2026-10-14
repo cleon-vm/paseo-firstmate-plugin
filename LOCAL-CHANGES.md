@@ -1,12 +1,23 @@
 # Local changes
 
-This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.3.4**, taken from the npm package, with ten local patches applied. It is not a fork and nothing here has been sent upstream.
+This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.4.0**, taken from upstream's release commit (`5989657`, the same files npm publishes), with ten local patches applied. It is not a fork and nothing here has been sent upstream.
 
 - Upstream: https://github.com/gpambrozio/paseo-plugins (monorepo, plugin in `firstmate/`)
 - The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the ten patches below are local.
 - `README.md` and `CHANGELOG.md` are upstream's; `README.md` also has install instructions for this repository and a note on the patches.
 
-Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.3.4 plus all ten patches, including the steer-box, status-report, steer-notify and permission-broker overlays, with one exception: `server/cli.ts` also carries a Windows change from this repository's first commit that no patch records (it finds the desktop app's bundled `paseo.cmd` and starts it through `Paseo.exe`, since Windows cannot spawn a `.cmd` directly). Upstream has not changed that file up to 0.3.4, so it is kept as it was; reapplying the ten patches to an npm install does not restore it. The package version is upstream's 0.3.4; each patch README records its local version note.
+Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.4.0 plus all ten patches, including the steer-box, status-report, steer-notify and permission-broker overlays, with one exception: `server/cli.ts` also carries a Windows change from this repository's first commit that no patch records (it finds the desktop app's bundled `paseo.cmd` and starts it through `Paseo.exe`, since Windows cannot spawn a `.cmd` directly). Upstream has not changed that file up to 0.4.0, so it is kept as it was; reapplying the ten patches to an npm install does not restore it. The package version is upstream's 0.4.0; each patch README records its local version note.
+
+## Base 0.4.0
+
+The base is now upstream **0.4.0** (released 2026-10-09). The Paseo requirement is unchanged at `>=0.11.0`.
+
+What 0.4.0 brings (see `CHANGELOG.md`): a held backlog line can carry `(actions: Label => prompt | …)`, which the card draws as buttons under "Captain's call"; each sends its prompt to the first mate the way a suggestion does. Every held card also gets an Answer box that sends `<id> — <title>: <text>`. The charter's §2 gains a paragraph telling the first mate to write `(actions: …)` on every hold. New files: `client/card-answer.ts`; changed: `client/board.tsx`, `card.tsx`, `crewmate.tsx`, `fleet.tsx`, `mate-send.ts`, `panels.tsx`, `ui.tsx`, `server/backlog.ts`, `shared/fleet.ts`, the charter, `README.md` and `CHANGELOG.md`. Upstream's `AGENTS.md`, test files and lockfile are not carried here, as before.
+
+Four records were re-cut on 0.4.0 with the recipe below; the other six touch no file 0.4.0 changed, so their patches and snapshots are byte-identical:
+
+- **Steer box click**: upstream rewrote the card's root as a `View` holding a pressable too, but only to keep the Answer box out; the crew actions and the steer box were still inside. `git merge-file` conflicted, and the edit was redone by hand on upstream's card. Its test passes the new `toMate` prop as `null`.
+- **Notification relay**, **steer notify** and **permission broker**: upstream's charter and `shared/fleet.ts` lines land away from theirs; `git merge-file` merged each with no conflict, and only the patches' context changed.
 
 ## Base 0.3.4 and Paseo 0.11.0
 
@@ -116,7 +127,7 @@ The `<install-id>` folder can change on reinstall; use the current one.
 
 ## Reapply after an upstream / npm update
 
-An npm update of the plugin overwrites `$P` and drops all ten patches. The patches are cut on npm 0.3.4. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
+An npm update of the plugin overwrites `$P` and drops all ten patches. The patches are cut on 0.4.0. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
 
 ```
 git -c core.autocrlf=false apply -p2 --directory=. --check <repo>/patches/quota-pill/quota-pill.patch
