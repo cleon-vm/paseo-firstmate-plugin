@@ -17,3 +17,4 @@ patches/files-images/** text eol=lf
 patches/notification-relay/** text eol=lf
 patches/reveal-in-explorer/** text eol=lf
 patches/chat-input-lag/** text eol=lf
+patches/mobile-send-arrow/** text eol=lf

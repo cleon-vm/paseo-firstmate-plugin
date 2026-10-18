@@ -14,16 +14,30 @@
  * The padding sits inside the view, so it does not change the frame being
  * measured; there is no feedback loop. Where the platform resizes the window
  * for the keyboard itself, the overlap measures as zero and nothing is added.
- * No keyboard events fire on the web renderer, where this is a no-op.
+ * On the web, the visual viewport supplies the visible bottom instead: mobile
+ * browsers can shrink it for the keyboard without resizing the layout viewport.
  */
 import { useEffect, useState, type RefObject } from "react";
 import { Keyboard, LayoutAnimation, Platform, type KeyboardEvent, type View } from "react-native";
+import { trackViewportBottom } from "./web";
 
 export function useKeyboardOverlap(target: RefObject<View | null>): number {
   const [overlap, setOverlap] = useState(0);
 
   useEffect(() => {
-    if (Platform.OS === "web") return;
+    if (Platform.OS === "web") {
+      let revision = 0;
+      const stop = trackViewportBottom((bottom) => {
+        const current = ++revision;
+        target.current?.measureInWindow((_x, y, _width, height) => {
+          if (current === revision) setOverlap(Math.max(0, Math.round(y + height - bottom)));
+        });
+      });
+      return () => {
+        revision++;
+        stop();
+      };
+    }
     const ios = Platform.OS === "ios";
 
     /** Moves with the keyboard on iOS, as its own views do; Android just snaps. */

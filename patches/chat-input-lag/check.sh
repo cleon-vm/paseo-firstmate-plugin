@@ -11,7 +11,7 @@ set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 # Overlays applied after this one, in order.
-later="steer-box-click status-line-reads steer-notify permission-broker"
+later="steer-box-click status-line-reads steer-notify permission-broker mobile-send-arrow"
 scratch=$(mktemp -d)
 cp -R "$here/original/." "$scratch/"
 cd "$scratch"
@@ -32,10 +32,12 @@ for file in $(cd "$here/modified" && find . -type f | sort); do
   fi
   next=""
   for overlay in $later; do
-    if [ -f "$here/../$overlay/original/$applied" ]; then next=$overlay; break; fi
+    if [ -f "$here/../$overlay/original/$applied" ] || [ -f "$here/../$overlay/original/$applied.txt" ]; then next=$overlay; break; fi
   done
   if [ -n "$next" ]; then
-    if cmp -s "$here/modified/$file" "$here/../$next/original/$applied"; then
+    next_file="$here/../$next/original/$applied"
+    [ -f "$next_file" ] || next_file="$next_file.txt"
+    if cmp -s "$here/modified/$file" "$next_file"; then
       echo "same, base ok  $applied (next edited by $next)"
     else
       echo "BASE     $applied differs from $next's original/"

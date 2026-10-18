@@ -1,0 +1,269 @@
+diff --git a/client/chat.test.ts b/client/chat.test.ts
+index 907884e..7391791 100644
+--- a/client/chat.test.ts
++++ b/client/chat.test.ts
+@@ -71,6 +71,7 @@ const mate: AgentSummary = {
+ };
+ const changed = () => {};
+ const openFile = vi.fn();
++const scrollToEnd = vi.fn();
+ let renderer: ReactTestRenderer | undefined;
+ const TextHost = "Text" as ElementType;
+ const InputHost = "TextInput" as ElementType;
+@@ -92,7 +93,10 @@ async function mount(nextTheme = theme, onOpenFile = openFile, compact = false)
+   await act(async () => {
+     const element = createElement(MateChat, { mate, theme: nextTheme, compact, onChanged: changed, onOpenFile });
+     if (renderer) renderer.update(element);
+-    else renderer = create(element);
++    else renderer = create(element, { createNodeMock: () => ({
++      measureInWindow: (callback: (x: number, y: number, width: number, height: number) => void) => callback(0, 0, 400, 800),
++      scrollToEnd,
++    }) });
+   });
+ }
+ async function refresh(entries: TimelineEntry[]) {
+@@ -120,10 +124,38 @@ afterEach(async () => {
+   const mounted = renderer;
+   if (mounted) await act(async () => mounted.unmount());
+   renderer = undefined;
++  vi.unstubAllGlobals();
+   vi.useRealTimers();
+ });
+ 
+ describe("first mate chat history", () => {
++  it("lifts the actions for the browser keyboard and follows only while pinned", async () => {
++    const listeners = new Map<string, () => void>();
++    const viewport = {
++      height: 800, offsetTop: 0, scale: 1,
++      addEventListener: (name: string, listener: () => void) => listeners.set(name, listener),
++      removeEventListener: (name: string) => listeners.delete(name),
++    };
++    vi.stubGlobal("visualViewport", viewport);
++    await mount(theme, openFile, true);
++    const pane = () => renderer!.root.findAllByType("View" as ElementType).find((node) => Array.isArray(node.props.style) && "paddingBottom" in node.props.style[1])!;
++    scrollToEnd.mockClear();
++    await act(async () => { viewport.height = 480; listeners.get("resize")!(); });
++    expect(pane().props.style[1].paddingBottom).toBe(320);
++    expect(scrollToEnd).toHaveBeenCalled();
++    expect(renderer!.root.findAllByType("Pressable" as ElementType).find((node) => node.props.accessibilityLabel === "Send")).toBeDefined();
++    const scroller = renderer!.root.findByType("ScrollView" as ElementType);
++    await act(async () => scroller.props.onScroll({ nativeEvent: {
++      contentOffset: { y: 0 }, contentSize: { height: 2000 }, layoutMeasurement: { height: 300 },
++    } }));
++    scrollToEnd.mockClear();
++    await act(async () => { viewport.height = 450; listeners.get("resize")!(); });
++    expect(pane().props.style[1].paddingBottom).toBe(350);
++    expect(scrollToEnd).not.toHaveBeenCalled();
++    await act(async () => { viewport.height = 800; listeners.get("resize")!(); });
++    expect(pane().props.style[1].paddingBottom).toBe(0);
++  });
++
+   it("keeps long mixed Markdown history idle while the composer changes", async () => {
+     await mount();
+     expect(sources()).toHaveLength(75);
+diff --git a/client/keyboard.test.ts b/client/keyboard.test.ts
+new file mode 100644
+index 0000000..2109a9d
+--- /dev/null
++++ b/client/keyboard.test.ts
+@@ -0,0 +1,122 @@
++import { createElement, type RefObject } from "react";
++import { act, create, type ReactTestRenderer } from "react-test-renderer";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import type { KeyboardEvent, View } from "react-native";
++import { Keyboard, LayoutAnimation, Platform } from "react-native";
++
++vi.mock("react-native", () => ({
++  Platform: { OS: "web" },
++  Keyboard: { addListener: vi.fn() },
++  LayoutAnimation: { configureNext: vi.fn(), Types: { keyboard: "keyboard" } },
++}));
++
++import { useKeyboardOverlap } from "./keyboard";
++
++let renderer: ReactTestRenderer | undefined;
++let overlap = 0;
++let paneBottom = 800;
++const listeners = { resize: new Set<() => void>(), scroll: new Set<() => void>() };
++const viewport = {
++  height: 800, offsetTop: 0, scale: 1,
++  addEventListener: (type: "resize" | "scroll", listener: () => void) => listeners[type].add(listener),
++  removeEventListener: (type: "resize" | "scroll", listener: () => void) => listeners[type].delete(listener),
++};
++const target = { current: {
++  measureInWindow: (callback: (x: number, y: number, width: number, height: number) => void) =>
++    callback(0, 100, 400, paneBottom - 100),
++} } as RefObject<View>;
++
++function Probe() {
++  overlap = useKeyboardOverlap(target);
++  return null;
++}
++async function mount() {
++  await act(async () => { renderer = create(createElement(Probe)); });
++}
++async function change(height: number, offsetTop = 0, type: "resize" | "scroll" = "resize") {
++  await act(async () => {
++    Object.assign(viewport, { height, offsetTop });
++    listeners[type].forEach((listener) => listener());
++  });
++}
++
++beforeEach(() => {
++  Platform.OS = "web";
++  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
++  vi.stubGlobal("visualViewport", viewport);
++  Object.assign(viewport, { height: 800, offsetTop: 0, scale: 1 });
++  paneBottom = 800;
++  overlap = 0;
++});
++afterEach(async () => {
++  if (renderer) await act(async () => renderer!.unmount());
++  renderer = undefined;
++  vi.unstubAllGlobals();
++});
++
++it("keeps the composer bottom above an Android browser keyboard", async () => {
++  await mount();
++  expect(overlap).toBe(0);
++  await change(480);
++  // Both stacked actions end at or above the composer's bottom.
++  expect(paneBottom - overlap).toBeLessThanOrEqual(viewport.height);
++  expect(overlap).toBe(320);
++  await change(800);
++  expect(overlap).toBe(0);
++});
++
++it("does not double-count a host that already resizes the pane", async () => {
++  await mount();
++  paneBottom = 480;
++  await change(480);
++  expect(overlap).toBe(0);
++});
++
++it("accounts for browser panning and an already open keyboard on mount", async () => {
++  Object.assign(viewport, { height: 480, offsetTop: 80 });
++  await mount();
++  expect(overlap).toBe(240);
++  await change(480, 120, "scroll");
++  expect(overlap).toBe(200);
++});
++
++it("leaves desktop and browsers without VisualViewport alone and removes listeners", async () => {
++  await mount();
++  expect(overlap).toBe(0);
++  await act(async () => renderer!.unmount());
++  renderer = undefined;
++  expect(listeners.resize.size).toBe(0);
++  expect(listeners.scroll.size).toBe(0);
++  vi.stubGlobal("visualViewport", undefined);
++  await mount();
++  expect(overlap).toBe(0);
++});
++
++it("does not move the composer for pinch zoom", async () => {
++  await mount();
++  viewport.scale = 2;
++  await change(400);
++  expect(overlap).toBe(0);
++});
++
++it.each(["android", "ios"] as const)("preserves %s native keyboard events", async (platform) => {
++  Platform.OS = platform;
++  const nativeListeners = new Map<string, (event: KeyboardEvent) => void>();
++  const remove = vi.fn();
++  vi.mocked(Keyboard.addListener).mockImplementation((name, callback) => {
++    nativeListeners.set(name, callback);
++    return { remove } as unknown as ReturnType<typeof Keyboard.addListener>;
++  });
++  vi.mocked(LayoutAnimation.configureNext).mockClear();
++  await mount();
++  expect(listeners.resize.size).toBe(0);
++  const event = { duration: 250, endCoordinates: { screenY: 480 } } as KeyboardEvent;
++  await act(async () => nativeListeners.get(platform === "ios" ? "keyboardWillChangeFrame" : "keyboardDidShow")!(event));
++  expect(overlap).toBe(320);
++  expect(LayoutAnimation.configureNext).toHaveBeenCalledTimes(platform === "ios" ? 1 : 0);
++  await act(async () => nativeListeners.get(platform === "ios" ? "keyboardWillHide" : "keyboardDidHide")!(event));
++  expect(overlap).toBe(0);
++  await act(async () => renderer!.unmount());
++  renderer = undefined;
++  expect(remove).toHaveBeenCalledTimes(2);
++});
+diff --git a/client/keyboard.ts b/client/keyboard.ts
+index 8f58f6e..d1e32f4 100644
+--- a/client/keyboard.ts
++++ b/client/keyboard.ts
+@@ -14,16 +14,30 @@
+  * The padding sits inside the view, so it does not change the frame being
+  * measured; there is no feedback loop. Where the platform resizes the window
+  * for the keyboard itself, the overlap measures as zero and nothing is added.
+- * No keyboard events fire on the web renderer, where this is a no-op.
++ * On the web, the visual viewport supplies the visible bottom instead: mobile
++ * browsers can shrink it for the keyboard without resizing the layout viewport.
+  */
+ import { useEffect, useState, type RefObject } from "react";
+ import { Keyboard, LayoutAnimation, Platform, type KeyboardEvent, type View } from "react-native";
++import { trackViewportBottom } from "./web";
+ 
+ export function useKeyboardOverlap(target: RefObject<View | null>): number {
+   const [overlap, setOverlap] = useState(0);
+ 
+   useEffect(() => {
+-    if (Platform.OS === "web") return;
++    if (Platform.OS === "web") {
++      let revision = 0;
++      const stop = trackViewportBottom((bottom) => {
++        const current = ++revision;
++        target.current?.measureInWindow((_x, y, _width, height) => {
++          if (current === revision) setOverlap(Math.max(0, Math.round(y + height - bottom)));
++        });
++      });
++      return () => {
++        revision++;
++        stop();
++      };
++    }
+     const ios = Platform.OS === "ios";
+ 
+     /** Moves with the keyboard on iOS, as its own views do; Android just snaps. */
+diff --git a/client/web.ts b/client/web.ts
+index 18342ed..4ab9729 100644
+--- a/client/web.ts
++++ b/client/web.ts
+@@ -16,6 +16,13 @@ import { rasterImageType } from "../shared/attachments";
+ 
+ /** Only what this module reads off the web globals; the DOM library stays off. */
+ interface WebGlobals {
++  visualViewport?: {
++    height: number;
++    offsetTop: number;
++    scale: number;
++    addEventListener(type: string, listener: () => void): void;
++    removeEventListener(type: string, listener: () => void): void;
++  };
+   document?: {
+     addEventListener?: (type: string, listener: (event: unknown) => void) => void;
+     removeEventListener?: (type: string, listener: (event: unknown) => void) => void;
+@@ -25,6 +32,22 @@ interface WebGlobals {
+   removeEventListener?: (type: string, listener: () => void) => void;
+ }
+ 
++/** The visible bottom in layout-viewport coordinates, including keyboard resize and browser panning. */
++export function trackViewportBottom(onChange: (bottom: number) => void): () => void {
++  if (Platform.OS !== "web") return () => {};
++  const viewport = (globalThis as WebGlobals).visualViewport;
++  if (viewport === undefined) return () => {};
++  // Pinch zoom is navigation, not a keyboard opening; leave the layout alone.
++  const update = () => onChange(viewport.scale === 1 ? viewport.offsetTop + viewport.height : Infinity);
++  viewport.addEventListener("resize", update);
++  viewport.addEventListener("scroll", update);
++  update();
++  return () => {
++    viewport.removeEventListener("resize", update);
++    viewport.removeEventListener("scroll", update);
++  };
++}
++
+ /**
+  * Follows a drag at the document level on the web renderer, where the
+  * responder system alone is not enough: widening the chat means dragging

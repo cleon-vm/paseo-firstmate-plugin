@@ -1,12 +1,12 @@
 # Local changes
 
-This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.4.0**, taken from upstream's release commit (`5989657`, the same files npm publishes), with ten local patches applied. It is not a fork and nothing here has been sent upstream.
+This is a patched copy of the FirstMate plugin for Paseo, **`@gpambrozio/paseo-firstmate` 0.4.0**, taken from upstream's release commit (`5989657`, the same files npm publishes), with eleven local patches applied. It is not a fork and nothing here has been sent upstream.
 
 - Upstream: https://github.com/gpambrozio/paseo-plugins (monorepo, plugin in `firstmate/`)
-- The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the ten patches below are local.
+- The upstream code, the MIT license and its copyright notice (see `LICENSE`) belong to the upstream author, Gustavo Ambrozio. Only the eleven patches below are local.
 - `README.md` and `CHANGELOG.md` are upstream's; `README.md` also has install instructions for this repository and a note on the patches.
 
-Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.4.0 plus all ten patches, including the steer-box, status-report, steer-notify and permission-broker overlays, with one exception: `server/cli.ts` also carries a Windows change from this repository's first commit that no patch records (it finds the desktop app's bundled `paseo.cmd` and starts it through `Paseo.exe`, since Windows cannot spawn a `.cmd` directly). Upstream has not changed that file up to 0.4.0, so it is kept as it was; reapplying the ten patches to an npm install does not restore it. The package version is upstream's 0.4.0; each patch README records its local version note.
+Every file outside `patches/`, `LOCAL-CHANGES.md`, `.gitignore` and `.gitattributes` is stock 0.4.0 plus all eleven patches, including the steer-box, status-report, steer-notify and permission-broker overlays, with one exception: `server/cli.ts` also carries a Windows change from this repository's first commit that no patch records (it finds the desktop app's bundled `paseo.cmd` and starts it through `Paseo.exe`, since Windows cannot spawn a `.cmd` directly). Upstream has not changed that file up to 0.4.0, so it is kept as it was; reapplying the eleven patches to an npm install does not restore it. The package version is upstream's 0.4.0; each patch README records its local version note.
 
 ## Base 0.4.0
 
@@ -49,9 +49,11 @@ The re-cut, for the next upstream version: starting from the new stock files, fo
 | Permission broker | Checks crew requests against task permits and a fixed never-auto list, and logs requests and resolutions. Shadow answers nothing; live with task `live: true` reserves each matching request durably, repeats all checks and sends one allow with a ten-second deadline. Never denies or messages anyone. Off by default; switching to shadow or off stops answering without a reload. | modified `index.server.ts`, `server/config.ts`, `shared/fleet.ts`, `templates/data/charter.md`; new `server/permission-broker.ts`, `server/permit-match.ts`, `server/permit-rules.ts`, their tests (4) and a synthetic test fixture | [patches/permission-broker/README.md](patches/permission-broker/README.md) |
 | Steer box click | Only a card's header (title and summary) toggles it open and closed; the action buttons and the steer box sit outside that pressable, so a click in the box no longer folds the card and hides the box. | modified `client/card.tsx`; new `client/card.test.ts` | [patches/steer-box-click/README.md](patches/steer-box-click/README.md) |
 
-The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay, steer-notify overlay, permission-broker overlay. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it), `modified/` (every patched or new file), a README and `check.sh`. `.gitattributes` pins every patch folder to LF, so a CRLF checkout keeps them byte-identical to the LF files npm installs.
+| Mobile send arrow | Keeps the web composer's Send and Attach actions above the keyboard using visual-viewport overlap; preserves native keyboard handling and pinned scrolling. | modified `client/keyboard.ts`, `client/web.ts`, `client/chat.test.ts`; new `client/keyboard.test.ts` | [patches/mobile-send-arrow/README.md](patches/mobile-send-arrow/README.md) |
 
-To check every record, from the repository root (Git Bash on Windows): `for p in patches/*/check.sh; do sh "$p" || echo "FAILED $p"; done`. Each check applies its patch to a scratch copy of its `original/` with the documented command, checks the result is byte-identical to `modified/`, and checks each file against the repository root (line endings ignored) or, where a later patch edits that file again, against that patch's `original/`. So the ten checks together also check the chain from one patch to the next. The checks bound parent repository discovery for their scratch apply commands, so a TMPDIR inside a checkout cannot make a patch silently skip its paths, and they keep their scratch copies for inspection.
+The quota pill and Windows watches touch different files and apply independently, in either order. Files images is based on the tree with both of them applied (it also edits `index.server.ts`), the notification relay on the tree with all three, reveal in explorer on the tree with all four, and chat input lag on the tree with all five. Steer box click edits only `client/card.tsx`, which no other patch touches, so it applies in any order. On a fresh npm install the order is: quota pill, Windows watches, files images (with the read-image fix), notification relay, reveal in explorer, chat input lag, steer box click, status-report overlay, steer-notify overlay, permission-broker overlay, mobile send arrow. Each `patches/<name>/` folder holds the `.patch` file, `original/` (the files it changes, as they were before it), `modified/` (every patched or new file), a README and `check.sh`. `.gitattributes` pins every patch folder to LF, so a CRLF checkout keeps them byte-identical to the LF files npm installs.
+
+To check every record, from the repository root (Git Bash on Windows): `for p in patches/*/check.sh; do sh "$p" || echo "FAILED $p"; done`. Each check applies its patch to a scratch copy of its `original/` with the documented command, checks the result is byte-identical to `modified/`, and checks each file against the repository root (line endings ignored) or, where a later patch edits that file again, against that patch's `original/`. So the eleven checks together also check the chain from one patch to the next. The checks bound parent repository discovery for their scratch apply commands, so a TMPDIR inside a checkout cannot make a patch silently skip its paths, and they keep their scratch copies for inspection.
 
 ## Status-report fix after the seven patches
 
@@ -127,7 +129,7 @@ The `<install-id>` folder can change on reinstall; use the current one.
 
 ## Reapply after an upstream / npm update
 
-An npm update of the plugin overwrites `$P` and drops all ten patches. The patches are cut on 0.4.0. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
+An npm update of the plugin overwrites `$P` and drops all eleven patches. The patches are cut on 0.4.0. From a shell in `$P` (Git Bash or PowerShell), with `<repo>` being this repository:
 
 ```
 git -c core.autocrlf=false apply -p2 --directory=. --check <repo>/patches/quota-pill/quota-pill.patch
@@ -190,6 +192,13 @@ git -c core.autocrlf=false apply --check <repo>/patches/permission-broker/permis
 git -c core.autocrlf=false apply <repo>/patches/permission-broker/permission-broker.patch
 ```
 
+Then mobile send arrow (plain paths), checking first:
+
+```
+git -c core.autocrlf=false apply --check <repo>/patches/mobile-send-arrow/mobile-send-arrow.patch
+git -c core.autocrlf=false apply <repo>/patches/mobile-send-arrow/mobile-send-arrow.patch
+```
+
 Then `paseo plugin reload firstmate`. To install this repository over the npm source instead, from a clone at `<plugin-dir>`, remove FirstMate, then install the directory with its existing ID and reload:
 
 ```
@@ -215,6 +224,7 @@ paseo plugin reload firstmate
 Or undo the patches in place from `$P`, newest first:
 
 ```
+git -c core.autocrlf=false apply --reverse <repo>/patches/mobile-send-arrow/mobile-send-arrow.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/permission-broker/permission-broker.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/steer-notify/steer-notify.patch
 git -c core.autocrlf=false apply --reverse <repo>/patches/status-line-reads/status-line-reads.patch

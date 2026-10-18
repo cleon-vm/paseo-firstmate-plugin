@@ -16,6 +16,13 @@ import { rasterImageType } from "../shared/attachments";
 
 /** Only what this module reads off the web globals; the DOM library stays off. */
 interface WebGlobals {
+  visualViewport?: {
+    height: number;
+    offsetTop: number;
+    scale: number;
+    addEventListener(type: string, listener: () => void): void;
+    removeEventListener(type: string, listener: () => void): void;
+  };
   document?: {
     addEventListener?: (type: string, listener: (event: unknown) => void) => void;
     removeEventListener?: (type: string, listener: (event: unknown) => void) => void;
@@ -23,6 +30,22 @@ interface WebGlobals {
   };
   addEventListener?: (type: string, listener: () => void) => void;
   removeEventListener?: (type: string, listener: () => void) => void;
+}
+
+/** The visible bottom in layout-viewport coordinates, including keyboard resize and browser panning. */
+export function trackViewportBottom(onChange: (bottom: number) => void): () => void {
+  if (Platform.OS !== "web") return () => {};
+  const viewport = (globalThis as WebGlobals).visualViewport;
+  if (viewport === undefined) return () => {};
+  // Pinch zoom is navigation, not a keyboard opening; leave the layout alone.
+  const update = () => onChange(viewport.scale === 1 ? viewport.offsetTop + viewport.height : Infinity);
+  viewport.addEventListener("resize", update);
+  viewport.addEventListener("scroll", update);
+  update();
+  return () => {
+    viewport.removeEventListener("resize", update);
+    viewport.removeEventListener("scroll", update);
+  };
 }
 
 /**
