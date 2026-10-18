@@ -71,6 +71,7 @@ const mate: AgentSummary = {
 };
 const changed = () => {};
 const openFile = vi.fn();
+const scrollToEnd = vi.fn();
 let renderer: ReactTestRenderer | undefined;
 const TextHost = "Text" as ElementType;
 const InputHost = "TextInput" as ElementType;
@@ -92,7 +93,10 @@ async function mount(nextTheme = theme, onOpenFile = openFile, compact = false) 
   await act(async () => {
     const element = createElement(MateChat, { mate, theme: nextTheme, compact, onChanged: changed, onOpenFile });
     if (renderer) renderer.update(element);
-    else renderer = create(element);
+    else renderer = create(element, { createNodeMock: () => ({
+      measureInWindow: (callback: (x: number, y: number, width: number, height: number) => void) => callback(0, 0, 400, 800),
+      scrollToEnd,
+    }) });
   });
 }
 async function refresh(entries: TimelineEntry[]) {
@@ -120,10 +124,38 @@ afterEach(async () => {
   const mounted = renderer;
   if (mounted) await act(async () => mounted.unmount());
   renderer = undefined;
+  vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
 describe("first mate chat history", () => {
+  it("lifts the actions for the browser keyboard and follows only while pinned", async () => {
+    const listeners = new Map<string, () => void>();
+    const viewport = {
+      height: 800, offsetTop: 0, scale: 1,
+      addEventListener: (name: string, listener: () => void) => listeners.set(name, listener),
+      removeEventListener: (name: string) => listeners.delete(name),
+    };
+    vi.stubGlobal("visualViewport", viewport);
+    await mount(theme, openFile, true);
+    const pane = () => renderer!.root.findAllByType("View" as ElementType).find((node) => Array.isArray(node.props.style) && "paddingBottom" in node.props.style[1])!;
+    scrollToEnd.mockClear();
+    await act(async () => { viewport.height = 480; listeners.get("resize")!(); });
+    expect(pane().props.style[1].paddingBottom).toBe(320);
+    expect(scrollToEnd).toHaveBeenCalled();
+    expect(renderer!.root.findAllByType("Pressable" as ElementType).find((node) => node.props.accessibilityLabel === "Send")).toBeDefined();
+    const scroller = renderer!.root.findByType("ScrollView" as ElementType);
+    await act(async () => scroller.props.onScroll({ nativeEvent: {
+      contentOffset: { y: 0 }, contentSize: { height: 2000 }, layoutMeasurement: { height: 300 },
+    } }));
+    scrollToEnd.mockClear();
+    await act(async () => { viewport.height = 450; listeners.get("resize")!(); });
+    expect(pane().props.style[1].paddingBottom).toBe(350);
+    expect(scrollToEnd).not.toHaveBeenCalled();
+    await act(async () => { viewport.height = 800; listeners.get("resize")!(); });
+    expect(pane().props.style[1].paddingBottom).toBe(0);
+  });
+
   it("keeps long mixed Markdown history idle while the composer changes", async () => {
     await mount();
     expect(sources()).toHaveLength(75);
