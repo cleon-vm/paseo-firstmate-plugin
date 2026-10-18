@@ -1,5 +1,5 @@
 diff --git a/client/files.tsx b/client/files.tsx
-index 918510a..0ddc2cf 100644
+index 05ae50b..12a7b4d 100644
 --- a/client/files.tsx
 +++ b/client/files.tsx
 @@ -11,17 +11,21 @@
@@ -26,17 +26,18 @@ index 918510a..0ddc2cf 100644
  import { imageTypeOf, MAX_IMAGE_BYTES, SVG_TYPE } from "../shared/images";
  import { relativeTime } from "./format";
  import { useKeyboardOverlap } from "./keyboard";
-@@ -29,7 +33,9 @@ import { ImageViewer, type MarkdownImages } from "./image-view";
+@@ -29,8 +33,10 @@ import { ImageViewer, type MarkdownImages } from "./image-view";
  import { isSaveKey, type WebKeyPressEvent } from "./keys";
  import { Markdown } from "./markdown";
  import { isDirty, markSaved, openedImage, type OpenFile } from "./open-file";
 +import { absolutePath, menuPosition, revealLabel } from "./reveal";
  import { Banner, IconButton, MONOSPACE, errorText } from "./ui";
+ import { FONT_SIZE, lineHeightFor } from "./type-scale";
 +import { contextMenuProps, type MenuPoint } from "./web";
  
  interface FilesMemory {
    dir: string;
-@@ -65,6 +71,20 @@ interface PendingAction {
+@@ -66,6 +72,20 @@ interface PendingAction {
    run: () => void;
  }
  
@@ -57,7 +58,7 @@ index 918510a..0ddc2cf 100644
  /** A file another part of the panel asks the view to open — the charter's Compare, a watch's name. `at` tells two asks apart. */
  export interface FilesRequest {
    path: string;
-@@ -84,6 +104,7 @@ export function FilesView({
+@@ -85,6 +105,7 @@ export function FilesView({
    const read = useRpc(readHomeFile);
    const readImage = useRpc(readHomeImage);
    const write = useRpc(writeHomeFile);
@@ -65,7 +66,7 @@ index 918510a..0ddc2cf 100644
    const toast = useToast();
    const queryClient = useQueryClient();
  
-@@ -96,6 +117,9 @@ export function FilesView({
+@@ -97,6 +118,9 @@ export function FilesView({
    /** An action held back because the open file has unsaved changes. */
    const [pending, setPending] = useState<PendingAction | null>(null);
    const [newName, setNewName] = useState<string | null>(null);
@@ -75,7 +76,7 @@ index 918510a..0ddc2cf 100644
    const editorPane = useRef<View>(null);
    const keyboard = useKeyboardOverlap(editorPane);
  
-@@ -120,6 +144,32 @@ export function FilesView({
+@@ -121,6 +145,32 @@ export function FilesView({
    });
  
    const dirty = isDirty(open);
@@ -108,10 +109,10 @@ index 918510a..0ddc2cf 100644
  
    /** Runs `action` now, or once the captain has decided what to do with unsaved changes. */
    function guarded(label: string, action: () => void): void {
-@@ -298,6 +348,40 @@ export function FilesView({
+@@ -299,6 +349,40 @@ export function FilesView({
          backgroundColor: colors.surface1,
        },
-       confirmText: { flex: 1, minWidth: 160, color: colors.foreground, fontSize: 12 },
+       confirmText: { flex: 1, minWidth: 160, color: colors.foreground, fontSize: FONT_SIZE.small },
 +      menuBackdrop: { position: "absolute" as const, left: 0, right: 0, top: 0, bottom: 0 },
 +      menu: {
 +        position: "absolute" as const,
@@ -134,11 +135,11 @@ index 918510a..0ddc2cf 100644
 +        paddingHorizontal: 12,
 +        paddingVertical: 8,
 +      },
-+      menuItemText: { color: colors.foreground, fontSize: 13 },
++      menuItemText: { color: colors.foreground, fontSize: FONT_SIZE.body },
 +      menuNote: {
 +        color: colors.foregroundMuted,
-+        fontSize: 11,
-+        lineHeight: 15,
++        fontSize: FONT_SIZE.caption,
++        lineHeight: lineHeightFor(FONT_SIZE.caption),
 +        paddingHorizontal: 12,
 +        paddingTop: 6,
 +        paddingBottom: 4,
@@ -149,7 +150,7 @@ index 918510a..0ddc2cf 100644
      };
    }, [theme, compact]);
  
-@@ -340,6 +424,12 @@ export function FilesView({
+@@ -341,6 +425,12 @@ export function FilesView({
                  disabled={listing.isFetching}
                  onPress={() => void listing.refetch()}
                />
@@ -162,7 +163,7 @@ index 918510a..0ddc2cf 100644
              </>
            ) : (
              <>
-@@ -374,6 +464,7 @@ export function FilesView({
+@@ -375,6 +465,7 @@ export function FilesView({
              accessibilityRole="button"
              accessibilityLabel={`${entry.kind === "dir" ? "Folder" : "File"} ${entry.name}`}
              style={[styles.entry, open?.path === entry.path ? styles.entryOpen : null]}
@@ -170,7 +171,7 @@ index 918510a..0ddc2cf 100644
              onPress={() =>
                entry.kind === "dir"
                  ? setDir(entry.path)
-@@ -449,7 +540,8 @@ export function FilesView({
+@@ -450,7 +541,8 @@ export function FilesView({
      editorBody = (
        <Text style={styles.muted}>
          Pick a file to read or edit it. The first mate reads its charter from AGENTS.md and your standing orders
@@ -180,7 +181,7 @@ index 918510a..0ddc2cf 100644
        </Text>
      );
    } else if (open.kind === "unreadable") {
-@@ -525,7 +617,10 @@ export function FilesView({
+@@ -526,7 +618,10 @@ export function FilesView({
    const editorPaneView = (
      <View ref={editorPane} style={[styles.editorPane, { paddingBottom: keyboard }]}>
        {open === null && !compact ? null : (
@@ -192,7 +193,7 @@ index 918510a..0ddc2cf 100644
            {compact ? (
              <IconButton
                icon="ArrowLeft"
-@@ -582,6 +677,8 @@ export function FilesView({
+@@ -583,6 +678,8 @@ export function FilesView({
                  disabled={loadingPath !== null}
                  onPress={() => guarded("reload it from disk", () => load(open.path, { asText: open.kind === "text" }))}
                />
@@ -201,7 +202,7 @@ index 918510a..0ddc2cf 100644
                {open.kind === "text" ? (
                  <IconButton
                    icon="Save"
-@@ -633,11 +730,56 @@ export function FilesView({
+@@ -634,11 +731,56 @@ export function FilesView({
      </View>
    );
  

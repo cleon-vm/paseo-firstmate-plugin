@@ -1,4 +1,4 @@
-<!-- The crewmate's answer in steer-relay.md when it is longer than the plugin relays; {{answer}} is its start. -->
+<!-- The captain's words in steer-relay.md when they are longer than the plugin relays; {{text}} is their start. The whole message is in the crewmate's timeline. -->
 
-{{answer}}
+{{text}}
 [truncated; use get_agent_activity for the rest]

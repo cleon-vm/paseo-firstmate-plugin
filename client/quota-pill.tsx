@@ -26,6 +26,7 @@ import {
   type QuotaWindow,
 } from "../shared/quota";
 import { QUOTA_LOGOS } from "../shared/quota-logos";
+import { FONT_SIZE } from "./type-scale";
 
 const ICON_SIZE = 14;
 // One source object per provider: a new one each render makes the image reload.
@@ -125,7 +126,7 @@ export function QuotaPill({ theme }: { theme: PluginTheme }) {
         borderColor: colors.border,
         backgroundColor: colors.surface1,
       },
-      text: { fontSize: 12, fontWeight: "500" as const },
+      text: { fontSize: FONT_SIZE.small, fontWeight: "500" as const },
       cell: { flexDirection: "row" as const, alignItems: "center" as const, gap: 4 },
       titleRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 6 },
       card: {
@@ -137,8 +138,8 @@ export function QuotaPill({ theme }: { theme: PluginTheme }) {
         borderColor: colors.border,
         backgroundColor: colors.surface1,
       },
-      title: { color: colors.foreground, fontSize: 12, fontWeight: "600" as const },
-      line: { color: colors.foregroundMuted, fontSize: 11 },
+      title: { color: colors.foreground, fontSize: FONT_SIZE.small, fontWeight: "600" as const },
+      line: { color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
     }),
     [colors],
   );

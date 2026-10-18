@@ -14,6 +14,10 @@
  *   plugin saw it finish before. A crewmate whose creator is still live — the current first mate above
  *   all — is Paseo's to tell, and is left alone; so are canceled turns, agents without the crew label,
  *   and the first mate's own events.
+ * - **Crewmates the captain steered.** A steer from the board is not a prompt from the first mate, so
+ *   Paseo arms no note for it, and a plugin cannot arm one. `touch` records the crewmate in `touched`,
+ *   saved with the queue; from then on its events are relayed as an orphan's are, whoever created it,
+ *   until it is archived.
  * - **Not twice.** Each event has a key — the turn's id and the length of the timeline it ended with, a
  *   permission's request id — kept in `crew-relay.json` in the plugin's data folder with the queue, so
  *   a plugin reload neither loses a note nor sends one again. A note is taken off the queue and saved
@@ -98,6 +102,8 @@ export interface RelayNote {
   request?: unknown;
   /** Earlier turns of the same crewmate folded into this note while it waited. */
   earlier?: number;
+  /** Relayed because the captain steered the crewmate, not because its creator is gone. */
+  steered?: true;
 }
 
 export interface RelayState {
@@ -110,10 +116,12 @@ export interface RelayState {
   finished: Record<string, string>;
   /** When recent relay messages went (ISO), for the rate limit. */
   sent: string[];
+  /** Crewmates the captain steered from the board, with when it last did (ISO). */
+  touched: Record<string, string>;
 }
 
 export function emptyState(): RelayState {
-  return { handled: {}, queue: [], dropped: 0, finished: {}, sent: [] };
+  return { handled: {}, queue: [], dropped: 0, finished: {}, sent: [], touched: {} };
 }
 
 export interface RelayStore {
@@ -276,7 +284,16 @@ export function prune(state: RelayState, now: number): void {
     );
   state.handled = keep(state.handled, HANDLED_TTL_MS, MAX_HANDLED);
   state.finished = keep(state.finished, HANDLED_TTL_MS, MAX_FINISHED);
+  state.touched = keep(state.touched, HANDLED_TTL_MS, MAX_FINISHED);
   state.sent = state.sent.filter((at) => Date.parse(at) > now - HOUR_MS);
+}
+
+/** A permission request, quoted and then cut to the relay's cap; the ids to answer it come first in the JSON. */
+function clipRequest(request: string): string {
+  const escaped = quoted(request);
+  if (escaped.length <= MAX_RESPONSE_CHARS) return escaped;
+  const omitted = escaped.length - MAX_RESPONSE_CHARS;
+  return `${escaped.slice(0, MAX_RESPONSE_CHARS)}\n[truncated ${omitted} chars; use get_agent_status for the full request]`;
 }
 
 function clipResponse(text: string): string {
@@ -294,7 +311,7 @@ export async function relayBlock(note: RelayNote): Promise<string> {
   const sections: string[] = [];
   if (note.event === "needs permission" && note.requestId !== undefined) {
     const request = JSON.stringify({ agentId: note.agentId, requestId: note.requestId, request: note.request ?? null }, null, 2);
-    sections.push(await message(TEMPLATES.crewRelayPermission, { request: quoted(request) }));
+    sections.push(await message(TEMPLATES.crewRelayPermission, { request: clipRequest(request) }));
   }
   if (note.error !== undefined && note.error.trim() !== "") {
     sections.push(`<agent-error>\n${quoted(note.error.trim())}\n</agent-error>`);
@@ -305,7 +322,7 @@ export async function relayBlock(note: RelayNote): Promise<string> {
   if ((note.earlier ?? 0) > 0) {
     sections.push(await message(TEMPLATES.crewRelayEarlier, { count: String(note.earlier) }));
   }
-  return message(TEMPLATES.crewRelay, {
+  return message(note.steered ? TEMPLATES.crewRelaySteered : TEMPLATES.crewRelay, {
     agentId: note.agentId,
     // The title sits in Paseo's first line; a newline in it would break the line the chat shows.
     title: quoted(note.title.replace(/\s+/g, " ").trim()),
@@ -372,18 +389,41 @@ export class CrewRelay {
   }
 
   /**
-   * The creator of an orphaned crewmate, or null when the event is not the relay's: not a crewmate,
-   * the first mate itself, no creator on record, or a creator Paseo will tell — one that is still live.
+   * The creator of a crewmate whose news is the relay's, and whether that is because the captain
+   * steered it; null when the event is not the relay's: not a crewmate, the first mate itself, or —
+   * for a crewmate the captain has not steered — no creator on record, or a creator Paseo will tell,
+   * one that is still live.
    */
-  private async orphanCreator(agent: HookAgent): Promise<{ creatorId: string; facts: CrewFacts } | null> {
+  private async relayed(agent: HookAgent): Promise<{ creatorId: string; steered: boolean } | null> {
     const creatorId = agent.parentAgentId?.trim() ?? "";
-    if (creatorId === "") return null;
+    const touched = (await this.load()).touched[agent.id] !== undefined;
+    if (creatorId === "" && !touched) return null;
     const mateId = await this.host.configuredMateId();
     if (agent.id === mateId) return null;
     const facts = await this.host.crewFacts(agent.id);
     if (facts === null || !isCrew(agent.id, facts.labels, mateId)) return null;
-    if (await this.host.isLive(creatorId)) return null;
-    return { creatorId, facts };
+    if (creatorId !== "" && !(await this.host.isLive(creatorId))) return { creatorId, steered: false };
+    return touched ? { creatorId, steered: true } : null;
+  }
+
+  /**
+   * The captain steered the crewmate from the board: relay its news from now on. Saved before the
+   * steer is sent, so a turn that ends at once is still covered and a reload forgets nothing. False
+   * when the save failed: the steer is then remembered only until the plugin reloads, and the caller
+   * says so rather than letting it pass for a saved one.
+   */
+  async touch(agentId: string): Promise<boolean> {
+    const state = await this.load();
+    const now = this.now();
+    state.touched[agentId] = new Date(now).toISOString();
+    prune(state, now);
+    try {
+      await this.store.save(state);
+      return true;
+    } catch (error) {
+      console.error(`[firstmate] could not save the steer of ${agentId}; it is not durable:`, error);
+      return false;
+    }
   }
 
   async onTurnEnded(event: PluginLifecycleEvents["agent.turn_ended"]): Promise<void> {
@@ -391,10 +431,10 @@ export class CrewRelay {
     if (kind === null) return;
     const key = turnKey(event.agent.id, event.turnId, event.timeline.length);
     if ((await this.load()).handled[key] !== undefined) return;
-    const orphan = await this.orphanCreator(event.agent);
-    if (orphan === null) return;
+    const relayed = await this.relayed(event.agent);
+    if (relayed === null) return;
     const response = closingText(event.timeline);
-    await this.add(event.agent, orphan.creatorId, key, kind, {
+    await this.add(event.agent, relayed, key, kind, {
       ...(response === null ? {} : { response }),
       ...(event.outcome.kind === "failed" ? { error: event.outcome.error.message } : {}),
     });
@@ -403,9 +443,9 @@ export class CrewRelay {
   async onPermissionRequested(event: PluginLifecycleEvents["agent.permission_requested"]): Promise<void> {
     const key = permissionKey(event.agent.id, event.request.id);
     if ((await this.load()).handled[key] !== undefined) return;
-    const orphan = await this.orphanCreator(event.agent);
-    if (orphan === null) return;
-    await this.add(event.agent, orphan.creatorId, key, "needs permission", {
+    const relayed = await this.relayed(event.agent);
+    if (relayed === null) return;
+    await this.add(event.agent, relayed, key, "needs permission", {
       requestId: event.request.id,
       request: event.request,
     });
@@ -425,17 +465,22 @@ export class CrewRelay {
   async onArchived(event: PluginLifecycleEvents["agent.archived"]): Promise<void> {
     const state = await this.load();
     const key = closedKey(event.agent.id);
-    if (state.handled[key] !== undefined || state.finished[event.agent.id] === undefined) return;
-    const orphan = await this.orphanCreator(event.agent);
-    if (orphan === null) return;
-    // A permission the crewmate was waiting on cannot be answered any more.
-    state.queue = state.queue.filter((note) => !(note.agentId === event.agent.id && note.event === "needs permission"));
-    await this.add(event.agent, orphan.creatorId, key, "was closed", {});
+    const relayed =
+      state.handled[key] !== undefined || state.finished[event.agent.id] === undefined ? null : await this.relayed(event.agent);
+    if (relayed !== null) {
+      // A permission the crewmate was waiting on cannot be answered any more.
+      state.queue = state.queue.filter((note) => !(note.agentId === event.agent.id && note.event === "needs permission"));
+      await this.add(event.agent, relayed, key, "was closed", {});
+    }
+    if (state.touched[event.agent.id] !== undefined) {
+      delete state.touched[event.agent.id];
+      await this.persist();
+    }
   }
 
   private async add(
     agent: HookAgent,
-    creatorId: string,
+    relayed: { creatorId: string; steered: boolean },
     key: string,
     kind: RelayEvent,
     extra: Partial<RelayNote>,
@@ -445,14 +490,19 @@ export class CrewRelay {
     if (state.handled[key] !== undefined) return;
     const now = this.now();
     const at = new Date(now).toISOString();
+    // For a steered crewmate, a prompt from the first mate before the steer armed nothing still waiting.
+    const finished = state.finished[agent.id] ?? null;
+    const touched = relayed.steered ? (state.touched[agent.id] ?? null) : null;
+    const since = finished === null || (touched !== null && touched > finished) ? touched : finished;
     const note: RelayNote = {
       key,
       agentId: agent.id,
       title: agent.title ?? agent.id,
       event: kind,
-      creatorId,
+      creatorId: relayed.creatorId,
       at,
-      since: state.finished[agent.id] ?? null,
+      since,
+      ...(relayed.steered ? { steered: true as const } : {}),
       ...extra,
     };
     state.handled[key] = at;
@@ -542,7 +592,7 @@ export class CrewRelay {
 
     const waiting: RelayNote[] = [];
     for (const note of state.queue) {
-      if (note.creatorId === mate.id || toldByPaseo(note, actions)) continue;
+      if ((!note.steered && note.creatorId === mate.id) || toldByPaseo(note, actions)) continue;
       if (note.event === "needs permission") {
         const facts = await this.host.crewFacts(note.agentId).catch(() => null);
         if (facts === null || facts.archived || !facts.pendingPermissionIds.includes(note.requestId ?? "")) continue;
@@ -633,6 +683,7 @@ function readNote(value: unknown): RelayNote[] {
       ...optional("requestId"),
       ...("request" in note ? { request: note.request } : {}),
       ...(typeof note.earlier === "number" && note.earlier > 0 ? { earlier: Math.floor(note.earlier) } : {}),
+      ...(note.steered === true ? { steered: true as const } : {}),
     },
   ];
 }
@@ -655,6 +706,7 @@ export async function readRelayState(path: string): Promise<RelayState> {
     dropped: typeof object.dropped === "number" && object.dropped > 0 ? Math.floor(object.dropped) : 0,
     finished: strings(object.finished),
     sent: Array.isArray(object.sent) ? object.sent.filter((at): at is string => typeof at === "string") : [],
+    touched: strings(object.touched),
   };
 }
 

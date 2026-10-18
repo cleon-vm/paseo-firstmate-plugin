@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "neverAuto": {
+    "hardware": {
+      "commandBasenames": ["hwtool-a", "hwb"]
+    }
+  }
+}

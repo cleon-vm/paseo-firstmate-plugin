@@ -7,21 +7,26 @@
  * first mate's job, because it owns the brief and the backlog.
  *
  * Steering goes straight to the crewmate — the captain's words are
- * authoritative, as if typed into its tab — and the first mate hears about it
- * when that turn ends, through `CaptainSteers` and the `turn_ended` hook.
+ * authoritative, as if typed into its tab — and the first mate is told what
+ * was said at once. What the crewmate does after, the crew relay tells it
+ * (`server/crew-relay.ts`): Paseo arms its own note only for the first mate's
+ * prompts.
  */
-import type { PluginLifecycleRegistration } from "@getpaseo/plugin/server";
-
 import { CREW_LABELS, type FirstmateConfig } from "../shared/fleet";
 import { stopAgent } from "./cli";
-import { closingText, fetchLiveAgent, resolveMate } from "./fleet";
+import { fetchLiveAgent, resolveMate } from "./fleet";
 import type { PaseoAgent, PaseoApi } from "./host-types";
 import { askMate } from "./mate";
 import { sendWithoutInterrupting } from "./send";
 import { TEMPLATES, message } from "./templates";
+import { quoted } from "./watches";
 
-/** The most of a crewmate's answer relayed to the first mate; the same cap Paseo's own notification uses. */
+/** The most of the captain's words relayed to the first mate; the same cap Paseo's own notification uses. */
 const MAX_RELAYED_CHARS = 4000;
+/** The most of the crewmate's title in that note. */
+const MAX_TITLE_CHARS = 200;
+/** The most the whole note can be: the template, a capped title, capped words, and the warning. */
+export const MAX_STEER_NOTE_CHARS = 6000;
 
 /** Refuses anything that is not a live crewmate, so the board cannot be pointed at an arbitrary agent. */
 async function requireCrew(paseo: PaseoApi, agentId: string): Promise<PaseoAgent> {
@@ -33,64 +38,28 @@ async function requireCrew(paseo: PaseoApi, agentId: string): Promise<PaseoAgent
   return agent;
 }
 
-/** A steer nobody answered in this long is forgotten, so the map cannot grow for the life of the daemon. */
-const STEER_TTL_MS = 60 * 60 * 1000;
-
 /**
- * What the captain has said to each crewmate that the first mate has not yet
- * been told about. In memory: a plugin reload forgets it, and the first mate
- * learns of the exchange the next time it looks at that crewmate.
- *
- * A steer is handed over only by a turn that *contains* it — its text is one
- * of the ended turn's user messages. The first `turn_ended` after a steer is
- * not always the answer: the turn that was running when it was sent may end
- * first, and a provider that cannot join a running turn cancels it and starts
- * a new one, so the ended turn has to show it read the words.
+ * The crewmate is marked as steered before the send, so a turn that ends the
+ * instant the message lands is still relayed. The first mate is told once the
+ * crewmate has the words; a failure to tell it does not fail the steer. A mark
+ * that could not be saved still lets the steer go, but is logged and the note
+ * says so: the relay would forget the crewmate at the next reload.
  */
-export class CaptainSteers {
-  private readonly pending = new Map<string, Array<{ text: string; at: number }>>();
-
-  constructor(private readonly now: () => number = Date.now) {}
-
-  record(agentId: string, text: string): void {
-    this.pending.set(agentId, [...this.fresh(agentId), { text, at: this.now() }]);
-  }
-
-  /** Takes back a steer whose send failed, so it is never relayed as said. */
-  forget(agentId: string, text: string): void {
-    const kept = this.fresh(agentId).filter((entry) => entry.text !== text);
-    if (kept.length === 0) this.pending.delete(agentId);
-    else this.pending.set(agentId, kept);
-  }
-
-  /** The steers `userMessages` shows were read, removed; null when it shows none of them. */
-  take(agentId: string, userMessages: readonly string[]): string[] | null {
-    const entries = this.fresh(agentId);
-    const read = entries.filter((entry) => userMessages.some((message) => message.includes(entry.text.trim())));
-    const left = entries.filter((entry) => !read.includes(entry));
-    if (left.length === 0) this.pending.delete(agentId);
-    else this.pending.set(agentId, left);
-    return read.length === 0 ? null : read.map((entry) => entry.text);
-  }
-
-  private fresh(agentId: string): Array<{ text: string; at: number }> {
-    const cutoff = this.now() - STEER_TTL_MS;
-    return (this.pending.get(agentId) ?? []).filter((entry) => entry.at >= cutoff);
-  }
-}
-
-/**
- * Recorded before the send, so a turn that ends the instant the message lands
- * still finds it; taken back if the send fails.
- */
-export async function steerCrew(paseo: PaseoApi, steers: CaptainSteers, agentId: string, text: string): Promise<void> {
-  await requireCrew(paseo, agentId);
-  steers.record(agentId, text);
+export async function steerCrew(
+  paseo: PaseoApi,
+  relay: { touch(agentId: string): Promise<boolean> },
+  readConfig: () => Promise<FirstmateConfig>,
+  agentId: string,
+  text: string,
+): Promise<void> {
+  const agent = await requireCrew(paseo, agentId);
+  const saved = await relay.touch(agentId);
+  await sendWithoutInterrupting(paseo, agentId, text);
   try {
-    await sendWithoutInterrupting(paseo, agentId, text);
+    const mate = await resolveMate(paseo, await readConfig());
+    if (mate.agent !== null) await sendWithoutInterrupting(paseo, mate.agent.id, await steerNote(agent, text, saved));
   } catch (error) {
-    steers.forget(agentId, text);
-    throw error;
+    console.error(`[firstmate] could not tell the first mate about the captain's words to ${agentId}:`, error);
   }
 }
 
@@ -119,53 +88,24 @@ export async function relaunchCrew(paseo: PaseoApi, agentId: string, note: strin
   return askMate(paseo, { text: await relaunchText(agent, note) });
 }
 
-/** What the first mate is told when a turn the captain started from the board ends (`templates/messages/steer-relay.md`). */
-export async function relayText(
-  agent: { id: string; title: string | null },
-  captain: readonly string[],
-  answer: string | null,
-): Promise<string> {
-  const response =
-    answer === null
-      ? await message(TEMPLATES.steerRelayNoAnswer)
-      : answer.length <= MAX_RELAYED_CHARS
-        ? answer
-        : await message(TEMPLATES.steerRelayClipped, { answer: answer.slice(0, MAX_RELAYED_CHARS) });
+/**
+ * What the first mate is told the moment the captain steers a crewmate from the board
+ * (`templates/messages/steer-relay.md`). Quoted as the crew relay quotes, so nothing in the words
+ * or the title can close the note or open another, and cut after quoting, so the note stays within
+ * `MAX_STEER_NOTE_CHARS` however much escaping adds. `saved` false adds steer-relay-unsaved.md.
+ */
+export async function steerNote(agent: { id: string; title: string | null }, text: string, saved = true): Promise<string> {
+  const words = quoted(text.trim());
+  const captain =
+    words.length <= MAX_RELAYED_CHARS
+      ? words
+      : await message(TEMPLATES.steerRelayClipped, { text: words.slice(0, MAX_RELAYED_CHARS) });
+  const title = quoted((agent.title ?? agent.id).replace(/\s+/g, " ").trim());
+  const followup = await message(TEMPLATES.steerRelayNoAnswer);
   return message(TEMPLATES.steerRelay, {
     agentId: agent.id,
-    title: agent.title ?? agent.id,
-    captain: captain.join("\n\n"),
-    response,
-  });
-}
-
-/**
- * Paseo tells the first mate when a crewmate *it* prompted finishes. A turn
- * the captain started from the board was prompted by nobody Paseo knows to
- * notify, so this hook does it: when that turn ends, the first mate gets what
- * the captain said and what the crewmate answered.
- */
-export function registerSteerRelay(
-  server: PluginLifecycleRegistration,
-  steers: CaptainSteers,
-  readConfig: () => Promise<FirstmateConfig>,
-): () => void {
-  return server.on("agent.turn_ended", async (event, { paseo }) => {
-    // A cancelled turn is the one a steer replaced, not the one that answers it.
-    if (event.outcome.kind === "canceled") return;
-    const userMessages = event.timeline.flatMap((item) => (item.type === "user_message" ? [item.text] : []));
-    const captain = steers.take(event.agent.id, userMessages);
-    if (captain === null) return;
-    try {
-      const mate = await resolveMate(paseo, await readConfig());
-      if (mate.agent === null) return;
-      await sendWithoutInterrupting(
-        paseo,
-        mate.agent.id,
-        await relayText(event.agent, captain, closingText(event.timeline)),
-      );
-    } catch (error) {
-      console.error(`[firstmate] could not tell the first mate about the captain's words to ${event.agent.id}:`, error);
-    }
+    title: title.length <= MAX_TITLE_CHARS ? title : `${title.slice(0, MAX_TITLE_CHARS)}… [truncated]`,
+    captain,
+    followup: saved ? followup : `${await message(TEMPLATES.steerRelayUnsaved)}\n${followup}`,
   });
 }

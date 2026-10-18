@@ -1,3 +1,3 @@
-<!-- The crewmate's answer in steer-relay.md when it ended its turn without one. -->
+<!-- The end of steer-relay.md: the crewmate has not answered yet, and what follows reaches the first mate as crew relay notes (crew-relay-steered.md). -->
 
-(it ended the turn without a message)
+It has not answered yet. From now on FirstMate relays this crewmate's turn ends, errors and permission requests to you as `<firstmate-crew>` notes, except those Paseo already tells you about because you prompted it.

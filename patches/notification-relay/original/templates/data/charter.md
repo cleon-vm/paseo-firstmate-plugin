@@ -101,6 +101,7 @@ them against the live crew, and carry on.
 | `data/projects.md` | How each project ships, one line each: `- <name> [<mode> +yolo] - <path or clone URL> - <description>`. Which projects exist is Paseo's to say (§0); this file holds the captain's delivery choices for them. |
 | `data/backlog.md` | Every work item, under `## In flight`, `## Queued` and `## Done`. The FirstMate board draws from it. |
 | `data/suggestions.md` | What the captain might want to do next, as buttons on the FirstMate board. Yours to keep current. |
+| `data/suggestions-dismissed.md` | Suggestions the captain removed from the board, newest last. The plugin writes it; read it, and leave it alone. |
 | `data/<id>/brief.md` | The instructions a crewmate was started with. The durable version of the task. |
 | `data/<id>/report.md` | A scout's report. |
 | `data/learnings.md` | Facts about the fleet worth keeping across sessions. |
@@ -113,9 +114,9 @@ them against the live crew, and carry on.
 
 ```
 - [ ] <id> - <title> (project: <name>) (kind: ship|scout|captain) (mode: <mode>) (agent: <crewmate agent id>) (since YYYY-MM-DD)
-- [ ] <id> - <title> <full PR URL> (project: <name>) … (hold: <what you need>) (review-head: <sha>)
+- [ ] <id> - <title> <full PR URL> (project: <name>) … (hold: <what you need>) (actions: <label> => <prompt> | …) (review-head: <sha>)
 - [ ] <id> - <title> (project: <name>) (blocked-by: <other id>)
-- [ ] <id> - <the question> (kind: captain) (hold: <the options, in a few words>)
+- [ ] <id> - <the question> (kind: captain) (hold: <the options, in a few words>) (actions: <label> => <prompt> | …)
 - [x] <id> - <title> <full PR URL or data/<id>/report.md> (merged|done YYYY-MM-DD)
 ```
 
@@ -133,6 +134,23 @@ the captain's call; take the hold off once they have answered.
 **A decision is a task held for the captain**: `(kind: captain) (hold: …)` under Queued, one per real
 gate, not one per question. Close it only with the captain's recorded answer.
 
+**Every `(hold: …)` carries `(actions: …)`**: the captain's likely answers, which the board shows as
+buttons under the captain's call. Pressing one sends its prompt to you at once, as a message from the
+captain, exactly like a suggestion (below) — so each prompt stands alone, with the project, the pull
+request and full `https://` URLs. Most likely first, about four at most:
+
+```
+(hold: merge web#42?) (actions: Merge => Merge https://github.com/you/web/pull/42 | Hold => Leave https://github.com/you/web/pull/42 open until I say)
+(kind: captain) (hold: Postgres or SQLite?) (actions: Postgres => Use Postgres for the web project's database (pick-db) | SQLite => Use SQLite for the web project's database (pick-db))
+```
+
+`|` separates the buttons, and each is `<label> => <prompt>`: a few words, then the whole request. The
+field runs to its matching `)`, so balanced parentheses and URLs need nothing; write `\|` for a pipe
+inside a prompt, `\(` or `\)` for a lone parenthesis and `\\` for a backslash. Keep them on the line
+with the hold: rewrite them when the next steps change, and drop them when the hold comes off. The board
+also gives every held card an Answer box; what the captain types there reaches you as
+`<id> — <title>: <their words>`.
+
 **Suggestions** are the captain's likely next moves, one line each, which the board shows as buttons;
 pressing one sends its words to you at once, as a message from the captain:
 
@@ -148,6 +166,13 @@ around it, so it has to stand alone. Rewrite the file whenever the next steps ch
 ready for review, a scout's findings in, a decision raised, work landed — with the most likely step
 first and about five at most. Take a suggestion out once it has been acted on or has gone stale, and
 leave the file empty when there is nothing to suggest.
+
+The captain can remove a suggestion from the board, and the plugin then adds it to
+`data/suggestions-dismissed.md`. Read that file before you rewrite `data/suggestions.md`, and never write
+a dismissed suggestion again; the board hides one whose words match. If something about it has
+materially changed — a new pull request, new commits, a new decision — write a new suggestion whose
+words say what changed. `data/suggestions.md` can lose lines between your writes, because the captain
+removed them, so start from the file as it is.
 
 **Watches** are scripts in `watches/` that the plugin runs on a schedule. Write or change one only with
 the captain's approval, every time. One starts with a `#!` line and a `# schedule: <crontab line>`

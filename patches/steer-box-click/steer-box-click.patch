@@ -1,0 +1,320 @@
+diff --git a/modified/client/card.test.ts b/modified/client/card.test.ts
+new file mode 100644
+index 0000000..59e1f53
+--- /dev/null
++++ b/modified/client/card.test.ts
+@@ -0,0 +1,155 @@
++import { createElement, type ElementType } from "react";
++import { act, create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type { PluginTheme } from "@getpaseo/plugin";
++import type { AgentSummary, FleetCard } from "../shared/fleet";
++
++// The daemon and native host are boundaries; the card, its buttons and its
++// memory are real. A fake TextInput stands in for the host's.
++const host = vi.hoisted(() => ({
++  toast: { error: vi.fn(), show: vi.fn() },
++  rpc: vi.fn().mockResolvedValue({}),
++}));
++
++vi.mock("react-native", () => ({
++  View: "View", Text: "Text", Pressable: "Pressable", ActivityIndicator: "ActivityIndicator",
++  Platform: { OS: "web", select: (options: { default: unknown }) => options.default },
++}));
++vi.mock("@getpaseo/plugin/client/react-native", () => ({
++  Icon: "Icon", TextInput: "TextInput", useToast: () => host.toast,
++}));
++vi.mock("@getpaseo/plugin/client", () => ({ useRpc: () => host.rpc, openExternalUrl: vi.fn() }));
++
++import { CrewCard } from "./card";
++
++const theme = { colors: {
++  foreground: "#eee", foregroundMuted: "#aaa", surface0: "#111", surface1: "#222",
++  border: "#555", accent: "#08f", accentForeground: "#fff", statusDanger: "#f00",
++  statusWarning: "#fa0", statusSuccess: "#0f0",
++} } as unknown as PluginTheme;
++const Pressable = "Pressable" as ElementType;
++const InputHost = "TextInput" as ElementType;
++
++const agent: AgentSummary = {
++  id: "agent-1", workspaceId: null, title: "alpha", provider: "codex", model: null,
++  status: "idle", cwd: "/work", pendingPermissions: 0, requiresAttention: false,
++  lastError: null, updatedAt: "2026-01-01T00:00:00Z", labels: {},
++};
++let sequence = 0;
++// Card keys are remembered per module, so each test gets its own.
++function makeCard(): () => FleetCard {
++  const key = `agent:card-test-${sequence++}`;
++  return () => ({
++    key, column: "in-progress" as FleetCard["column"], taskId: "T1", title: "Alpha task",
++    project: "proj", kind: null, backlog: null, agent: { ...agent }, report: null, url: null,
++  });
++}
++
++let renderer: ReactTestRenderer | undefined;
++afterEach(() => {
++  act(() => renderer?.unmount());
++  renderer = undefined;
++  host.rpc.mockClear();
++});
++
++function mount(card: FleetCard): void {
++  const element = createElement(CrewCard, { card, theme, compact: false, opener: null, onChanged: () => {}, toMate: null });
++  act(() => {
++    if (renderer) renderer.update(element);
++    else renderer = create(element);
++  });
++}
++const labelled = (matches: (label: string) => boolean) =>
++  renderer!.root.findAll(
++    (node) => node.type === Pressable && typeof node.props.accessibilityLabel === "string" && matches(node.props.accessibilityLabel),
++  )[0]!;
++const header = () => labelled((label) => label.endsWith(" actions"));
++const button = (label: string) => labelled((found) => found === label);
++const box = () => renderer!.root.findAllByType(InputHost);
++const isOpen = () => header().props.accessibilityState.expanded as boolean;
++const ancestors = (node: ReactTestInstance) => {
++  const chain: ReactTestInstance[] = [];
++  for (let up = node.parent; up !== null; up = up.parent) chain.push(up);
++  return chain;
++};
++/** A click reaches the nearest pressable at or above the target, which stops it (as react-native-web does). */
++function click(target: ReactTestInstance): void {
++  const pressable = [target, ...ancestors(target)].find((node) => node.type === Pressable && node.props.onPress);
++  if (pressable) act(() => pressable.props.onPress());
++}
++function openSteerBox(card: FleetCard): void {
++  mount(card);
++  click(header());
++  click(button("Steer"));
++  act(() => box()[0]!.props.onChangeText("please rebase first"));
++}
++
++describe("CrewCard steer box", () => {
++  it("opens and closes on a press of the header, and only there", () => {
++    mount(makeCard()());
++    expect(isOpen()).toBe(false);
++    click(header());
++    expect(isOpen()).toBe(true);
++    click(renderer!.root.findByProps({ children: "Alpha task" }));
++    expect(isOpen()).toBe(false);
++  });
++
++  it("keeps the box open on a press inside it, and on its buttons", () => {
++    openSteerBox(makeCard()());
++    expect(box()).toHaveLength(1);
++    // The actions and the box are not inside the pressable header.
++    expect(ancestors(box()[0]!)).not.toContain(header());
++    for (const label of ["Steer", "Interrupt", "Relaunch", "End", "Send", "Cancel"]) {
++      expect(ancestors(button(label))).not.toContain(header());
++    }
++    click(box()[0]!);
++    expect(isOpen()).toBe(true);
++    expect(box()[0]!.props.value).toBe("please rebase first");
++    // Pressing a button runs only that button's action.
++    click(button("Relaunch"));
++    expect(isOpen()).toBe(true);
++    expect(box()[0]!.props.value).toBe("");
++  });
++
++  it("closes only through the header, which hides the box and keeps the text", () => {
++    openSteerBox(makeCard()());
++    click(header());
++    expect(isOpen()).toBe(false);
++    expect(box()).toHaveLength(0);
++    click(header());
++    expect(box()[0]!.props.value).toBe("please rebase first");
++  });
++
++  it("keeps the box, the text and the node through a refresh with the same data", () => {
++    const card = makeCard();
++    openSteerBox(card());
++    const before = box()[0]!;
++    mount(card());
++    mount({ ...card(), agent: { ...agent, updatedAt: "2026-01-01T00:00:05Z" } });
++    expect(isOpen()).toBe(true);
++    expect(box()).toHaveLength(1);
++    expect(box()[0]!.props.value).toBe("please rebase first");
++    expect(box()[0]).toBe(before);
++  });
++
++  it("leaves Enter and Space to the box: nothing above it handles keys or presses", () => {
++    openSteerBox(makeCard()());
++    const above = ancestors(box()[0]!).filter((node) => typeof node.type === "string");
++    for (const node of above) {
++      for (const prop of ["onPress", "onKeyDown", "onKeyUp", "onKeyPress", "onClick"]) {
++        expect(node.props[prop], `${String(node.type)} ${prop}`).toBeUndefined();
++      }
++    }
++    // Typing a newline and a space is the box's own change, with the card still open.
++    act(() => box()[0]!.props.onChangeText("line one\nand a space "));
++    expect(isOpen()).toBe(true);
++    expect(box()[0]!.props.value).toBe("line one\nand a space ");
++  });
++
++  it("sends the typed text and closes the box", async () => {
++    openSteerBox(makeCard()());
++    await act(async () => { click(button("Send")); });
++    expect(host.rpc).toHaveBeenCalledWith({ agentId: "agent-1", text: "please rebase first" });
++    expect(box()).toHaveLength(0);
++  });
++});
+diff --git a/original/client/card.tsx b/modified/client/card.tsx
+index f4bb366..f12d924 100644
+--- a/original/client/card.tsx
++++ b/modified/client/card.tsx
+@@ -1,12 +1,17 @@
+ /**
+  * One card on the board: a crewmate, a backlog item, or both.
+  *
+- * Pressing the card opens its actions. The first one is the caller's: the
+- * board watches the crewmate without leaving FirstMate, a panel beside a
+- * workspace opens it in Paseo. Steering, interrupting and ending go to the
+- * crewmate directly; relaunching goes through the first mate, because it
+- * owns the brief the new crewmate starts from. Ending archives the agent and
+- * leaves its workspace and worktree exactly as they are.
++ * Pressing the card's header (title and summary) opens its actions. The
++ * first one is the caller's: the board watches the crewmate without leaving
++ * FirstMate, a panel beside a workspace opens it in Paseo. Steering,
++ * interrupting and ending go to the crewmate directly; relaunching goes
++ * through the first mate, because it owns the brief the new crewmate starts
++ * from. Ending archives the agent and leaves its workspace and worktree
++ * exactly as they are.
++ *
++ * Only the header is pressable. The actions and the steer box sit beside it,
++ * not inside it: a press that lands in the box to place the cursor or select
++ * text must not fold the card, and the box with it.
+  *
+  * What the first mate wrote as the item's `(actions: …)` is a row of buttons
+  * under the captain's call, shown whether the card is open or not, and a held
+@@ -127,6 +132,7 @@ export function CrewCard({
+         backgroundColor: colors.surface0,
+       },
+       press: { padding: pad, gap: 6 },
++      below: { paddingHorizontal: pad, paddingBottom: pad, gap: 6 },
+       titleRow: { flexDirection: "row" as const, alignItems: "flex-start" as const, gap: 8 },
+       title: { flex: 1, color: colors.foreground, fontSize: FONT_SIZE.body, fontWeight: "600" as const },
+       meta: { color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
+@@ -197,6 +203,7 @@ export function CrewCard({
+   const actions = toMate === null ? [] : cardActions(card);
+   const answers = toMate !== null && isHeld(card);
+   const sending = toMate?.sending ?? false;
++  const crew = expanded && agent !== null;
+   const facts = [
+     card.project,
+     card.kind,
+@@ -211,7 +218,7 @@ export function CrewCard({
+         accessibilityLabel={`${card.title}. ${expanded ? "Hide" : "Show"} actions`}
+         accessibilityState={{ expanded }}
+         onPress={() => setExpanded(!expanded)}
+-        style={[styles.press, answers ? { paddingBottom: 6 } : null]}
++        style={[styles.press, answers || crew ? { paddingBottom: 6 } : null]}
+       >
+         <View style={styles.titleRow}>
+           <Text style={styles.title}>{card.title}</Text>
+@@ -280,7 +287,16 @@ export function CrewCard({
+             .join(" · ")}
+         </Text>
+ 
+-        {expanded && agent !== null ? (
++        {expanded && agent === null ? (
++          <View style={styles.actions}>
++            <Icon name="Info" size={12} color={theme.colors.foregroundMuted} />
++            <Text style={styles.meta}>Ask the first mate to act on backlog items.</Text>
++          </View>
++        ) : null}
++      </Pressable>
++      {crew ? (
++        // Outside the card's Pressable too, for the same reason as the Answer box: a click in the steer box must not fold the card.
++        <View style={[styles.below, answers ? { paddingBottom: 6 } : null]}>
+           <View style={styles.actions}>
+             {opener === null ? null : (
+               <IconButton icon={opener.icon} label={opener.label} showLabel theme={theme} onPress={opener.onPress} />
+@@ -319,51 +335,44 @@ export function CrewCard({
+               onPress={() => setDraft({ kind: "end" })}
+             />
+           </View>
+-        ) : null}
+ 
+-        {expanded && draft !== null ? (
+-          <View style={{ gap: 6 }}>
+-            {draft.kind === "end" ? (
+-              <Text style={styles.prompt}>
+-                End this worker? The agent is archived; its workspace and local copy stay exactly as they are.
+-              </Text>
+-            ) : (
+-              <TextInput
+-                value={draft.text}
+-                onChangeText={(text) => setDraft({ kind: draft.kind, text })}
+-                placeholder={
+-                  draft.kind === "steer"
+-                    ? "Tell the worker… (the first mate hears about it)"
+-                    : "What the new worker should know — progress so far, what to avoid"
+-                }
+-                placeholderTextColor={theme.colors.foregroundMuted}
+-                multiline
+-                autoFocus={!compact}
+-                style={styles.input}
+-              />
+-            )}
+-            <View style={styles.actions}>
+-              <IconButton
+-                icon={draft.kind === "end" ? "Power" : "Send"}
+-                label={draft.kind === "end" ? "End it" : draft.kind === "steer" ? "Send" : "Relaunch"}
+-                showLabel
+-                tone={draft.kind === "end" ? "danger" : "accent"}
+-                theme={theme}
+-                disabled={busy || (draft.kind !== "end" && draft.text.trim() === "")}
+-                onPress={submitDraft}
+-              />
+-              <IconButton icon="X" label="Cancel" showLabel theme={theme} onPress={() => setDraft(null)} />
++          {draft === null ? null : (
++            <View style={{ gap: 6 }}>
++              {draft.kind === "end" ? (
++                <Text style={styles.prompt}>
++                  End this worker? The agent is archived; its workspace and local copy stay exactly as they are.
++                </Text>
++              ) : (
++                <TextInput
++                  value={draft.text}
++                  onChangeText={(text) => setDraft({ kind: draft.kind, text })}
++                  placeholder={
++                    draft.kind === "steer"
++                      ? "Tell the worker… (the first mate hears about it)"
++                      : "What the new worker should know — progress so far, what to avoid"
++                  }
++                  placeholderTextColor={theme.colors.foregroundMuted}
++                  multiline
++                  autoFocus={!compact}
++                  style={styles.input}
++                />
++              )}
++              <View style={styles.actions}>
++                <IconButton
++                  icon={draft.kind === "end" ? "Power" : "Send"}
++                  label={draft.kind === "end" ? "End it" : draft.kind === "steer" ? "Send" : "Relaunch"}
++                  showLabel
++                  tone={draft.kind === "end" ? "danger" : "accent"}
++                  theme={theme}
++                  disabled={busy || (draft.kind !== "end" && draft.text.trim() === "")}
++                  onPress={submitDraft}
++                />
++                <IconButton icon="X" label="Cancel" showLabel theme={theme} onPress={() => setDraft(null)} />
++              </View>
+             </View>
+-          </View>
+-        ) : null}
+-
+-        {expanded && agent === null ? (
+-          <View style={styles.actions}>
+-            <Icon name="Info" size={12} color={theme.colors.foregroundMuted} />
+-            <Text style={styles.meta}>Ask the first mate to act on backlog items.</Text>
+-          </View>
+-        ) : null}
+-      </Pressable>
++          )}
++        </View>
++      ) : null}
+       {answers ? (
+         // Outside the card's Pressable: on the web a click inside it is a press of the card, which opens or folds it.
+         <View style={styles.answerRow}>

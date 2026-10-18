@@ -1,10 +1,12 @@
-# Windows watches (local patch to FirstMate 0.2.1)
+# Windows watches (local patch to FirstMate 0.3.4)
 
 | Files | Patch file |
 | --- | --- |
 | `server/watch-files.ts`, `server/watch-run.ts` modified; `server/watch-launch.ts`, `server/watch-launch.test.ts` new | `windows-watches.patch` |
 
-`original/` holds the two stock files as shipped in 0.2.1; `modified/` holds every patched or new file. This patch and the quota pill touch different files, so they apply independently and in either order.
+`original/` holds the two stock files as shipped in 0.3.4; `modified/` holds every patched or new file. This patch and the quota pill touch different files, so they apply independently and in either order.
+
+**Re-cut on 0.3.4.** First cut on 0.2.1. Upstream did not change `watch-files.ts` or `watch-run.ts` between 0.2.1 and 0.3.4, so the patch, `original/` and `modified/` are byte-identical to the 0.2.1 cut. On 0.3.4 the 19 tests in `server/watch-launch.test.ts` pass.
 
 **Problem.** Every watch showed as invalid ("it is not executable (chmod +x)") and, even if it had run, `spawn(script)` cannot start a `#!` script on Windows and `process.kill(-pid)` is a POSIX process-group call.
 
@@ -35,3 +37,7 @@ Add `--check` first. If the update changed `watch-files.ts` or `watch-run.ts` an
 ## Restore
 
 Copy `original/server/watch-files.ts` and `watch-run.ts` back into `$P/server/`, delete `$P/server/watch-launch.ts` and `watch-launch.test.ts`, reload.
+
+## Verify the patch
+
+From the repository root (Git Bash on Windows, any POSIX shell elsewhere): `sh patches/windows-watches/check.sh`. It applies the patch to a scratch copy of `original/` with the command above and checks the result is byte-identical to `modified/`. It then checks each file against the repository root (line endings ignored there) or, where a later patch edits that file again, against that patch's `original/`. It prints `ok: ...` and exits 0, or names each differing file and exits 1; the scratch copy is kept for inspection. `.gitattributes` pins this folder to LF, so a CRLF checkout does not break the patch.

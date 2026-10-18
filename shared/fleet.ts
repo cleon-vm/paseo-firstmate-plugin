@@ -70,6 +70,17 @@ export type CrewReportSummary = z.infer<typeof CrewReportSchema>;
 export const BacklogSectionSchema = z.enum(["in-flight", "queued", "done"]);
 export type BacklogSection = z.infer<typeof BacklogSectionSchema>;
 
+/**
+ * One of the captain's likely answers to a held item, written by the first
+ * mate on its backlog line as `(actions: <label> => <prompt> | …)`: the card
+ * draws the label as a button that sends the prompt.
+ */
+export const CardActionSchema = z.object({
+  label: z.string(),
+  prompt: z.string(),
+});
+export type CardAction = z.infer<typeof CardActionSchema>;
+
 export const BacklogItemSchema = z.object({
   section: BacklogSectionSchema,
   id: z.string(),
@@ -79,6 +90,7 @@ export const BacklogItemSchema = z.object({
   mode: z.string().nullable(),
   agentId: z.string().nullable(),
   hold: z.string().nullable(),
+  actions: z.array(CardActionSchema),
   blockedBy: z.string().nullable(),
   since: z.string().nullable(),
   url: z.string().nullable(),
@@ -222,6 +234,10 @@ export type Fleet = z.infer<typeof FleetSchema>;
 // The daemon's own file: what handlers act on
 // ---------------------------------------------------------------------------
 
+export const PERMISSION_BROKER_MODES = ["off", "shadow", "live"] as const;
+export const PermissionBrokerModeSchema = z.enum(PERMISSION_BROKER_MODES);
+export type PermissionBrokerMode = z.infer<typeof PermissionBrokerModeSchema>;
+
 export const FirstmateConfigSchema = z.object({
   /** The first mate's home; empty means `$PASEO_HOME/plugin-data/firstmate/home`. */
   home: z.string().default(""),
@@ -235,6 +251,12 @@ export const FirstmateConfigSchema = z.object({
   crewModeId: z.string().default(""),
   /** Watch scripts the captain has switched off on the board, by file name. */
   disabledWatches: z.array(z.string()).default([]),
+  /**
+   * What the permission broker does with crew permission requests (server/permission-broker.ts): `off`
+   * registers nothing; `shadow` logs the answer it would give and the one people gave. In this build
+   * `live` answers nothing either; it logs as shadow does, as live mode would judge.
+   */
+  permissionBroker: PermissionBrokerModeSchema.default("off"),
 });
 export type FirstmateConfig = z.infer<typeof FirstmateConfigSchema>;
 
@@ -300,8 +322,9 @@ export const toggleWatch = defineRpc({
 });
 
 /**
- * Takes one suggestion off the board by removing its line from `data/suggestions.md`, matched by label
- * and prompt; one the file no longer has is left alone. Answers with the suggestions the file has now.
+ * Takes one suggestion off the board: records it in `data/suggestions-dismissed.md`, so the board hides
+ * its prompt from then on, and removes its line from `data/suggestions.md`, matched by label and prompt;
+ * one the file no longer has is left alone. Answers with the suggestions the board shows now.
  */
 export const removeSuggestion = defineRpc({
   name: "firstmate.suggestion.remove",

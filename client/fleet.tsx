@@ -16,7 +16,7 @@
  * fleet, the compact tab and the crewmate being watched live in module scope
  * and the board comes back drawn rather than empty.
  */
-import type { PluginSurfaceProps } from "@getpaseo/plugin/client";
+import type { PluginScreenProps } from "@getpaseo/plugin/client";
 import { useRpc, useSettings } from "@getpaseo/plugin/client";
 import { Icon, useToast } from "@getpaseo/plugin/client/react-native";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -43,9 +43,11 @@ import { CrewmateView } from "./crewmate";
 import { agentStatusLabel, agentStatusTone, groupCards, orderedColumns, revealFilesPatch, shortPath } from "./format";
 import { LaunchPanel } from "./launch";
 import { useMateSender } from "./mate-send";
+import type { MateAsk } from "./card-answer";
 import { ResizeHandle, clampShare } from "./resize-handle";
 import { SuggestionList } from "./suggestions";
 import { Banner, Chip, IconButton, Segmented, errorText } from "./ui";
+import { FONT_SIZE } from "./type-scale";
 
 export const FLEET_QUERY_KEY = ["firstmate", "fleet"] as const;
 
@@ -70,7 +72,10 @@ export function bindSettingsOpener(opener: ((id: string) => void) | null): void 
 const DEFAULT_DISPLAY: DisplaySettings = displaySettings.schema.parse({});
 const SAVE_DELAY_MS = 400;
 
-/** The fleet query, shared by the surface and the workspace panels so they poll once between them. */
+/**
+ * The fleet query, shared by the screen, the workspace panels and the sidebar item so they poll once
+ * between them.
+ */
 export function useFleet(pollSeconds: number) {
   const load = useRpc(loadFleet);
   return useQuery({
@@ -86,7 +91,7 @@ export function useFleet(pollSeconds: number) {
   });
 }
 
-export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) {
+export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
   const compact = layout.compact;
   const enable = useRpc(enableAgentTools);
   const compareCharters = useRpc(compareCharter);
@@ -219,9 +224,9 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
         borderBottomColor: colors.border,
       },
       headerRow: { flexDirection: "row" as const, alignItems: "center" as const, gap: 8, flexWrap: "wrap" as const },
-      title: { color: colors.foreground, fontSize: compact ? 17 : 20, fontWeight: "600" as const },
+      title: { color: colors.foreground, fontSize: compact ? FONT_SIZE.heading : FONT_SIZE.display, fontWeight: "600" as const },
       spacer: { flex: 1 },
-      meta: { color: colors.foregroundMuted, fontSize: 12 },
+      meta: { color: colors.foregroundMuted, fontSize: FONT_SIZE.small },
       banners: { paddingHorizontal: compact ? 12 : 16, paddingTop: 8, gap: 6 },
       split: { flex: 1, minHeight: 0, flexDirection: "row" as const },
       rail: {
@@ -241,10 +246,10 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
       },
       tab: { flex: 1, paddingVertical: 7, alignItems: "center" as const },
       tabActive: { backgroundColor: colors.accent },
-      tabText: { color: colors.foreground, fontSize: 13 },
+      tabText: { color: colors.foreground, fontSize: FONT_SIZE.body },
       tabTextActive: { color: colors.accentForeground, fontWeight: "600" as const },
       suggestions: { padding: 10, paddingBottom: 24 },
-      loading: { color: colors.foregroundMuted, fontSize: 13, padding: 20 },
+      loading: { color: colors.foregroundMuted, fontSize: FONT_SIZE.body, padding: 20 },
     };
   }, [theme, compact]);
 
@@ -278,21 +283,24 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
     mate === null || navigation === undefined ? null : () => navigation.openAgent({ agentId: mate.id });
 
   /**
-   * A suggestion is sent to the first mate at once, through the chat's own
-   * path, and the chat comes into view to show it going out. The draft the
-   * captain was typing is left as it was. While a message is on its way the
-   * buttons are disabled, and a press that still gets through is refused by
-   * the sender, so a double press sends once.
+   * A suggestion, a card's action or a held card's answer is sent to the first
+   * mate at once, through the chat's own path, and the chat comes into view to
+   * show it going out. The draft the captain was typing is left as it was.
+   * While a message is on its way the buttons are disabled, and a press that
+   * still gets through is refused by the sender, so a double press sends once.
    */
-  function suggest(prompt: string): void {
-    if (mate === null || !mateSender.send(captainMessage(prompt, []))) return;
+  function tellMate(text: string, onFailure?: () => void, onSent?: () => void): boolean {
+    if (mate === null || !mateSender.send(captainMessage(text, []), onFailure, onSent)) return false;
     if (compact) setTab("chat");
     else if (values.chatCollapsed) save({ chatCollapsed: false });
+    return true;
   }
+  const toMate: MateAsk = { sending: mateSender.sending, send: tellMate };
 
   /**
-   * A suggestion's trash: its line leaves the first mate's file, and the board takes the list the
-   * daemon answers with at once rather than waiting for the next load.
+   * A suggestion's trash: the daemon records it as dismissed and its line leaves the first mate's file,
+   * and the board takes the list the daemon answers with at once rather than waiting for the next load.
+   * Pressing a suggestion (`suggest`) never comes here, so sending one never dismisses it.
    */
   function dismissSuggestion(suggestion: Suggestion): Promise<void> {
     return removeSuggestions(suggestion)
@@ -526,8 +534,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
       theme={theme}
       compact={compact}
       suggestions={data.suggestions}
-      suggesting={mateSender.sending}
-      onSuggest={suggest}
+      toMate={toMate}
       onRemoveSuggestion={dismissSuggestion}
       watches={data.watches}
       onOpenFile={openFile}
@@ -566,6 +573,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
         onBack={() => setWatching(null)}
         onOpen={navigation === undefined ? null : () => navigation.openAgent({ agentId: watching })}
         onChanged={refresh}
+        toMate={toMate}
       />
     );
 
@@ -606,7 +614,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginSurfaceProps) 
                 suggestions={data.suggestions}
                 theme={theme}
                 disabled={mateSender.sending}
-                onPick={suggest}
+                onPick={(prompt) => tellMate(prompt)}
                 onRemove={dismissSuggestion}
               />
             </ScrollView>

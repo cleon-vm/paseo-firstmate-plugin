@@ -12,7 +12,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
-import { FirstmateConfigSchema, type FirstmateConfig } from "../shared/fleet";
+import { FirstmateConfigSchema, PermissionBrokerModeSchema, type FirstmateConfig } from "../shared/fleet";
 import { dataPath, legacyPluginDir, migrateLegacyData } from "./data-dir";
 import { serialized } from "./serialize";
 
@@ -106,6 +106,15 @@ function parseConfig(raw: string): FirstmateConfig {
   } catch (error) {
     console.error(`[firstmate] ${configPath()} is not JSON, using defaults:`, error);
     return FirstmateConfigSchema.parse({});
+  }
+  // A mistyped permissionBroker turns the broker off, rather than resetting the whole config (and the
+  // first mate with it) to the defaults.
+  if (typeof json === "object" && json !== null && "permissionBroker" in json) {
+    const mode = (json as { permissionBroker: unknown }).permissionBroker;
+    if (!PermissionBrokerModeSchema.safeParse(mode).success) {
+      console.error(`[firstmate] ${configPath()} has permissionBroker ${JSON.stringify(mode)}; the broker is off.`);
+      json = { ...json, permissionBroker: "off" };
+    }
   }
   const parsed = FirstmateConfigSchema.safeParse(json);
   if (!parsed.success) {
