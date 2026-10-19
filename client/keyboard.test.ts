@@ -2,10 +2,11 @@ import { createElement, type RefObject } from "react";
 import { act, create, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import type { KeyboardEvent, View } from "react-native";
-import { Keyboard, LayoutAnimation, Platform } from "react-native";
+import { Keyboard, LayoutAnimation, Platform, StatusBar } from "react-native";
 
 vi.mock("react-native", () => ({
   Platform: { OS: "web" },
+  StatusBar: { currentHeight: 0 },
   Keyboard: { addListener: vi.fn() },
   LayoutAnimation: { configureNext: vi.fn(), Types: { keyboard: "keyboard" } },
 }));
@@ -42,6 +43,7 @@ async function change(height: number, offsetTop = 0, type: "resize" | "scroll" =
 
 beforeEach(() => {
   Platform.OS = "web";
+  StatusBar.currentHeight = 0;
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   vi.stubGlobal("visualViewport", viewport);
   Object.assign(viewport, { height: 800, offsetTop: 0, scale: 1 });
@@ -119,4 +121,23 @@ it.each(["android", "ios"] as const)("preserves %s native keyboard events", asyn
   await act(async () => renderer!.unmount());
   renderer = undefined;
   expect(remove).toHaveBeenCalledTimes(2);
+});
+
+it("lifts the composer clear of the keyboard in the Android app, below a status bar", async () => {
+  // Edge-to-edge app: measureInWindow counts from below the 40-dp status bar,
+  // while keyboardDidShow reports the keyboard's top from the top of the screen.
+  Platform.OS = "android";
+  StatusBar.currentHeight = 40;
+  const nativeListeners = new Map<string, (event: KeyboardEvent) => void>();
+  vi.mocked(Keyboard.addListener).mockImplementation((name, callback) => {
+    nativeListeners.set(name, callback);
+    return { remove: vi.fn() } as unknown as ReturnType<typeof Keyboard.addListener>;
+  });
+  await mount();
+  // The pane ends at 800 below the status bar, 840 on screen; the keyboard starts at 520 on screen.
+  const event = { duration: 0, endCoordinates: { screenY: 520 } } as KeyboardEvent;
+  await act(async () => nativeListeners.get("keyboardDidShow")!(event));
+  // The whole composer, Send at its bottom, ends at or above the keyboard.
+  expect(40 + paneBottom - overlap).toBeLessThanOrEqual(520);
+  expect(overlap).toBe(320);
 });

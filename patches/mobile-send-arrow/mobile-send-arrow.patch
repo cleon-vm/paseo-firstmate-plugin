@@ -63,18 +63,19 @@ index 907884e..7391791 100644
      expect(sources()).toHaveLength(75);
 diff --git a/client/keyboard.test.ts b/client/keyboard.test.ts
 new file mode 100644
-index 0000000..2109a9d
+index 0000000..7c2cdac
 --- /dev/null
 +++ b/client/keyboard.test.ts
-@@ -0,0 +1,122 @@
+@@ -0,0 +1,143 @@
 +import { createElement, type RefObject } from "react";
 +import { act, create, type ReactTestRenderer } from "react-test-renderer";
 +import { afterEach, beforeEach, expect, it, vi } from "vitest";
 +import type { KeyboardEvent, View } from "react-native";
-+import { Keyboard, LayoutAnimation, Platform } from "react-native";
++import { Keyboard, LayoutAnimation, Platform, StatusBar } from "react-native";
 +
 +vi.mock("react-native", () => ({
 +  Platform: { OS: "web" },
++  StatusBar: { currentHeight: 0 },
 +  Keyboard: { addListener: vi.fn() },
 +  LayoutAnimation: { configureNext: vi.fn(), Types: { keyboard: "keyboard" } },
 +}));
@@ -111,6 +112,7 @@ index 0000000..2109a9d
 +
 +beforeEach(() => {
 +  Platform.OS = "web";
++  StatusBar.currentHeight = 0;
 +  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 +  vi.stubGlobal("visualViewport", viewport);
 +  Object.assign(viewport, { height: 800, offsetTop: 0, scale: 1 });
@@ -189,8 +191,27 @@ index 0000000..2109a9d
 +  renderer = undefined;
 +  expect(remove).toHaveBeenCalledTimes(2);
 +});
++
++it("lifts the composer clear of the keyboard in the Android app, below a status bar", async () => {
++  // Edge-to-edge app: measureInWindow counts from below the 40-dp status bar,
++  // while keyboardDidShow reports the keyboard's top from the top of the screen.
++  Platform.OS = "android";
++  StatusBar.currentHeight = 40;
++  const nativeListeners = new Map<string, (event: KeyboardEvent) => void>();
++  vi.mocked(Keyboard.addListener).mockImplementation((name, callback) => {
++    nativeListeners.set(name, callback);
++    return { remove: vi.fn() } as unknown as ReturnType<typeof Keyboard.addListener>;
++  });
++  await mount();
++  // The pane ends at 800 below the status bar, 840 on screen; the keyboard starts at 520 on screen.
++  const event = { duration: 0, endCoordinates: { screenY: 520 } } as KeyboardEvent;
++  await act(async () => nativeListeners.get("keyboardDidShow")!(event));
++  // The whole composer, Send at its bottom, ends at or above the keyboard.
++  expect(40 + paneBottom - overlap).toBeLessThanOrEqual(520);
++  expect(overlap).toBe(320);
++});
 diff --git a/client/keyboard.ts b/client/keyboard.ts
-index 8f58f6e..d1e32f4 100644
+index 8f58f6e..35e0f8b 100644
 --- a/client/keyboard.ts
 +++ b/client/keyboard.ts
 @@ -14,16 +14,30 @@
@@ -202,7 +223,8 @@ index 8f58f6e..d1e32f4 100644
 + * browsers can shrink it for the keyboard without resizing the layout viewport.
   */
  import { useEffect, useState, type RefObject } from "react";
- import { Keyboard, LayoutAnimation, Platform, type KeyboardEvent, type View } from "react-native";
+-import { Keyboard, LayoutAnimation, Platform, type KeyboardEvent, type View } from "react-native";
++import { Keyboard, LayoutAnimation, Platform, StatusBar, type KeyboardEvent, type View } from "react-native";
 +import { trackViewportBottom } from "./web";
  
  export function useKeyboardOverlap(target: RefObject<View | null>): number {
@@ -226,6 +248,23 @@ index 8f58f6e..d1e32f4 100644
      const ios = Platform.OS === "ios";
  
      /** Moves with the keyboard on iOS, as its own views do; Android just snaps. */
+@@ -35,11 +49,15 @@ export function useKeyboardOverlap(target: RefObject<View | null>): number {
+       });
+     }
+ 
++    // Android measures from below the status bar but reports the keyboard's top
++    // from the top of the screen; Paseo's own overlays add the same offset.
++    const top = Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
++
+     function onChange(event: KeyboardEvent): void {
+       const view = target.current;
+       if (view === null) return;
+       view.measureInWindow((_x, y, _width, height) => {
+-        const next = Math.max(0, Math.round(y + height - event.endCoordinates.screenY));
++        const next = Math.max(0, Math.round(top + y + height - event.endCoordinates.screenY));
+         animate(event);
+         setOverlap(next);
+       });
 diff --git a/client/web.ts b/client/web.ts
 index 18342ed..4ab9729 100644
 --- a/client/web.ts
