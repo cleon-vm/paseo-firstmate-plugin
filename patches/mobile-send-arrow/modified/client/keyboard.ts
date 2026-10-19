@@ -18,7 +18,7 @@
  * browsers can shrink it for the keyboard without resizing the layout viewport.
  */
 import { useEffect, useState, type RefObject } from "react";
-import { Keyboard, LayoutAnimation, Platform, type KeyboardEvent, type View } from "react-native";
+import { Keyboard, LayoutAnimation, Platform, StatusBar, type KeyboardEvent, type View } from "react-native";
 import { trackViewportBottom } from "./web";
 
 export function useKeyboardOverlap(target: RefObject<View | null>): number {
@@ -49,11 +49,15 @@ export function useKeyboardOverlap(target: RefObject<View | null>): number {
       });
     }
 
+    // Android measures from below the status bar but reports the keyboard's top
+    // from the top of the screen; Paseo's own overlays add the same offset.
+    const top = Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
+
     function onChange(event: KeyboardEvent): void {
       const view = target.current;
       if (view === null) return;
       view.measureInWindow((_x, y, _width, height) => {
-        const next = Math.max(0, Math.round(y + height - event.endCoordinates.screenY));
+        const next = Math.max(0, Math.round(top + y + height - event.endCoordinates.screenY));
         animate(event);
         setOverlap(next);
       });
