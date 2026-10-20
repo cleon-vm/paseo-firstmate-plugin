@@ -142,6 +142,9 @@ describe("first mate chat history", () => {
     scrollToEnd.mockClear();
     await act(async () => { viewport.height = 480; listeners.get("resize")!(); });
     expect(pane().props.style[1].paddingBottom).toBe(320);
+    // The pane's own layout measures again; its padding does not feed back.
+    await act(async () => pane().props.onLayout());
+    expect(pane().props.style[1].paddingBottom).toBe(320);
     expect(scrollToEnd).toHaveBeenCalled();
     expect(renderer!.root.findAllByType("Pressable" as ElementType).find((node) => node.props.accessibilityLabel === "Send")).toBeDefined();
     const scroller = renderer!.root.findByType("ScrollView" as ElementType);

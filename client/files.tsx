@@ -122,7 +122,7 @@ export function FilesView({
   const [hoveredItem, setHoveredItem] = useState<string | null>(null);
   const root = useRef<View>(null);
   const editorPane = useRef<View>(null);
-  const keyboard = useKeyboardOverlap(editorPane);
+  const { overlap: keyboard, onLayout: remeasureKeyboard } = useKeyboardOverlap(editorPane);
 
   function setDir(next: string): void {
     memory = { ...memory, dir: next };
@@ -616,7 +616,7 @@ export function FilesView({
   }
 
   const editorPaneView = (
-    <View ref={editorPane} style={[styles.editorPane, { paddingBottom: keyboard }]}>
+    <View ref={editorPane} onLayout={remeasureKeyboard} style={[styles.editorPane, { paddingBottom: keyboard }]}>
       {open === null && !compact ? null : (
         <View
           style={styles.editorHeader}

@@ -1,5 +1,5 @@
 diff --git a/client/chat.test.ts b/client/chat.test.ts
-index 907884e..7391791 100644
+index 907884e..e1a1b71 100644
 --- a/client/chat.test.ts
 +++ b/client/chat.test.ts
 @@ -71,6 +71,7 @@ const mate: AgentSummary = {
@@ -22,7 +22,7 @@ index 907884e..7391791 100644
    });
  }
  async function refresh(entries: TimelineEntry[]) {
-@@ -120,10 +124,38 @@ afterEach(async () => {
+@@ -120,10 +124,41 @@ afterEach(async () => {
    const mounted = renderer;
    if (mounted) await act(async () => mounted.unmount());
    renderer = undefined;
@@ -44,6 +44,9 @@ index 907884e..7391791 100644
 +    scrollToEnd.mockClear();
 +    await act(async () => { viewport.height = 480; listeners.get("resize")!(); });
 +    expect(pane().props.style[1].paddingBottom).toBe(320);
++    // The pane's own layout measures again; its padding does not feed back.
++    await act(async () => pane().props.onLayout());
++    expect(pane().props.style[1].paddingBottom).toBe(320);
 +    expect(scrollToEnd).toHaveBeenCalled();
 +    expect(renderer!.root.findAllByType("Pressable" as ElementType).find((node) => node.props.accessibilityLabel === "Send")).toBeDefined();
 +    const scroller = renderer!.root.findByType("ScrollView" as ElementType);
@@ -61,22 +64,67 @@ index 907884e..7391791 100644
    it("keeps long mixed Markdown history idle while the composer changes", async () => {
      await mount();
      expect(sources()).toHaveLength(75);
+diff --git a/client/chat.tsx b/client/chat.tsx
+index 12ade57..99c50c4 100644
+--- a/client/chat.tsx
++++ b/client/chat.tsx
+@@ -151,7 +151,7 @@ export function MateChat({
+   const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(new Set());
+   const pane = useRef<View>(null);
+   /** The keyboard's cover over this pane; padding it away lifts the composer above the keyboard. */
+-  const keyboard = useKeyboardOverlap(pane);
++  const { overlap: keyboard, onLayout: remeasureKeyboard } = useKeyboardOverlap(pane);
+   // The transcript shrinks when the keyboard opens; keep its end in view if that is where the captain was.
+   useEffect(() => {
+     // Not a dependency: `follow` is new every render, and the keyboard opening is the event.
+@@ -386,7 +386,7 @@ export function MateChat({
+   const renderedGroups = useMemo(() => groups.map(renderGroup), [groups, renderGroup]);
+ 
+   return (
+-    <View ref={pane} style={[styles.pane, { paddingBottom: keyboard }]}>
++    <View ref={pane} onLayout={remeasureKeyboard} style={[styles.pane, { paddingBottom: keyboard }]}>
+       <View style={styles.transcript}>
+         <ScrollView {...follow.scrollProps} style={styles.scroller} contentContainerStyle={styles.transcriptBody}>
+           {timeline.error === null ? null : <Text style={styles.error}>{timeline.error}</Text>}
+diff --git a/client/files.tsx b/client/files.tsx
+index 12a7b4d..35a2f9c 100644
+--- a/client/files.tsx
++++ b/client/files.tsx
+@@ -122,7 +122,7 @@ export function FilesView({
+   const [hoveredItem, setHoveredItem] = useState<string | null>(null);
+   const root = useRef<View>(null);
+   const editorPane = useRef<View>(null);
+-  const keyboard = useKeyboardOverlap(editorPane);
++  const { overlap: keyboard, onLayout: remeasureKeyboard } = useKeyboardOverlap(editorPane);
+ 
+   function setDir(next: string): void {
+     memory = { ...memory, dir: next };
+@@ -616,7 +616,7 @@ export function FilesView({
+   }
+ 
+   const editorPaneView = (
+-    <View ref={editorPane} style={[styles.editorPane, { paddingBottom: keyboard }]}>
++    <View ref={editorPane} onLayout={remeasureKeyboard} style={[styles.editorPane, { paddingBottom: keyboard }]}>
+       {open === null && !compact ? null : (
+         <View
+           style={styles.editorHeader}
 diff --git a/client/keyboard.test.ts b/client/keyboard.test.ts
 new file mode 100644
-index 0000000..7c2cdac
+index 0000000..bc37e7e
 --- /dev/null
 +++ b/client/keyboard.test.ts
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,221 @@
 +import { createElement, type RefObject } from "react";
 +import { act, create, type ReactTestRenderer } from "react-test-renderer";
 +import { afterEach, beforeEach, expect, it, vi } from "vitest";
 +import type { KeyboardEvent, View } from "react-native";
-+import { Keyboard, LayoutAnimation, Platform, StatusBar } from "react-native";
++import { DeviceEventEmitter, Keyboard, LayoutAnimation, Platform, StatusBar } from "react-native";
 +
 +vi.mock("react-native", () => ({
-+  Platform: { OS: "web" },
++  Platform: { OS: "web", Version: 34 },
 +  StatusBar: { currentHeight: 0 },
 +  Keyboard: { addListener: vi.fn() },
++  DeviceEventEmitter: { addListener: vi.fn() },
 +  LayoutAnimation: { configureNext: vi.fn(), Types: { keyboard: "keyboard" } },
 +}));
 +
@@ -84,6 +132,7 @@ index 0000000..7c2cdac
 +
 +let renderer: ReactTestRenderer | undefined;
 +let overlap = 0;
++let layout = () => {};
 +let paneBottom = 800;
 +const listeners = { resize: new Set<() => void>(), scroll: new Set<() => void>() };
 +const viewport = {
@@ -97,11 +146,21 @@ index 0000000..7c2cdac
 +} } as RefObject<View>;
 +
 +function Probe() {
-+  overlap = useKeyboardOverlap(target);
++  ({ overlap, onLayout: layout } = useKeyboardOverlap(target));
 +  return null;
 +}
 +async function mount() {
 +  await act(async () => { renderer = create(createElement(Probe)); });
++}
++/** Native keyboard listeners, React Native's and Paseo's keyboard library's, by event name. */
++const nativeListeners = new Map<string, (event: unknown) => void>();
++const remove = vi.fn();
++function emit(name: string, event: unknown) {
++  return act(async () => nativeListeners.get(name)?.(event));
++}
++/** React Native's keyboard event with the keyboard's top on screen. */
++function frame(screenY: number) {
++  return { duration: 0, endCoordinates: { screenY } } as KeyboardEvent;
 +}
 +async function change(height: number, offsetTop = 0, type: "resize" | "scroll" = "resize") {
 +  await act(async () => {
@@ -112,6 +171,15 @@ index 0000000..7c2cdac
 +
 +beforeEach(() => {
 +  Platform.OS = "web";
++  Object.assign(Platform, { Version: 34 });
++  nativeListeners.clear();
++  remove.mockClear();
++  for (const emitter of [Keyboard, DeviceEventEmitter]) {
++    vi.mocked(emitter.addListener).mockImplementation(((name: string, callback: (event: unknown) => void) => {
++      nativeListeners.set(name, callback);
++      return { remove };
++    }) as never);
++  }
 +  StatusBar.currentHeight = 0;
 +  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
 +  vi.stubGlobal("visualViewport", viewport);
@@ -172,12 +240,6 @@ index 0000000..7c2cdac
 +
 +it.each(["android", "ios"] as const)("preserves %s native keyboard events", async (platform) => {
 +  Platform.OS = platform;
-+  const nativeListeners = new Map<string, (event: KeyboardEvent) => void>();
-+  const remove = vi.fn();
-+  vi.mocked(Keyboard.addListener).mockImplementation((name, callback) => {
-+    nativeListeners.set(name, callback);
-+    return { remove } as unknown as ReturnType<typeof Keyboard.addListener>;
-+  });
 +  vi.mocked(LayoutAnimation.configureNext).mockClear();
 +  await mount();
 +  expect(listeners.resize.size).toBe(0);
@@ -189,7 +251,8 @@ index 0000000..7c2cdac
 +  expect(overlap).toBe(0);
 +  await act(async () => renderer!.unmount());
 +  renderer = undefined;
-+  expect(remove).toHaveBeenCalledTimes(2);
++  // Android also stops listening to Paseo's keyboard library.
++  expect(remove).toHaveBeenCalledTimes(platform === "ios" ? 2 : 4);
 +});
 +
 +it("lifts the composer clear of the keyboard in the Android app, below a status bar", async () => {
@@ -197,11 +260,6 @@ index 0000000..7c2cdac
 +  // while keyboardDidShow reports the keyboard's top from the top of the screen.
 +  Platform.OS = "android";
 +  StatusBar.currentHeight = 40;
-+  const nativeListeners = new Map<string, (event: KeyboardEvent) => void>();
-+  vi.mocked(Keyboard.addListener).mockImplementation((name, callback) => {
-+    nativeListeners.set(name, callback);
-+    return { remove: vi.fn() } as unknown as ReturnType<typeof Keyboard.addListener>;
-+  });
 +  await mount();
 +  // The pane ends at 800 below the status bar, 840 on screen; the keyboard starts at 520 on screen.
 +  const event = { duration: 0, endCoordinates: { screenY: 520 } } as KeyboardEvent;
@@ -210,61 +268,219 @@ index 0000000..7c2cdac
 +  expect(40 + paneBottom - overlap).toBeLessThanOrEqual(520);
 +  expect(overlap).toBe(320);
 +});
++
++it("keeps Send above an open Android keyboard as its suggestion strip comes and goes", async () => {
++  // From Android 11 React Native reports only opening and closing; Paseo's
++  // keyboard library reports every height, counted with the 48-dp navigation bar.
++  Platform.OS = "android";
++  StatusBar.currentHeight = 40;
++  await mount();
++  await emit("keyboardDidShow", frame(520));
++  await emit("KeyboardController::keyboardDidShow", { height: 368 });
++  expect(overlap).toBe(320);
++  // The suggestion strip adds 48 dp on top of the open keyboard.
++  await emit("KeyboardController::keyboardDidShow", { height: 416 });
++  expect(40 + paneBottom - overlap).toBeLessThanOrEqual(472);
++  expect(overlap).toBe(368);
++  await emit("KeyboardController::keyboardDidShow", { height: 368 });
++  expect(overlap).toBe(320);
++  await emit("KeyboardController::keyboardDidHide", { height: 0 });
++  await emit("keyboardDidHide", frame(1000));
++  expect(overlap).toBe(0);
++  // Reopened taller: React Native's own report already has the new top.
++  await emit("KeyboardController::keyboardDidShow", { height: 416 });
++  await emit("keyboardDidShow", frame(472));
++  expect(overlap).toBe(368);
++  await emit("KeyboardController::keyboardDidShow", { height: 368 });
++  expect(overlap).toBe(320);
++});
++
++it("leaves height changes to React Native before Android 11, which reports them itself", async () => {
++  Platform.OS = "android";
++  Object.assign(Platform, { Version: 29 });
++  await mount();
++  expect(nativeListeners.has("KeyboardController::keyboardDidShow")).toBe(false);
++  await emit("keyboardDidShow", frame(480));
++  await emit("keyboardDidShow", frame(432));
++  expect(overlap).toBe(368);
++});
++
++it.each(["android", "ios", "web"] as const)("measures %s again when the pane moves under an open keyboard", async (platform) => {
++  Platform.OS = platform;
++  await mount();
++  if (platform === "web") await change(480);
++  else await emit(platform === "ios" ? "keyboardWillChangeFrame" : "keyboardDidShow", frame(480));
++  expect(overlap).toBe(320);
++  paneBottom = 700;
++  await act(async () => layout());
++  expect(overlap).toBe(220);
++  if (platform === "web") await change(800);
++  else await emit(platform === "ios" ? "keyboardWillHide" : "keyboardDidHide", frame(800));
++  await act(async () => layout());
++  expect(overlap).toBe(0);
++});
++
++it("drops a measurement that lands after the Android keyboard closed", async () => {
++  Platform.OS = "android";
++  let pending: (() => void) | undefined;
++  const measure = target.current!.measureInWindow;
++  target.current!.measureInWindow = (callback) => { pending = () => callback(0, 100, 400, paneBottom - 100); };
++  try {
++    await mount();
++    await emit("keyboardDidShow", frame(480));
++    await emit("keyboardDidHide", frame(800));
++    await act(async () => pending!());
++    expect(overlap).toBe(0);
++  } finally {
++    target.current!.measureInWindow = measure;
++  }
++});
 diff --git a/client/keyboard.ts b/client/keyboard.ts
-index 8f58f6e..35e0f8b 100644
+index 8f58f6e..946f393 100644
 --- a/client/keyboard.ts
 +++ b/client/keyboard.ts
-@@ -14,16 +14,30 @@
+@@ -14,16 +14,56 @@
   * The padding sits inside the view, so it does not change the frame being
   * measured; there is no feedback loop. Where the platform resizes the window
   * for the keyboard itself, the overlap measures as zero and nothing is added.
 - * No keyboard events fire on the web renderer, where this is a no-op.
 + * On the web, the visual viewport supplies the visible bottom instead: mobile
 + * browsers can shrink it for the keyboard without resizing the layout viewport.
++ * The view's own layout handler measures again against the last keyboard edge,
++ * in case the host moves or resizes the view while the keyboard is open.
   */
- import { useEffect, useState, type RefObject } from "react";
+-import { useEffect, useState, type RefObject } from "react";
 -import { Keyboard, LayoutAnimation, Platform, type KeyboardEvent, type View } from "react-native";
-+import { Keyboard, LayoutAnimation, Platform, StatusBar, type KeyboardEvent, type View } from "react-native";
++import { useEffect, useRef, useState, type RefObject } from "react";
++import {
++  DeviceEventEmitter,
++  Keyboard,
++  LayoutAnimation,
++  Platform,
++  StatusBar,
++  type KeyboardEvent,
++  type View,
++} from "react-native";
 +import { trackViewportBottom } from "./web";
  
- export function useKeyboardOverlap(target: RefObject<View | null>): number {
+-export function useKeyboardOverlap(target: RefObject<View | null>): number {
++export interface KeyboardOverlap {
++  /** How far the keyboard covers the view, to pad away. */
++  overlap: number;
++  /** The view's `onLayout`: measures again against the keyboard's last edge. */
++  onLayout: () => void;
++}
++
++export function useKeyboardOverlap(target: RefObject<View | null>): KeyboardOverlap {
    const [overlap, setOverlap] = useState(0);
++  const remeasure = useRef(() => {});
++  const [onLayout] = useState(() => () => remeasure.current());
  
    useEffect(() => {
 -    if (Platform.OS === "web") return;
 +    if (Platform.OS === "web") {
 +      let revision = 0;
-+      const stop = trackViewportBottom((bottom) => {
++      let bottom = Infinity;
++      function measure(): void {
 +        const current = ++revision;
 +        target.current?.measureInWindow((_x, y, _width, height) => {
 +          if (current === revision) setOverlap(Math.max(0, Math.round(y + height - bottom)));
 +        });
++      }
++      remeasure.current = measure;
++      const stop = trackViewportBottom((next) => {
++        bottom = next;
++        measure();
 +      });
 +      return () => {
 +        revision++;
++        remeasure.current = () => {};
 +        stop();
 +      };
 +    }
      const ios = Platform.OS === "ios";
  
      /** Moves with the keyboard on iOS, as its own views do; Android just snaps. */
-@@ -35,11 +49,15 @@ export function useKeyboardOverlap(target: RefObject<View | null>): number {
+@@ -35,17 +75,37 @@ export function useKeyboardOverlap(target: RefObject<View | null>): number {
        });
      }
  
+-    function onChange(event: KeyboardEvent): void {
+-      const view = target.current;
+-      if (view === null) return;
+-      view.measureInWindow((_x, y, _width, height) => {
+-        const next = Math.max(0, Math.round(y + height - event.endCoordinates.screenY));
+-        animate(event);
 +    // Android measures from below the status bar but reports the keyboard's top
 +    // from the top of the screen; Paseo's own overlays add the same offset.
 +    const top = Platform.OS === "android" ? (StatusBar.currentHeight ?? 0) : 0;
 +
-     function onChange(event: KeyboardEvent): void {
-       const view = target.current;
-       if (view === null) return;
-       view.measureInWindow((_x, y, _width, height) => {
--        const next = Math.max(0, Math.round(y + height - event.endCoordinates.screenY));
-+        const next = Math.max(0, Math.round(top + y + height - event.endCoordinates.screenY));
-         animate(event);
++    let revision = 0;
++    /** The keyboard's top on screen while it is open. */
++    let edge: number | null = null;
++    /** The last open-keyboard height Paseo's keyboard library reported (Android). */
++    let resized: number | undefined;
++
++    function measure(event?: KeyboardEvent): void {
++      const current = ++revision;
++      const screenY = edge;
++      if (screenY === null) return;
++      target.current?.measureInWindow((_x, y, _width, height) => {
++        if (current !== revision) return;
++        const next = Math.max(0, Math.round(top + y + height - screenY));
++        if (event) animate(event);
          setOverlap(next);
        });
+     }
+ 
++    function onChange(event: KeyboardEvent): void {
++      edge = event.endCoordinates.screenY;
++      measure(event);
++    }
++
+     function onHide(event: KeyboardEvent): void {
++      revision++;
++      edge = null;
++      resized = undefined;
+       animate(event);
+       setOverlap(0);
+     }
+@@ -55,10 +115,34 @@ export function useKeyboardOverlap(target: RefObject<View | null>): number {
+     const subscriptions = ios
+       ? [Keyboard.addListener("keyboardWillChangeFrame", onChange), Keyboard.addListener("keyboardWillHide", onHide)]
+       : [Keyboard.addListener("keyboardDidShow", onChange), Keyboard.addListener("keyboardDidHide", onHide)];
++
++    // From Android 11, React Native reports only the keyboard opening and
++    // closing, not an open keyboard changing height: its suggestion strip
++    // appearing, an emoji panel. Paseo's keyboard library reports those on the
++    // same event bus, but counts its heights from another bottom (the
++    // navigation bar included), so only the change in its height moves the edge.
++    if (Platform.OS === "android" && Number(Platform.Version) >= 30) {
++      subscriptions.push(
++        DeviceEventEmitter.addListener("KeyboardController::keyboardDidShow", (event?: { height?: unknown }) => {
++          const previous = resized;
++          resized = typeof event?.height === "number" ? event.height : undefined;
++          if (previous === undefined || resized === undefined || edge === null || resized === previous) return;
++          edge -= resized - previous;
++          measure();
++        }),
++        DeviceEventEmitter.addListener("KeyboardController::keyboardDidHide", () => {
++          resized = undefined;
++        }),
++      );
++    }
++
++    remeasure.current = () => measure();
+     return () => {
++      revision++;
++      remeasure.current = () => {};
+       for (const subscription of subscriptions) subscription.remove();
+     };
+   }, [target]);
+ 
+-  return overlap;
++  return { overlap, onLayout };
+ }
 diff --git a/client/web.ts b/client/web.ts
 index 18342ed..4ab9729 100644
 --- a/client/web.ts
