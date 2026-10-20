@@ -151,7 +151,7 @@ export function MateChat({
   const [openGroups, setOpenGroups] = useState<ReadonlySet<string>>(new Set());
   const pane = useRef<View>(null);
   /** The keyboard's cover over this pane; padding it away lifts the composer above the keyboard. */
-  const keyboard = useKeyboardOverlap(pane);
+  const { overlap: keyboard, onLayout: remeasureKeyboard } = useKeyboardOverlap(pane);
   // The transcript shrinks when the keyboard opens; keep its end in view if that is where the captain was.
   useEffect(() => {
     // Not a dependency: `follow` is new every render, and the keyboard opening is the event.
@@ -386,7 +386,7 @@ export function MateChat({
   const renderedGroups = useMemo(() => groups.map(renderGroup), [groups, renderGroup]);
 
   return (
-    <View ref={pane} style={[styles.pane, { paddingBottom: keyboard }]}>
+    <View ref={pane} onLayout={remeasureKeyboard} style={[styles.pane, { paddingBottom: keyboard }]}>
       <View style={styles.transcript}>
         <ScrollView {...follow.scrollProps} style={styles.scroller} contentContainerStyle={styles.transcriptBody}>
           {timeline.error === null ? null : <Text style={styles.error}>{timeline.error}</Text>}
