@@ -37,6 +37,7 @@ import { absolutePath, menuPosition, revealLabel } from "./reveal";
 import { Banner, IconButton, MONOSPACE, errorText } from "./ui";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
 import { contextMenuProps, type MenuPoint } from "./web";
+import { DataText } from "./data-links";
 
 interface FilesMemory {
   dir: string;
@@ -539,11 +540,11 @@ export function FilesView({
     editorBody = <Text style={styles.muted}>Opening {loadingPath}…</Text>;
   } else if (open === null) {
     editorBody = (
-      <Text style={styles.muted}>
+      <DataText theme={theme} style={styles.muted}>
         Pick a file to read or edit it. The first mate reads its charter from AGENTS.md and your standing orders
         from data/captain.md; its backlog, projects and each worker's brief are under data/. Right-click a file, or
         use its toolbar, to reveal it or copy its path. {REVEAL_NOTE}
-      </Text>
+      </DataText>
     );
   } else if (open.kind === "unreadable") {
     editorBody = (

@@ -162,6 +162,13 @@ your permission stays flagged until you answer.
 A worker's workspace and session also get a **FirstMate** tab showing its card, with a box for telling
 the first mate something about it.
 
+Paths under `data/` are clickable in cards (including reports, holds and Done artifacts), suggestions,
+watch output, conversations, permission summaries and Markdown previews. Existing text files and
+images open in FirstMate's Files view; folders open in the file manager on the daemon's machine.
+Standalone panels reveal files in that file manager, as do binaries the viewer cannot show. Scripts
+open as text and are never run. Missing paths stay plain text. Links are checked against the configured
+home's `data/` directory both before display and on click; traversal and symlinks out of it are refused.
+
 ## The first mate's home
 
 The **Files** view — next to the crew board, or its own tab on a phone — shows everything in the home

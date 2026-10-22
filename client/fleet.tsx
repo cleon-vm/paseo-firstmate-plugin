@@ -48,6 +48,7 @@ import { ResizeHandle, clampShare } from "./resize-handle";
 import { SuggestionList } from "./suggestions";
 import { Banner, Chip, IconButton, Segmented, errorText } from "./ui";
 import { FONT_SIZE } from "./type-scale";
+import { DataFilesContext } from "./data-links";
 
 export const FLEET_QUERY_KEY = ["firstmate", "fleet"] as const;
 
@@ -343,6 +344,10 @@ export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
     setFilesRequest({ path, at: Date.now() });
   }
 
+  function withDataLinks(children: ReactNode): ReactNode {
+    return <DataFilesContext.Provider value={openFile}>{children}</DataFilesContext.Provider>;
+  }
+
   /** Puts the plugin's current charter beside the captain's and opens it in the Files view. */
   function compareCharterFiles(): void {
     setCharterBusy(true);
@@ -505,7 +510,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
   );
 
   if (data === null) {
-    return (
+    return withDataLinks(
       <View style={styles.screen}>
         {header}
         {banners.length === 0 ? null : <View style={styles.banners}>{banners}</View>}
@@ -515,7 +520,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
   }
 
   if (mate === null) {
-    return (
+    return withDataLinks(
       <View style={styles.screen}>
         {header}
         <ScrollView automaticallyAdjustKeyboardInsets>
@@ -580,7 +585,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
   if (compact) {
     const tabs: readonly Tab[] =
       suggestionCount > 0 ? ["chat", "suggestions", "board", "files"] : ["chat", "board", "files"];
-    return (
+    return withDataLinks(
       <View style={styles.screen}>
         {header}
         {banners.length === 0 ? null : <View style={styles.banners}>{banners}</View>}
@@ -629,7 +634,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
   }
 
   const chatShare = clampShare(share ?? values.chatWidthFraction);
-  return (
+  return withDataLinks(
     <View style={styles.screen}>
       {header}
       {banners.length === 0 ? null : <View style={styles.banners}>{banners}</View>}

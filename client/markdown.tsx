@@ -28,6 +28,8 @@ import { MarkdownImage, type MarkdownImages } from "./image-view";
 import { parseMarkdown, type Block } from "./markdown-parse";
 import { MONOSPACE } from "./ui";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
+import { useDataLinks } from "./data-links";
+import { dataMentions } from "./data-paths";
 
 interface MarkdownStyles {
   paragraph: object;
@@ -162,17 +164,17 @@ function renderTokens(tokens: InlineToken[], styles: MarkdownStyles, context: In
   return tokens.map((token, index) => {
     switch (token.kind) {
       case "text":
-        return token.text;
+        return renderDataText(token.text, styles, context);
       case "code":
         return (
           <Text key={index} style={styles.inlineCode}>
-            {token.text}
+            {renderDataText(token.text, styles, context)}
           </Text>
         );
       case "bold":
         return (
           <Text key={index} style={styles.bold}>
-            {token.text}
+            {renderDataText(token.text, styles, context)}
           </Text>
         );
       case "file":
@@ -182,7 +184,7 @@ function renderTokens(tokens: InlineToken[], styles: MarkdownStyles, context: In
             accessibilityRole="link"
             accessibilityHint={`Opens ${token.path} in Files`}
             style={token.code ? [styles.inlineCode, styles.link] : styles.link}
-            onPress={() => onOpenFile?.(token.path)}
+            onPress={(event) => { event.stopPropagation(); onOpenFile?.(token.path); }}
           >
             {token.text}
           </Text>
@@ -198,6 +200,36 @@ function renderTokens(tokens: InlineToken[], styles: MarkdownStyles, context: In
         );
     }
   });
+}
+
+/** Also link paths in bold and fenced code without changing their formatting. */
+function renderDataText(text: string, styles: MarkdownStyles, context: InlineContext): ReactNode[] {
+  const whole = context.lookup(text);
+  const mentions = whole !== null && /^(?:\.\/)?data[\\/]/.test(text)
+    ? [{ start: 0, text, path: text }]
+    : dataMentions(text);
+  const parts: ReactNode[] = [];
+  let at = 0;
+  for (const mention of mentions) {
+    if (context.lookup(mention.path) === null) continue;
+    parts.push(text.slice(at, mention.start));
+    parts.push(
+      <Text
+        key={mention.start}
+        accessibilityRole="link"
+        style={styles.link}
+        onPress={(event) => {
+          event.stopPropagation();
+          context.onOpenFile?.(mention.path);
+        }}
+      >
+        {mention.text}
+      </Text>,
+    );
+    at = mention.start + mention.text.length;
+  }
+  parts.push(text.slice(at));
+  return parts;
 }
 
 function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineContext): ReactNode[] {
@@ -228,7 +260,7 @@ function renderBlocks(blocks: Block[], styles: MarkdownStyles, context: InlineCo
         return (
           <View key={index} style={styles.codeBlock}>
             <Text selectable style={styles.codeText}>
-              {block.text}
+              {renderDataText(block.text, styles, context)}
             </Text>
           </View>
         );
@@ -292,9 +324,18 @@ export function Markdown({
 }) {
   const styles = useMarkdownStyles(theme, fontSize);
   const blocks = useMemo(() => parseMarkdown(source), [source]);
+  const data = useDataLinks(source, onOpenFile);
+  const lookup: FileLookup = (candidate) => {
+    if (/^(?:\.\/)?data[\\/]/.test(candidate)) return data.paths[candidate] === undefined ? null : candidate;
+    return files(candidate);
+  };
+  function open(path: string): void {
+    if (/^(?:\.\/)?data[\\/]/.test(path)) data.openPath(path);
+    else onOpenFile?.(path);
+  }
   return (
     <View style={{ gap: 6 }}>
-      {renderBlocks(blocks, styles, { lookup: files, onOpenLink, onOpenFile, images, theme, fontSize })}
+      {renderBlocks(blocks, styles, { lookup, onOpenLink, onOpenFile: open, images, theme, fontSize })}
     </View>
   );
 }

@@ -105,6 +105,8 @@ export function inlineTokens(text: string, lookup: FileLookup, options: { images
       const path = candidate === null ? null : lookup(candidate);
       const label = link[1] === "" ? target : (link[1] ?? target);
       if (path !== null) return [{ kind: "file", text: label, path, code: false }];
+      // A local data link that is missing or refused stays inert, never an external URL.
+      if (/^(?:\.\/)?data[\\/]/.test(target)) return [{ kind: "text", text: label }];
     }
     const url = (link?.[2] ?? part).replace(/[.,;:]+$/, "");
     const label = link === null ? part : link[1] === "" ? url : (link[1] ?? url);

@@ -17,6 +17,7 @@ import { useMemo, useState } from "react";
 import { Pressable, Text, View } from "react-native";
 
 import { Markdown } from "./markdown";
+import { DataText } from "./data-links";
 import {
   allAnswered,
   buildAnswers,
@@ -230,7 +231,7 @@ function QuestionCard({ request, theme, compact, onRespond, questions }: CardPro
         </View>
       ) : null}
 
-      <Text style={styles.question}>{question.question}</Text>
+      <DataText theme={theme} style={styles.question}>{question.question}</DataText>
 
       {question.options.length === 0 ? null : (
         <View accessibilityRole={question.multiSelect ? undefined : "radiogroup"}>
@@ -249,9 +250,9 @@ function QuestionCard({ request, theme, compact, onRespond, questions }: CardPro
                   {question.multiSelect ? (on ? "☑" : "☐") : on ? "◉" : "○"}
                 </Text>
                 <View style={styles.optionText}>
-                  <Text style={styles.optionLabel}>{option.label}</Text>
+                  <DataText theme={theme} style={styles.optionLabel}>{option.label}</DataText>
                   {option.description === undefined ? null : (
-                    <Text style={styles.optionDescription}>{option.description}</Text>
+                    <DataText theme={theme} style={styles.optionDescription}>{option.description}</DataText>
                   )}
                 </View>
               </Pressable>
@@ -357,15 +358,15 @@ function RequestCard({ request, theme, compact, onRespond, onOpenLink }: CardPro
           {request.kind === "plan" ? "The first mate has a plan for you to approve" : "The first mate is asking permission"}
         </Text>
       </View>
-      <Text style={styles.question}>{request.title ?? request.name}</Text>
-      {request.description === undefined ? null : <Text style={styles.body}>{request.description}</Text>}
+      <DataText theme={theme} style={styles.question}>{request.title ?? request.name}</DataText>
+      {request.description === undefined ? null : <DataText theme={theme} style={styles.body}>{request.description}</DataText>}
       {summary.markdown === null ? null : (
         <Markdown source={summary.markdown} theme={theme} onOpenLink={onOpenLink} />
       )}
       {summary.code === null ? null : (
-        <Text selectable style={styles.code} numberOfLines={12}>
+        <DataText theme={theme} selectable style={styles.code} numberOfLines={12}>
           {summary.code}
-        </Text>
+        </DataText>
       )}
       <View style={styles.actions}>
         {actions.map((action) => (

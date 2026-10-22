@@ -26,6 +26,7 @@ import { PermissionCard, usePendingRequests } from "./permission-card";
 import { Chip, IconButton, JumpToEnd, MONOSPACE, Spinner, errorText } from "./ui";
 import { useAgentTimeline } from "./use-timeline";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
+import { DataText } from "./data-links";
 
 /** How much of a crewmate's history is read: its tail, this many entries long. */
 const TIMELINE_LIMIT = 200;
@@ -262,9 +263,9 @@ function ActivityTranscript({
       case "prompt":
         return (
           <View style={styles.prompt}>
-            <Text selectable style={styles.promptText} numberOfLines={foldedLines(row.key, row.text)}>
+            <DataText theme={theme} selectable style={styles.promptText} numberOfLines={foldedLines(row.key, row.text)}>
               {row.text}
-            </Text>
+            </DataText>
             {foldToggle(row.key, row.text)}
           </View>
         );
@@ -272,9 +273,9 @@ function ActivityTranscript({
         const text = row.text.trim();
         return (
           <View>
-            <Text selectable style={styles.reasoning} numberOfLines={foldedLines(row.key, text)}>
+            <DataText theme={theme} selectable style={styles.reasoning} numberOfLines={foldedLines(row.key, text)}>
               {text}
-            </Text>
+            </DataText>
             {foldToggle(row.key, text)}
           </View>
         );
@@ -295,9 +296,9 @@ function ActivityTranscript({
             <View style={styles.toolHead}>
               <Icon name={row.icon} size={13} color={theme.colors.foregroundMuted} />
               <Text style={styles.toolLabel}>{row.label}</Text>
-              <Text style={styles.toolSummary} numberOfLines={1}>
+              <DataText theme={theme} style={styles.toolSummary} numberOfLines={1}>
                 {row.summary}
-              </Text>
+              </DataText>
               {toolStatusIcon(row.status)}
               {row.detail === null ? null : (
                 <Icon name={expanded ? "ChevronDown" : "ChevronRight"} size={13} color={theme.colors.foregroundMuted} />
@@ -306,9 +307,9 @@ function ActivityTranscript({
             {!expanded || row.detail === null ? null : row.markdown ? (
               <Markdown source={row.detail} theme={theme} fontSize={FONT_SIZE.small} onOpenLink={openLink} />
             ) : (
-              <Text selectable style={styles.detail}>
+              <DataText theme={theme} selectable style={styles.detail}>
                 {row.detail}
-              </Text>
+              </DataText>
             )}
           </Pressable>
         );
@@ -319,7 +320,7 @@ function ActivityTranscript({
             {row.items.map((item, index) => (
               <View key={index} style={styles.planRow}>
                 {planIcon(item.status)}
-                <Text
+                <DataText theme={theme}
                   style={[
                     styles.planText,
                     item.status === "completed" ? styles.planDone : null,
@@ -327,18 +328,18 @@ function ActivityTranscript({
                   ]}
                 >
                   {item.text}
-                </Text>
+                </DataText>
               </View>
             ))}
           </View>
         );
       case "error":
-        return <Text style={styles.error}>{row.text}</Text>;
+        return <DataText theme={theme} style={styles.error}>{row.text}</DataText>;
       default:
         return (
           <View style={styles.line}>
             <Icon name="Bell" size={11} color={theme.colors.foregroundMuted} />
-            <Text style={styles.lineText}>{row.text}</Text>
+            <DataText theme={theme} style={styles.lineText}>{row.text}</DataText>
           </View>
         );
     }
