@@ -20,6 +20,7 @@ import { Pressable, Text, View } from "react-native";
 import type { Suggestion } from "../shared/fleet";
 import { chevronLabel, isCut, showsChevron } from "./suggestion-fold";
 import { suggestionRemovals } from "./suggestion-removals";
+import { DataText } from "./data-links";
 import { FONT_SIZE } from "./type-scale";
 
 export const SUGGESTIONS_TITLE = "Suggestions";
@@ -149,16 +150,16 @@ function SuggestionCard({
         >
           {expanded ? (
             <View style={styles.text}>
-              <Text style={styles.label}>{suggestion.label}</Text>
+              <DataText theme={theme} style={styles.label}>{suggestion.label}</DataText>
             </View>
           ) : (
             <View style={styles.text} onLayout={(event) => setShown(event.nativeEvent.layout.height)}>
-              <Text style={styles.label} numberOfLines={1}>
+              <DataText theme={theme} style={styles.label} numberOfLines={1}>
                 {suggestion.label}
-              </Text>
-              <Text style={styles.prompt} numberOfLines={2}>
+              </DataText>
+              <DataText theme={theme} style={styles.prompt} numberOfLines={2}>
                 {suggestion.prompt}
-              </Text>
+              </DataText>
               <View
                 style={styles.whole}
                 pointerEvents="none"
@@ -199,9 +200,9 @@ function SuggestionCard({
         </Pressable>
       </View>
       {expanded ? (
-        <Text style={styles.full} selectable>
+        <DataText theme={theme} style={styles.full} selectable>
           {suggestion.prompt}
-        </Text>
+        </DataText>
       ) : null}
     </View>
   );

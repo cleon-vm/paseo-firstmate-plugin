@@ -29,6 +29,7 @@ import { useModeOptions, useModelOptions, withCurrent } from "./models";
 import { OptionPicker } from "./option-picker";
 import { errorText } from "./ui";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
+import { DataText } from "./data-links";
 
 const CONFIG_QUERY_KEY = ["firstmate", "config"] as const;
 const PROVIDER_DEFAULT = "";
@@ -124,11 +125,11 @@ export function SettingsScreen({ theme, layout }: PluginSurfaceProps) {
         <SettingsSection
           title="Home"
           info={
-            <Text style={styles.note}>
+            <DataText theme={theme} style={styles.note}>
               The directory the first mate runs in and the only one it writes to: its charter (AGENTS.md, rewritten on
               every launch), its standing orders (data/captain.md — yours to edit), the project registry and the
               backlog. It can only be moved while no first mate is aboard — release it first.
-            </Text>
+            </DataText>
           }
         >
           {current === null ? null : (

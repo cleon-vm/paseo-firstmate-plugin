@@ -24,6 +24,7 @@ import {
 } from "./attachments";
 import { drafts } from "./draft";
 import { lookupIn, recentCandidates } from "./file-links";
+import { DataText } from "./data-links";
 import { useFollowEnd } from "./follow-end";
 import { isSendKey, type WebKeyPressEvent } from "./keys";
 import { MateControls } from "./mate-controls";
@@ -342,9 +343,9 @@ export function MateChat({
                   color={tool.status === "failed" ? theme.colors.statusDanger : theme.colors.foregroundMuted}
                 />
               )}
-              <Text style={styles.toolText} numberOfLines={1}>
+              <DataText theme={theme} style={styles.toolText} numberOfLines={1}>
                 {tool.text}
-              </Text>
+              </DataText>
             </View>
           ))}
         </View>
@@ -355,9 +356,9 @@ export function MateChat({
       case "captain":
         return (
           <View key={row.key} style={styles.captain}>
-            <Text selectable style={styles.captainText}>
+            <DataText theme={theme} selectable style={styles.captainText}>
               {row.text}
-            </Text>
+            </DataText>
           </View>
         );
       case "mate":
@@ -368,15 +369,15 @@ export function MateChat({
         );
       case "error":
         return (
-          <Text key={row.key} style={styles.error}>
+          <DataText key={row.key} theme={theme} style={styles.error}>
             {row.text}
-          </Text>
+          </DataText>
         );
       default:
         return (
           <View key={row.key} style={styles.line}>
             <Icon name="Bell" size={11} color={theme.colors.foregroundMuted} />
-            <Text style={styles.lineText}>{row.text}</Text>
+            <DataText theme={theme} style={styles.lineText}>{row.text}</DataText>
           </View>
         );
     }

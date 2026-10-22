@@ -17,6 +17,7 @@ import { toggleWatch, watchPath, type WatchSummary } from "../shared/fleet";
 import { errorText, watchStatusText, watchTone } from "./format";
 import { MONOSPACE } from "./ui";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
+import { DataText } from "./data-links";
 
 export const WATCHES_TITLE = "Watches";
 export const WATCHES_ICON = "Radar";
@@ -135,9 +136,9 @@ export function WatchList({
               {watchStatusText(watch)}
             </Text>
             {problem === null ? null : (
-              <Text style={styles.problem} numberOfLines={expanded ? undefined : 2}>
+              <DataText theme={theme} style={styles.problem} numberOfLines={expanded ? undefined : 2}>
                 {problem}
-              </Text>
+              </DataText>
             )}
             {watch.outdated ? (
               <Text style={styles.note}>
@@ -150,9 +151,9 @@ export function WatchList({
                 accessibilityLabel={expanded ? "Show less of the last output" : "Show all of the last output"}
                 onPress={() => setOpen(expanded ? null : watch.name)}
               >
-                <Text style={styles.output} numberOfLines={expanded ? undefined : 3}>
+                <DataText theme={theme} style={styles.output} numberOfLines={expanded ? undefined : 3}>
                   {watch.lastOutput}
-                </Text>
+                </DataText>
                 <Text style={styles.more}>
                   {expanded ? "Show less" : "Last output — show all"}
                 </Text>

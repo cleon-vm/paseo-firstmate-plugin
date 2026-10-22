@@ -28,6 +28,7 @@ import { exitCrew, interruptCrew, relaunchCrew, steerCrew, type ColumnId, type F
 import { answerKey, answers as answerDrafts, cardActions, isHeld, submitAnswer, type MateAsk } from "./card-answer";
 import { agentStatusLabel, agentStatusTone, columnTone, modelLabel, opensAsLeft, relativeTime } from "./format";
 import { Chip, IconButton, errorText } from "./ui";
+import { DataText } from "./data-links";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
 
 /** The card's first action, which opens the crewmate somewhere. */
@@ -221,22 +222,22 @@ export function CrewCard({
         style={[styles.press, answers || crew ? { paddingBottom: 6 } : null]}
       >
         <View style={styles.titleRow}>
-          <Text style={styles.title}>{card.title}</Text>
+          <DataText theme={theme} style={styles.title}>{card.title}</DataText>
           {agent === null ? null : <Chip theme={theme} text={agentStatusLabel(agent)} color={agentStatusTone(theme, agent)} />}
         </View>
-        {facts.length === 0 ? null : <Text style={styles.meta}>{facts.join(" · ")}</Text>}
+        {facts.length === 0 ? null : <DataText theme={theme} style={styles.meta}>{facts.join(" · ")}</DataText>}
 
         {card.report === null ? null : (
-          <Text style={styles.report} numberOfLines={expanded ? undefined : 3}>
+          <DataText theme={theme} style={styles.report} numberOfLines={expanded ? undefined : 3}>
             <Text style={styles.reportState}>{STATE_WORDS[card.report.state] ?? card.report.state}: </Text>
             {card.report.text}
-          </Text>
+          </DataText>
         )}
         {backlog?.hold === null || backlog?.hold === undefined ? null : (
-          <Text style={styles.report}>
+          <DataText theme={theme} style={styles.report}>
             <Text style={styles.reportState}>Captain's call: </Text>
             {backlog.hold}
-          </Text>
+          </DataText>
         )}
         {actions.length === 0 ? null : (
           <View style={styles.actions}>
@@ -254,9 +255,9 @@ export function CrewCard({
           </View>
         )}
         {agent?.lastError === null || agent?.lastError === undefined ? null : (
-          <Text style={[styles.report, { color: theme.colors.statusDanger }]} numberOfLines={expanded ? undefined : 2}>
+          <DataText theme={theme} style={[styles.report, { color: theme.colors.statusDanger }]} numberOfLines={expanded ? undefined : 2}>
             {agent.lastError}
-          </Text>
+          </DataText>
         )}
         {agent === null && backlog?.section === "in-flight" ? (
           <Text style={styles.meta}>No worker is running for this item.</Text>
@@ -275,17 +276,17 @@ export function CrewCard({
           </Text>
         )}
         {backlog?.reportPath === null || backlog?.reportPath === undefined ? null : (
-          <Text style={styles.meta}>Report: {backlog.reportPath}</Text>
+          <DataText theme={theme} style={styles.meta}>Report: {backlog.reportPath}</DataText>
         )}
 
-        <Text style={styles.meta}>
+        <DataText theme={theme} style={styles.meta}>
           {[
             agent === null ? null : modelLabel(agent),
             agent === null ? backlog?.outcome ?? backlog?.since ?? null : relativeTime(agent.updatedAt),
           ]
             .filter((part): part is string => part !== null && part !== "")
             .join(" · ")}
-        </Text>
+        </DataText>
 
         {expanded && agent === null ? (
           <View style={styles.actions}>

@@ -19,6 +19,7 @@ vi.mock("@getpaseo/plugin/client/react-native", () => ({
   Icon: "Icon", TextInput: "TextInput", useToast: () => host.toast,
 }));
 vi.mock("@getpaseo/plugin/client", () => ({ useRpc: () => host.rpc, openExternalUrl: vi.fn() }));
+vi.mock("@tanstack/react-query", () => ({ useQuery: () => ({ data: undefined }) }));
 
 import { CrewCard } from "./card";
 

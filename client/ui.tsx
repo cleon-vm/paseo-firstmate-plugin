@@ -8,6 +8,7 @@ import { Icon } from "@getpaseo/plugin/client/react-native";
 import { useMemo } from "react";
 import { ActivityIndicator, Platform, Pressable, Text, View } from "react-native";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
+import { DataText } from "./data-links";
 
 /** A fixed-width font on every platform; iOS has no font named "monospace". */
 export const MONOSPACE = Platform.select({ ios: "Menlo", default: "monospace" });
@@ -222,7 +223,7 @@ export function Banner({
   return (
     <View style={styles.banner}>
       <Icon name={tone === "info" ? "Info" : "AlertTriangle"} size={14} color={color} />
-      <Text style={styles.text}>{text}</Text>
+      <DataText theme={theme} style={styles.text}>{text}</DataText>
       {[...(action === undefined ? [] : [action]), ...(actions ?? [])].map((each) => (
         <IconButton
           key={each.label}

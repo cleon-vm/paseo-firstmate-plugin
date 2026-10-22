@@ -36,11 +36,15 @@ vi.mock("@getpaseo/plugin/client", () => {
       },
     }) },
   };
-  return { usePaseo: () => paseo, useRpc: () => host.rpc, openExternalUrl: host.openUrl };
+  return { usePaseo: () => paseo, useRpc: (rpc: { name: string }) => rpc.name === "firstmate.data.open"
+    ? async ({ path }: { path: string }) => ({ path: host.files[path] ?? null, kind: host.files[path] === undefined ? null : "file", view: host.files[path] !== undefined })
+    : host.rpc, openExternalUrl: host.openUrl };
 });
 vi.mock("@tanstack/react-query", () => ({
   useQuery: ({ queryKey }: { queryKey: string[] }) => ({
-    data: queryKey.includes("files") ? { files: host.files } : undefined,
+    data: queryKey.includes("files") ? { files: host.files } : queryKey.includes("data")
+      ? { paths: Object.fromEntries(Object.entries(host.files).map(([candidate, path]) => [candidate, { path, kind: "file" }])) }
+      : undefined,
     refetch: host.rpc, dataUpdatedAt: 0,
   }),
 }));
@@ -203,7 +207,7 @@ describe("first mate chat history", () => {
     }
     await act(async () => link("docs").props.onPress());
     expect(host.openUrl).toHaveBeenCalledWith("https://example.com/docs");
-    await act(async () => link("data/backlog.md").props.onPress());
+    await act(async () => link("data/backlog.md").props.onPress({ stopPropagation: vi.fn() }));
     expect(openFile).toHaveBeenCalledWith("data/backlog.md");
 
     host.files = { "data/backlog.md": "data/renamed.md" };
@@ -211,12 +215,12 @@ describe("first mate chat history", () => {
     vi.mocked(Markdown).mockClear();
     await mount(theme, nextOpen);
     expect(Markdown).toHaveBeenCalledTimes(75);
-    await act(async () => link("data/backlog.md").props.onPress());
+    await act(async () => link("data/backlog.md").props.onPress({ stopPropagation: vi.fn() }));
     expect(nextOpen).toHaveBeenCalledWith("data/renamed.md");
 
     const latestOpen = vi.fn();
     await mount(theme, latestOpen);
-    await act(async () => link("data/backlog.md").props.onPress());
+    await act(async () => link("data/backlog.md").props.onPress({ stopPropagation: vi.fn() }));
     expect(latestOpen).toHaveBeenCalledWith("data/renamed.md");
     expect(nextOpen).toHaveBeenCalledTimes(1);
 
