@@ -11,7 +11,7 @@ import { registerReportCache } from "./server/report-cache";
 import { findFiles, listDirectory, readTextFile, requireHome, writeTextFile } from "./server/files";
 import { readHomeImageFile } from "./server/images";
 import { revealInHome } from "./server/reveal";
-import { findDataPaths, openDataPath } from "./server/data-links";
+import { findLinkPaths, openLinkPath, type FolderLinkSettings } from "./server/folder-links";
 import { findDataPaths as findDataPathsRpc, openDataPath as openDataPathRpc } from "./shared/files";
 import { CHARTER_FILE, NEW_CHARTER_FILE, acknowledgeCharter, writeNewCharter } from "./server/charter-file";
 import { isHomeReady, prepareHome, removeSuggestion } from "./server/home";
@@ -141,8 +141,13 @@ export default function contribute(server: PluginServerContext) {
   server.handle(readHomeFile, async ({ path }) => readTextFile(await home(), path));
   server.handle(readHomeImage, async (input) => readHomeImageFile(await home(), input));
   server.handle(findHomeFiles, async ({ paths }) => ({ files: await findFiles(await home(), paths) }));
-  server.handle(findDataPathsRpc, async ({ paths }) => findDataPaths(await home(), paths));
-  server.handle(openDataPathRpc, async ({ path, revealFile }) => openDataPath(await home(), path, revealFile));
+  // Data links stay in home/data; folder links (any local folder, opened in the file manager) follow the settings.
+  async function folderLinks(): Promise<FolderLinkSettings> {
+    const config = await readFirstmateConfig();
+    return { enabled: config.folderLinks, deny: config.folderLinkDeny };
+  }
+  server.handle(findDataPathsRpc, async ({ paths }) => findLinkPaths(await home(), paths, await folderLinks()));
+  server.handle(openDataPathRpc, async (input) => openLinkPath(await home(), input, await folderLinks()));
   // Opens on the daemon's machine, whichever client asked; see server/reveal.ts.
   server.handle(revealHomePath, async ({ path }) => revealInHome(await home(), path));
   server.handle(writeHomeFile, async (input) => {

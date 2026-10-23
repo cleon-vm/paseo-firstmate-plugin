@@ -16,6 +16,7 @@ import {
   SettingsRow,
   SettingsSection,
   SettingsSelect,
+  SettingsSwitch,
 } from "@getpaseo/plugin/client/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
@@ -47,6 +48,7 @@ export function SettingsScreen({ theme, layout }: PluginSurfaceProps) {
   const config = useQuery({ queryKey: CONFIG_QUERY_KEY, queryFn: () => read({}) });
   const current = config.data?.config ?? null;
   const [homeDraft, setHomeDraft] = useState<string | null>(null);
+  const [denyDraft, setDenyDraft] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const models = useModelOptions();
@@ -190,6 +192,50 @@ export function SettingsScreen({ theme, layout }: PluginSurfaceProps) {
             options={crewModeOptions}
             disabled={busy || current === null || current.crewProvider === ""}
             onValueChange={(value) => apply({ crewModeId: value }, "The crew's mode is saved.")}
+          />
+        </SettingsSection>
+      </SettingsGroup>
+
+      <SettingsGroup title="Links">
+        <SettingsSection
+          title="Folder links"
+          info={
+            <Text style={styles.note}>
+              A folder named anywhere in the board's text (an absolute, drive or ~ path) is a link that opens it in
+              the file manager on the daemon's machine. Only an existing folder is ever opened, never a file or a
+              program. Credential locations (.ssh, .gnupg, .aws, .azure, .kube, .docker, .git, browser profiles and
+              password stores) are never linked, and UNC and device paths stay plain text. Links to files under the
+              home's data/ folder are not affected.
+            </Text>
+          }
+        >
+          <SettingsSwitch
+            label="Link local folders"
+            hint="Turn off to leave folder paths as plain text."
+            value={current?.folderLinks ?? true}
+            disabled={busy || current === null}
+            onValueChange={(value) => apply({ folderLinks: value }, value ? "Folder links are on." : "Folder links are off.")}
+          />
+          {current === null ? null : (
+            <SettingsInput
+              key={current.folderLinkDeny.join(",")}
+              label="Never link"
+              hint="Extra folder names to refuse, separated by commas. A name can contain *, and a/b matches a folder b inside a folder a, anywhere in the path."
+              initialValue={current.folderLinkDeny.join(", ")}
+              placeholder="vault, secrets/*"
+              onChangeText={setDenyDraft}
+              disabled={busy}
+            />
+          )}
+          <SettingsAction
+            label="Save the list"
+            actionLabel="Save"
+            disabled={busy || current === null || denyDraft === null}
+            onPress={() => {
+              if (denyDraft === null) return;
+              apply({ folderLinkDeny: denyDraft.split(",").map((part) => part.trim()).filter((part) => part !== "") }, "The list is saved.");
+              setDenyDraft(null);
+            }}
           />
         </SettingsSection>
       </SettingsGroup>

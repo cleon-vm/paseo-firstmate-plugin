@@ -114,3 +114,58 @@ describe("data path rendering", () => {
     expect(external).not.toHaveBeenCalled();
   });
 });
+
+describe("folder link rendering", () => {
+  const demo = "C:\\projects\\demo";
+  const spaced = "/home/user/my projects";
+  beforeEach(() => {
+    host.paths = {
+      ...host.paths,
+      [demo]: { path: demo, kind: "dir", action: "folder" },
+      [spaced]: { path: spaced, kind: "dir", action: "folder" },
+      "~/Downloads": { path: "/home/user/Downloads", kind: "dir", action: "folder" },
+    } as typeof host.paths;
+  });
+
+  it("links a folder the daemon vouches for, in prose, backticks and quotes, and leaves the rest as text", async () => {
+    await mount(createElement(DataText, { theme },
+      `Build in ${demo}, notes in "${spaced}" and \`~/Downloads\`; not C:\\projects\\missing or \\\\server\\share\\x or https://host/projects/demo.`));
+    expect(links().map((node) => node.children.join(""))).toEqual([demo, spaced, "~/Downloads"]);
+    expect(links()[0]!.props.accessibilityHint).toMatch(/file manager/);
+  });
+
+  it("opens a folder with the folder action, never through the Files viewer", async () => {
+    const viewer = vi.fn();
+    host.open.mockResolvedValue({ path: demo, kind: "dir", view: false });
+    await mount(createElement(DataFilesContext.Provider, { value: viewer }, createElement(DataText, { theme }, `Open ${demo}`)));
+    const stopPropagation = vi.fn();
+    await act(async () => links()[0]!.props.onPress({ stopPropagation }));
+    expect(stopPropagation).toHaveBeenCalledOnce();
+    expect(host.open).toHaveBeenCalledWith({ path: demo, revealFile: false, action: "folder" });
+    expect(viewer).not.toHaveBeenCalled();
+  });
+
+  it("shows an error toast when the daemon refuses the click", async () => {
+    host.open.mockRejectedValue(new Error("Explorer could not be opened."));
+    await mount(createElement(DataText, { theme }, `Open ${demo}`));
+    await act(async () => links()[0]!.props.onPress({ stopPropagation: vi.fn() }));
+    expect(host.toast.error).toHaveBeenCalledWith("Explorer could not be opened.");
+  });
+
+  it("links nothing when the daemon vouches for nothing, as when the setting is off", async () => {
+    host.paths = {};
+    await mount(createElement(DataText, { theme }, `Open ${demo} and ${spaced}`));
+    expect(links()).toHaveLength(0);
+  });
+
+  it("links folders in Markdown prose, inline code with spaces and local link targets, and never opens them as a URL", async () => {
+    const external = vi.fn();
+    await mount(createElement(Markdown, { theme, onOpenLink: external, source:
+      `${demo} \`${spaced}\` \`~/Downloads\` [Demo](${demo}) [gone](C:\\projects\\gone)`,
+    }));
+    expect(links().map((node) => node.children.join(""))).toEqual([demo, spaced, "~/Downloads", "Demo"]);
+    await act(async () => links()[3]!.props.onPress({ stopPropagation: vi.fn() }));
+    expect(host.open).toHaveBeenCalledWith({ path: demo, revealFile: true, action: "folder" });
+    expect(external).not.toHaveBeenCalled();
+  });
+});

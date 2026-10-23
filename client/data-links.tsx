@@ -6,7 +6,7 @@ import { Children, createContext, useContext, useMemo, type ReactNode } from "re
 import { Text, type TextProps } from "react-native";
 
 import { findDataPaths, MAX_FILE_CANDIDATES, MAX_FILE_PATH_LENGTH, openDataPath } from "../shared/files";
-import { dataMentions } from "./data-paths";
+import { pathMentions } from "./data-paths";
 
 /** The fleet lends its existing Files viewer; standalone panels safely reveal files instead. */
 export const DataFilesContext = createContext<((path: string) => void) | null>(null);
@@ -18,7 +18,7 @@ export function useDataLinks(source: string, viewer?: ((path: string) => void) |
   const open = useRpc(openDataPath);
   const toast = useToast();
   const candidates = useMemo(
-    () => [...new Set(dataMentions(source).map((mention) => mention.path))]
+    () => [...new Set(pathMentions(source).map((mention) => mention.path))]
       .filter((path) => path.length <= MAX_FILE_PATH_LENGTH).slice(-MAX_FILE_CANDIDATES),
     [source],
   );
@@ -30,7 +30,9 @@ export function useDataLinks(source: string, viewer?: ((path: string) => void) |
   });
   const paths = result.data?.paths ?? {};
   function openPath(path: string): void {
-    void open({ path, revealFile: onOpenFile === null })
+    // A folder link names its action, so the daemon checks it as a folder and nothing else.
+    const folder = paths[path]?.action === "folder";
+    void open({ path, revealFile: onOpenFile === null, ...(folder ? { action: "folder" as const } : {}) })
       .then((target) => {
         if (target.path !== null && target.view) onOpenFile?.(target.path);
       })
@@ -47,7 +49,7 @@ export function DataText({ theme, children, ...props }: TextProps & { theme: Plu
     if (typeof child !== "string" || props.onPress !== undefined) return child;
     const parts: ReactNode[] = [];
     let at = 0;
-    for (const mention of dataMentions(child)) {
+    for (const mention of pathMentions(child)) {
       const target = links.paths[mention.path];
       if (target === undefined) continue;
       parts.push(child.slice(at, mention.start));

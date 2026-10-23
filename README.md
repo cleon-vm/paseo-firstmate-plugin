@@ -169,6 +169,33 @@ Standalone panels reveal files in that file manager, as do binaries the viewer c
 open as text and are never run. Missing paths stay plain text. Links are checked against the configured
 home's `data/` directory both before display and on click; traversal and symlinks out of it are refused.
 
+**Folder links.** The same places also link a folder anywhere on the machine: an absolute path
+(`C:\projects\demo`, `C:/projects/demo`, `/home/user/projects/demo`) or one starting with `~`
+(`~/Downloads`), in plain text, in backticks or in quotes. A path with spaces links only inside
+backticks or quotes (`` `C:\my projects\demo` ``), and a path with parentheses in its name does too.
+A click opens the folder in the file manager on the daemon's machine, and does nothing else:
+
+- Only an existing **folder** is opened — never a file, never a program, and no command is run. The file
+  manager is started with the folder as its only argument. A path to a file outside `data/` stays plain
+  text (FirstMate does not offer "reveal its folder" for it).
+- The path is checked again on every click, as its own action kind (`folder`), separate from the
+  `data/` links: it must be absolute (a drive letter or `/` or `~`), contain no `..`, and not be a
+  device (`\\.\`, `\\?\`) or UNC (`\\server\share`, `//server/share`) path — those stay plain text.
+  Symlinks and junctions are followed to their real folder, and that real folder is what is checked and
+  opened. A drive root such as `C:\` is allowed: a click just opens that folder.
+- Credential locations never link, whether the path names them or leads to them through a link or
+  junction: `.ssh`, `.gnupg`, `.aws`, `.azure`, `.kube`, `.docker`, `.git` (and everything inside it, but
+  not the working folder around it), `.password-store`, and browser-profile, keychain and
+  password-store folders. The folder names match anywhere in the path, case-insensitively.
+- The `data/` links above are unchanged, and do not depend on this setting.
+
+Settings › Plugins › FirstMate › **Links** turns folder links off (they are on by default), and adds
+your own never-link patterns to the built-in list (comma-separated; `*` matches within a name, and
+`a/b` matches a folder `b` inside a folder `a` anywhere in the path). They are stored in the daemon's
+config as `folderLinks` (`true`/`false`) and `folderLinkDeny` (a list of strings). Link checks run
+on the daemon, so a change applies to the next check; text already on the board updates within ten
+seconds.
+
 ## The first mate's home
 
 The **Files** view — next to the crew board, or its own tab on a phone — shows everything in the home
@@ -267,6 +294,8 @@ FirstMate's has changed. The first mate adds or changes a watch only when you sa
   task. "Let the first mate choose" gives workers its own model.
 - **Agent tools** — Paseo's switch, described above.
 - **Refresh every** — how often the board polls.
+- **Link local folders** — whether a folder path in the board's text is a clickable link (on by
+  default), and **Never link** for extra folder patterns to refuse. See *Folder links* above.
 
 ## Limitations
 
