@@ -12,6 +12,7 @@
 
 import { MAX_FILE_PATH_LENGTH } from "../shared/files";
 import { isUrlTarget, isWebTarget } from "../shared/images";
+import { isLocalPath } from "./data-paths";
 import { inlineTexts, parseMarkdown } from "./markdown-parse";
 
 /** Bold, inline code and links, in one pass; everything else stays as written. */
@@ -101,12 +102,12 @@ export function inlineTokens(text: string, lookup: FileLookup, options: { images
     const link = /^\[([^\]]*)\]\(([^)]+)\)$/.exec(part);
     if (link !== null) {
       const target = link[2] ?? "";
-      const candidate = pathCandidate(target);
+      const candidate = pathCandidate(target) ?? (isLocalPath(target) ? target : null);
       const path = candidate === null ? null : lookup(candidate);
       const label = link[1] === "" ? target : (link[1] ?? target);
       if (path !== null) return [{ kind: "file", text: label, path, code: false }];
-      // A local data link that is missing or refused stays inert, never an external URL.
-      if (/^(?:\.\/)?data[\\/]/.test(target)) return [{ kind: "text", text: label }];
+      // A local data or folder link that is missing or refused stays inert, never an external URL.
+      if (/^(?:\.\/)?data[\\/]/.test(target) || /^(?:[A-Za-z]:[\\/]|~[\\/])/.test(target)) return [{ kind: "text", text: label }];
     }
     const url = (link?.[2] ?? part).replace(/[.,;:]+$/, "");
     const label = link === null ? part : link[1] === "" ? url : (link[1] ?? url);

@@ -64,16 +64,32 @@ export const MAX_FILE_CANDIDATES = 500;
 /** The longest path `firstmate.files.find` takes; the chat does not ask about a longer word. */
 export const MAX_FILE_PATH_LENGTH = 1024;
 
-/** Data links have a narrower boundary than the Files browser: only home/data. */
+/**
+ * Data links have a narrower boundary than the Files browser: only home/data. A `folder` link is the one
+ * other kind: an existing local folder anywhere, opened in the file manager and nothing else.
+ */
+export const LINK_ACTIONS = ["data", "folder"] as const;
+export type LinkAction = (typeof LINK_ACTIONS)[number];
+
 export const findDataPaths = defineRpc({
   name: "firstmate.data.find",
   input: z.object({ paths: z.array(z.string().max(MAX_FILE_PATH_LENGTH)).max(MAX_FILE_CANDIDATES) }),
-  output: z.object({ paths: z.record(z.string(), z.object({ path: z.string(), kind: z.enum(["file", "dir"]) })) }),
+  output: z.object({
+    paths: z.record(z.string(), z.object({
+      path: z.string(),
+      kind: z.enum(["file", "dir"]),
+      action: z.enum(LINK_ACTIONS).default("data"),
+    })),
+  }),
 });
 
 export const openDataPath = defineRpc({
   name: "firstmate.data.open",
-  input: z.object({ path: z.string().max(MAX_FILE_PATH_LENGTH), revealFile: z.boolean().default(false) }),
+  input: z.object({
+    path: z.string().max(MAX_FILE_PATH_LENGTH),
+    revealFile: z.boolean().default(false),
+    action: z.enum(LINK_ACTIONS).default("data"),
+  }),
   output: z.object({ path: z.string().nullable(), kind: z.enum(["file", "dir"]).nullable(), view: z.boolean() }),
 });
 

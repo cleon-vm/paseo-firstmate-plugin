@@ -29,7 +29,7 @@ import { parseMarkdown, type Block } from "./markdown-parse";
 import { MONOSPACE } from "./ui";
 import { FONT_SIZE, lineHeightFor } from "./type-scale";
 import { useDataLinks } from "./data-links";
-import { dataMentions } from "./data-paths";
+import { isLocalPath, pathMentions } from "./data-paths";
 
 interface MarkdownStyles {
   paragraph: object;
@@ -205,9 +205,9 @@ function renderTokens(tokens: InlineToken[], styles: MarkdownStyles, context: In
 /** Also link paths in bold and fenced code without changing their formatting. */
 function renderDataText(text: string, styles: MarkdownStyles, context: InlineContext): ReactNode[] {
   const whole = context.lookup(text);
-  const mentions = whole !== null && /^(?:\.\/)?data[\\/]/.test(text)
+  const mentions = whole !== null && isLocalPath(text)
     ? [{ start: 0, text, path: text }]
-    : dataMentions(text);
+    : pathMentions(text);
   const parts: ReactNode[] = [];
   let at = 0;
   for (const mention of mentions) {
@@ -326,11 +326,14 @@ export function Markdown({
   const blocks = useMemo(() => parseMarkdown(source), [source]);
   const data = useDataLinks(source, onOpenFile);
   const lookup: FileLookup = (candidate) => {
-    if (/^(?:\.\/)?data[\\/]/.test(candidate)) return data.paths[candidate] === undefined ? null : candidate;
+    // Data paths and folders anywhere are the data links' to vouch for; the home's own files are `files`'.
+    if (/^(?:\.\/)?data[\\/]/.test(candidate) || data.paths[candidate] !== undefined) {
+      return data.paths[candidate] === undefined ? null : candidate;
+    }
     return files(candidate);
   };
   function open(path: string): void {
-    if (/^(?:\.\/)?data[\\/]/.test(path)) data.openPath(path);
+    if (/^(?:\.\/)?data[\\/]/.test(path) || data.paths[path] !== undefined) data.openPath(path);
     else onOpenFile?.(path);
   }
   return (

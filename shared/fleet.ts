@@ -257,6 +257,10 @@ export const FirstmateConfigSchema = z.object({
    * `live` answers nothing either; it logs as shadow does, as live mode would judge.
    */
   permissionBroker: PermissionBrokerModeSchema.default("off"),
+  /** Whether a folder named anywhere in the board's text is a link that opens it in the file manager (server/folder-links.ts). */
+  folderLinks: z.boolean().default(true),
+  /** Folder patterns added to the built-in list of credential locations that are never linked. */
+  folderLinkDeny: z.array(z.string().max(256)).max(100).default([]),
 });
 export type FirstmateConfig = z.infer<typeof FirstmateConfigSchema>;
 
@@ -273,6 +277,8 @@ export const FirstmateConfigPatchSchema = z.object({
   crewProvider: z.string().optional(),
   crewModeId: z.string().optional(),
   disabledWatches: z.array(z.string()).optional(),
+  folderLinks: z.boolean().optional(),
+  folderLinkDeny: z.array(z.string().max(256)).max(100).optional(),
 });
 
 export const readConfig = defineRpc({
