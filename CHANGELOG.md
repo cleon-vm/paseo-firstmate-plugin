@@ -7,6 +7,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Every version
 as `@gpambrozio/paseo-firstmate` and tagged here, so a version is something to install and a line to
 read before you move.
 
+## [Unreleased]
+
+### Added
+
+- **Fold the Watches card out of the way.** The Watches card now has the same fold arrow as the
+  board's columns. Folded, it shrinks to a narrow strip on a wide board, or to its title line on a
+  phone, so the columns that change more often get its room. It still shows how many watches there
+  are, and on a phone how many are failing; on a wide board the strip's icon turns red when one is. It
+  stays folded across reloads, remembered with the folded columns in the board's display settings.
+
 ## [0.4.0] — 2026-10-08
 
 ### Added
