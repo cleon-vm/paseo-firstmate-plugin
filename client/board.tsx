@@ -9,7 +9,9 @@
  * as a card that counts toward the rows but never folds or moves. A phone
  * shows them in a tab of their own instead, so the board is given none there.
  * The home's watches are a card after the columns, the same way, and on a
- * phone the last section of the list.
+ * phone the last section of the list. The watches card folds like a column,
+ * keeping its count and how many are failing, so the columns that change more
+ * often get its room.
  *
  * Columns move with their header's arrows rather than by dragging: a drag
  * needs document-level pointer tracking on the web and fights every scroll
@@ -32,6 +34,7 @@ import {
   moveColumn,
   SUGGESTIONS_CARD,
   WATCHES_CARD,
+  watchTrouble,
 } from "./format";
 import { SUGGESTIONS_ICON, SUGGESTIONS_TITLE, SuggestionList } from "./suggestions";
 import { WATCHES_ICON, WATCHES_TITLE, WatchList } from "./watches";
@@ -57,7 +60,8 @@ interface BoardProps {
   onOpenFile: (path: string) => void;
   /** Shows one crewmate's card and transcript in place of the board. */
   onWatch: (agentId: string) => void;
-  onToggleColumn: (id: ColumnId) => void;
+  /** Folds or unfolds a column, or the watches card. */
+  onToggleColumn: (id: ColumnId | typeof WATCHES_CARD) => void;
   /** Saves a new whole column order, hidden columns included. */
   onReorder: (order: ColumnId[]) => void;
   onChanged: () => void;
@@ -99,7 +103,10 @@ export function Board(props: BoardProps) {
       headerFolded: { alignItems: "center" as const, gap: 8 },
       title: { flex: 1, color: colors.foreground, fontSize: FONT_SIZE.small, fontWeight: "600" as const },
       count: { color: colors.foregroundMuted, fontSize: FONT_SIZE.caption },
-      arrow: { padding: 3 },
+      trouble: { color: colors.statusDanger, fontSize: FONT_SIZE.caption },
+      arrow: { padding: 3, borderRadius: 4 },
+      /** A visible ring on the web when the fold button has keyboard focus. */
+      focusRing: { outlineWidth: 2, outlineStyle: "solid" as const, outlineColor: colors.accent },
       body: { gap: 8, paddingBottom: 4 },
       foldedTitle: {
         color: colors.foregroundMuted,
@@ -188,13 +195,41 @@ export function Board(props: BoardProps) {
     });
   }
 
+  const watchesFolded = collapsed.includes(WATCHES_CARD);
+  const troubled = watchTrouble(watches);
+
   function renderWatchesHeader() {
+    const summary = `${watches.length} ${watches.length === 1 ? "watch" : "watches"}${troubled > 0 ? `, ${troubled} failing` : ""}`;
+    const toggle = (
+      <Pressable
+        accessibilityRole="button"
+        accessibilityLabel={`${watchesFolded ? "Unfold" : "Fold"} ${WATCHES_TITLE}, ${summary}`}
+        accessibilityState={{ expanded: !watchesFolded }}
+        // react-native-web passes `focused`; native passes only `pressed`.
+        style={(state) => [styles.arrow, (state as { focused?: boolean }).focused ? styles.focusRing : null]}
+        onPress={() => props.onToggleColumn(WATCHES_CARD)}
+      >
+        <Icon name={watchesFolded ? "ChevronRight" : "ChevronDown"} size={14} color={theme.colors.foregroundMuted} />
+      </Pressable>
+    );
+    const trouble = troubled === 0 ? null : <Text style={styles.trouble}>{`${troubled} failing`}</Text>;
+    if (watchesFolded && !compact) {
+      return (
+        <View style={styles.headerFolded}>
+          {toggle}
+          <Icon name={WATCHES_ICON} size={14} color={troubled > 0 ? theme.colors.statusDanger : theme.colors.accent} />
+          <Text style={styles.count}>{watches.length}</Text>
+        </View>
+      );
+    }
     return (
       <View style={styles.header}>
+        {toggle}
         <Icon name={WATCHES_ICON} size={14} color={theme.colors.accent} />
         <Text style={styles.title} numberOfLines={1}>
           {WATCHES_TITLE}
         </Text>
+        {watchesFolded ? trouble : null}
         <Text style={styles.count}>{watches.length}</Text>
       </View>
     );
@@ -224,7 +259,9 @@ export function Board(props: BoardProps) {
         {withWatches ? (
           <View style={styles.columnStacked}>
             {renderWatchesHeader()}
-            <WatchList watches={watches} theme={theme} onChanged={props.onChanged} onOpenFile={props.onOpenFile} />
+            {watchesFolded ? null : (
+              <WatchList watches={watches} theme={theme} onChanged={props.onChanged} onOpenFile={props.onOpenFile} />
+            )}
           </View>
         ) : null}
       </ScrollView>
@@ -260,11 +297,17 @@ export function Board(props: BoardProps) {
             }
             if (id === WATCHES_CARD) {
               return (
-                <View key={id} style={styles.column}>
+                <View key={id} style={[styles.column, watchesFolded ? styles.columnFolded : null]}>
                   {renderWatchesHeader()}
-                  <ScrollView contentContainerStyle={styles.body}>
-                    <WatchList watches={watches} theme={theme} onChanged={props.onChanged} onOpenFile={props.onOpenFile} />
-                  </ScrollView>
+                  {watchesFolded ? (
+                    <Text style={styles.foldedTitle} numberOfLines={1}>
+                      {WATCHES_TITLE}
+                    </Text>
+                  ) : (
+                    <ScrollView contentContainerStyle={styles.body}>
+                      <WatchList watches={watches} theme={theme} onChanged={props.onChanged} onOpenFile={props.onOpenFile} />
+                    </ScrollView>
+                  )}
                 </View>
               );
             }

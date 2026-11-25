@@ -18,7 +18,7 @@ export const displaySettings = defineSettings({
   schema: z.object({
     /** Board columns, in the order the captain arranged them. Unknown ids are dropped when read. */
     columnOrder: z.array(z.string()).default([...COLUMN_IDS]),
-    /** Columns folded down to a narrow strip. */
+    /** Columns folded down to a narrow strip, and `watches` when the Watches card is folded. */
     collapsedColumns: z.array(z.string()).default([]),
     /**
      * The chat pane's share of the surface's width. A share rather than pixels,

@@ -213,6 +213,11 @@ export function watchTone(theme: PluginTheme, watch: WatchSummary): string {
   }
 }
 
+/** How many switched-on watches show the danger tone, for the folded Watches card. */
+export function watchTrouble(watches: readonly WatchSummary[]): number {
+  return watches.filter((watch) => watch.enabled && (watch.lastResult === "failed" || watch.lastResult === "invalid")).length;
+}
+
 /** "just now", "5m ago", "3h ago", "2d ago". */
 export function relativeTime(iso: string, now: number = Date.now()): string {
   const then = Date.parse(iso);

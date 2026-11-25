@@ -545,7 +545,7 @@ export function FleetSurface({ theme, layout, navigation }: PluginScreenProps) {
       onOpenFile={openFile}
       onWatch={setWatching}
       onChanged={refresh}
-      onToggleColumn={(id: ColumnId) =>
+      onToggleColumn={(id: string) =>
         save({
           collapsedColumns: values.collapsedColumns.includes(id)
             ? values.collapsedColumns.filter((column) => column !== id)
